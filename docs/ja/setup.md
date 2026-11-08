@@ -38,7 +38,7 @@ ip -4 addr show | grep -v 127.0.0.1 | grep inet
 
 ### 2. systemd ユニットを入れる
 
-WSL の中で `install.sh` を実行します。`sudo` のパスワードを 1 回聞かれます。何度実行しても安全です。ユニットの `User=` は、実行したユーザーに自動で置き換わります。
+`/etc/wsl.conf` の `[boot]` に `systemd=true` が必要です（`install.sh` が確認します）。WSL の中で `install.sh` を実行します。`sudo` のパスワードを 1 回聞かれます。何度実行しても安全です。ユニットの `User=` は、実行したユーザーに自動で置き換わります。
 
 ```bash
 cd ~/projects/musekusa/hey-muse
@@ -64,13 +64,17 @@ systemctl is-active muse-asr && journalctl -u muse-asr -n 5 --no-pager
 
 ### 3. Windows ログオン時に WSL を起こしたままにする
 
-手順 1 のスクリプトが、タスク `hey-muse WSL` を登録しています。ログオン時に `wsl.exe -d Ubuntu --exec /bin/sh -c 'sleep infinity'` を 1 本起動し、WSL が idle で終了するのを防ぎます。ディストリビューション名は `wsl -l -q` で確認し、`Ubuntu` がなければ止まります（`docker-desktop` は使いません）。別の名前なら `-Distro 名前` を付けて実行します。
+手順 1 のスクリプトが、タスク `hey-muse WSL` を登録しています。ログオン時に `wsl.exe -d Ubuntu --exec /bin/sleep infinity` を 1 本起動し、WSL が idle で終了するのを防ぎます。タスクは実行時間の制限なし、バッテリー駆動でも開始・継続する設定です。ディストリビューション名は `wsl -l -q` で確認し、`Ubuntu` がなければ止まります（`docker-desktop` は使いません）。別の名前なら `-Distro 名前` を付けて実行します。
 
 ```powershell
-schtasks /Query /TN "hey-muse WSL" /V /FO LIST | Select-String "Task To Run"
+schtasks /Query /TN "hey-muse WSL" /V /FO LIST | Select-String "Task To Run","Stop the task if it runs longer than","Power Management"
 ```
 
-期待する結果: `Task To Run:` の行に `wsl.exe -d Ubuntu --exec /bin/sh -c 'sleep infinity'` が出ます。
+期待する結果は次のとおりです。
+
+- `Task To Run:` の行に `wsl.exe -d Ubuntu --exec /bin/sleep infinity` が出ます。
+- `Stop the task if it runs longer than:` が `Disabled` です。
+- `Power Management` に電源条件の停止がありません（`Stop On Battery Mode: No Start On Batteries`）。
 
 ### 4. 再起動して確認する
 
