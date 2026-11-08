@@ -133,7 +133,7 @@ func TestMuseSkipsLocalSTTAfterFailures(t *testing.T) {
 	}
 }
 
-func TestMuseFallsBackToVoiceNoteEvenWithIdleHome(t *testing.T) {
+func TestMuseFallsBackToVoiceNoteWhenLocalSTTFails(t *testing.T) {
 	askCalls := 0
 	l := &textTestLink{fakeLink: fakeLink{ask: func(context.Context, []byte, func(muse.ReplyEvent)) (muse.Reply, error) {
 		askCalls++
@@ -147,6 +147,9 @@ func TestMuseFallsBackToVoiceNoteEvenWithIdleHome(t *testing.T) {
 		return "", errors.New("offline")
 	}
 	reply, err := m.ask(context.Background(), someAudio, "echo-test", func(muse.ReplyEvent) {})
+	if reply.Text == "聞き取れませんでした。もう一度お願いします。" {
+		t.Fatal("asked the speaker to repeat instead of using Muse")
+	}
 	if err != nil || reply.Text != "Muse の返事" || transcribeCalls != 1 || askCalls != 1 {
 		t.Fatalf("reply=%+v err=%v transcribe=%d ask=%d", reply, err, transcribeCalls, askCalls)
 	}

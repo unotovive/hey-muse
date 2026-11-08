@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -44,8 +45,11 @@ const museChunk = mic.Rate / 10
 const museThinkingAfter = 5 * time.Second
 
 const (
+	// sttFailuresToSkip は、ローカル認識がこの回数だけ続けて失敗したら遮断する回数。
 	sttFailuresToSkip = 2
-	sttSkipFor        = time.Minute
+	// sttSkipFor は、遮断してローカル認識を飛ばす時間。
+	// 窓が終わった後は失敗 1 回で再遮断する。毎分 1 回、最大 2 秒のプローブになるが意図的。
+	sttSkipFor = time.Minute
 )
 
 type viaMuse struct {
@@ -59,6 +63,7 @@ type viaMuse struct {
 	early      *earlySTT
 	// After sttFailuresToSkip failures in a row the owner's recogniser is left alone for sttSkipFor,
 	// so a mothership that is down does not cost its connect timeout on every turn.
+	sttMu        sync.Mutex // End は answer を別 goroutine で走らせるため、下の 2 つを守る
 	sttFailures  int
 	sttSkipUntil time.Time
 	now          func() time.Time
@@ -95,7 +100,7 @@ func (m *viaMuse) ask(ctx context.Context, pcm []byte, sessionID string, on func
 			return muse.Reply{}, ctx.Err()
 		}
 		if err == nil {
-			m.sttFailures = 0
+			m.noteSTTSuccess()
 			text = strings.TrimSpace(text)
 			if text == "" {
 				return muse.Reply{}, nil
@@ -135,16 +140,32 @@ func (m *viaMuse) ask(ctx context.Context, pcm []byte, sessionID string, on func
 			reply.Heard = text
 			return reply, err
 		}
-		if m.sttFailures++; m.sttFailures >= sttFailuresToSkip {
-			m.sttSkipUntil = m.clock().Add(sttSkipFor)
-		}
+		m.noteSTTFailure()
 		slog.Warn("muse: local recognition unavailable, using Muse voice recognition", "err", err)
 	}
 	return m.link.Ask(ctx, wavFile(media.Normalize(samples)), sessionID, on)
 }
 
 // skipLocalSTT is true while the owner's recogniser has failed often enough to be left alone.
-func (m *viaMuse) skipLocalSTT() bool { return m.clock().Before(m.sttSkipUntil) }
+func (m *viaMuse) skipLocalSTT() bool {
+	m.sttMu.Lock()
+	defer m.sttMu.Unlock()
+	return m.clock().Before(m.sttSkipUntil)
+}
+
+func (m *viaMuse) noteSTTSuccess() {
+	m.sttMu.Lock()
+	m.sttFailures = 0
+	m.sttMu.Unlock()
+}
+
+func (m *viaMuse) noteSTTFailure() {
+	m.sttMu.Lock()
+	defer m.sttMu.Unlock()
+	if m.sttFailures++; m.sttFailures >= sttFailuresToSkip {
+		m.sttSkipUntil = m.clock().Add(sttSkipFor)
+	}
+}
 
 func (m *viaMuse) clock() time.Time {
 	if m.now == nil {
