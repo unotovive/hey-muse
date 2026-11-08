@@ -89,9 +89,11 @@ def deploy(args):
             cfg.pop("codex", None)
             cfg["power_controls"] = {k: dict(label=v[0], icon=v[1], toggle=v[2], on=v[3], off=v[4])
                                      for k, v in live.POWER_NAMES.items()}
-            cfg["voice_devices"] = {k: dict(name=v[0], type=v[1]) for k, v in light.VOICE_DEVICES.items()}
-            cfg["voice_scenes"] = {k: {op: name} for (k, op), name in light.VOICE_SCENES.items()}
-            cfg["hall"] = dict(name="廊下の電気", type="Color Bulb", transport="cloud")
+            if cfg.get("backend", "switchbot") in ("", "switchbot"):
+                cfg["voice_devices"] = {k: dict(name=v[0], type=v[1]) for k, v in light.VOICE_DEVICES.items()}
+                cfg["voice_scenes"] = {k: {op: name} for (k, op), name in light.VOICE_SCENES.items()}
+                cfg["hall"] = dict(name="廊下の電気", type="Color Bulb", transport="cloud")
+            # SwitchBot 以外では home-local.json の voice_devices / hall（Remo の nickname と type）をそのまま使う。
             add("home-local.json", json.dumps(cfg, ensure_ascii=False).encode())
             # 資格情報とカレンダー購読は存在するものだけ送る（Remo のみの構成では switchbot.env が無い）。
             for name, source in (("switchbot.env", Path.home() / "switchbot_token.env"),

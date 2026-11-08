@@ -56,6 +56,8 @@ NATURE_REMO_TOKEN=取得したトークン
 }
 ```
 
+`deploy_usb.py config` は `backend` が `nature_remo` のとき、ブリッジ側 `home-local.json` の `voice_devices` と `hall` を SwitchBot 側の名前で上書きせず、そのまま送ります。
+
 `remo_local` はローカル API 用の枠で、現在は `home-check` に表示するだけです。送信は Cloud API のみです。機器一覧とセンサー値は60秒キャッシュされ、429 が返ると `Retry-After`（無ければ300秒）の間は送信を止めます。
 
 ## 元の構成に戻す

@@ -238,7 +238,31 @@ func (b natureRemo) appliance(ctx context.Context, cfg settings, key, action str
 	default:
 		return errors.New("unsupported appliance type")
 	}
-	return b.api(ctx, http.MethodPost, path, form, nil)
+	if err := b.api(ctx, http.MethodPost, path, form, nil); err != nil {
+		return err
+	}
+	if a.Type == "AC" && form.Get("operation_mode") != "" {
+		b.rememberAircon(a.ID, form.Get("operation_mode"), form.Get("temperature"))
+	}
+	return nil
+}
+
+// rememberAircon は送信に成功した mode/temp をキャッシュへ反映する。共有スライスは書き換えず差し替える。
+func (b natureRemo) rememberAircon(id, mode, temp string) {
+	h := b.h
+	h.remoMu.Lock()
+	defer h.remoMu.Unlock()
+	list := make([]remoAppliance, len(h.remoAppliances))
+	copy(list, h.remoAppliances)
+	for i := range list {
+		if list[i].ID == id {
+			list[i].Settings.Mode = mode
+			if temp != "" {
+				list[i].Settings.Temp = temp
+			}
+		}
+	}
+	h.remoAppliances = list
 }
 
 func (b natureRemo) environment(ctx context.Context, cfg settings) (*Environment, error) {

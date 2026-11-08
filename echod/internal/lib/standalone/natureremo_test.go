@@ -48,7 +48,8 @@ func TestRemoLightAndAirconCommands(t *testing.T) {
 		{"ac", "off", 0, "/1/appliances/A1/aircon_settings", "button=power-off"},
 		{"ac", "cool", 26, "/1/appliances/A1/aircon_settings", "operation_mode=cool&temperature=26"},
 		{"ac", "heat", 0, "/1/appliances/A1/aircon_settings", "operation_mode=warm"},
-		{"ac", "temp", 24, "/1/appliances/A1/aircon_settings", "operation_mode=cool&temperature=24"},
+		{"ac", "temp", 24, "/1/appliances/A1/aircon_settings", "operation_mode=warm&temperature=24"},
+		{"ac", "on", 0, "/1/appliances/A1/aircon_settings", "operation_mode=warm"},
 	} {
 		if err := h.Appliance(ctx, c.key, c.action, c.value); err != nil {
 			t.Fatalf("%v: %v", c, err)
