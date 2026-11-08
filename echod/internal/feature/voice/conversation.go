@@ -763,6 +763,12 @@ func (c *conversation) turnEvent(e event) {
 		c.reply.stream.send(playbackChunk{data: e.audio, consumed: e.consumed})
 
 	case evMusePartEnd:
+		// A message said a sentence at a time was announced (evReplyText) with its first sentence:
+		// the whole of it, as said, is what the turn and the log keep.
+		if e.text != "" && c.phase != phaseIdle {
+			c.log.Replied(e.text)
+			c.turn.Replying(e.text)
+		}
 		if c.phase == phaseReplying && c.reply.stream != nil {
 			c.reply.stream.send(playbackChunk{partEnd: true, consumed: e.consumed})
 		} else if e.consumed != nil {

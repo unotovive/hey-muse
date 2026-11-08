@@ -256,14 +256,18 @@ func (m *viaMuse) answer(ctx context.Context, pcm []byte, sessionID string) {
 	}()
 
 	// Nothing heard for a while after the question: one short chime says the answer is on its way.
-	var audible atomic.Bool
+	// Stop does not wait for a chime already on its way, so the turn ending is marked for it to see.
+	var audible, ended atomic.Bool
 	if m.thinking != nil && m.thinkingAfter > 0 {
 		chime := time.AfterFunc(m.thinkingAfter, func() {
-			if !audible.Load() && ctx.Err() == nil {
+			if !audible.Load() && !ended.Load() && ctx.Err() == nil {
 				m.thinking()
 			}
 		})
-		defer chime.Stop()
+		defer func() {
+			ended.Store(true)
+			chime.Stop()
+		}()
 	}
 	emit := func(samples []int16) error {
 		if err := ctx.Err(); err != nil {
@@ -277,8 +281,18 @@ func (m *viaMuse) answer(ctx context.Context, pcm []byte, sessionID string) {
 		return nil
 	}
 	v := m.voice()
+	// Once the endpoint has failed and the built-in voice said a sentence instead, the rest of the
+	// turn is in the built-in voice: an endpoint that is down would cost its timeout per sentence.
+	var builtInOnly atomic.Bool
 	fetch := func(qctx context.Context, text string, out func([]int16) error) error {
-		err := m.say(qctx, v, text, out)
+		voice := v
+		if builtInOnly.Load() {
+			voice = speech.BuiltIn
+		}
+		fellBack, err := m.say(qctx, voice, text, out)
+		if fellBack {
+			builtInOnly.Store(true)
+		}
 		if err != nil && qctx.Err() == nil {
 			stopAsk() // the voice has failed: there is no use waiting for more to say
 		}
@@ -300,8 +314,10 @@ func (m *viaMuse) answer(ctx context.Context, pcm []byte, sessionID string) {
 			part.Push(s)
 		}
 	}
-	// endPart waits for the message being said to have played.
-	endPart := func() {
+	// endPart waits for the message being said to have played. said is the whole reply as it stands
+	// once it has: the part was shown (evReplyText) with only its first sentence, so the turn's record
+	// takes the reply from evMusePartEnd.
+	endPart := func(said string) {
 		if part == nil {
 			return
 		}
@@ -319,7 +335,7 @@ func (m *viaMuse) answer(ctx context.Context, pcm []byte, sessionID string) {
 			return
 		}
 		if !q.FirstAudio().IsZero() {
-			m.post(event{kind: evMusePartEnd, ctx: ctx})
+			m.post(event{kind: evMusePartEnd, text: said, ctx: ctx})
 		}
 	}
 	// Settled and the final return value contain the entire answer: what has not been said of it,
@@ -327,7 +343,7 @@ func (m *viaMuse) answer(ctx context.Context, pcm []byte, sessionID string) {
 	sayRest := func(full string) {
 		full = speech.Spoken(full)
 		say(cursor.Next(full, true), full)
-		endPart()
+		endPart(full)
 	}
 	reply, err := m.ask(askCtx, pcm, sessionID, func(e muse.ReplyEvent) {
 		if askCtx.Err() != nil {
@@ -362,7 +378,7 @@ func (m *viaMuse) answer(ctx context.Context, pcm []byte, sessionID string) {
 				display = preview
 			}
 			say(cursor.Next(messages, true), display)
-			endPart()
+			endPart(display)
 		case muse.Settled:
 			sayRest(v.Text)
 		}
@@ -373,7 +389,7 @@ func (m *viaMuse) answer(ctx context.Context, pcm []byte, sessionID string) {
 	if err == nil && speechErr == nil {
 		sayRest(reply.Text)
 	}
-	endPart()
+	endPart(speech.Spoken(reply.Text))
 	if ctx.Err() != nil {
 		return
 	}
@@ -401,7 +417,8 @@ func (m *viaMuse) answer(ctx context.Context, pcm []byte, sessionID string) {
 // the endpoint fails before any chunk was handed out, a piece held back included, the sentence is
 // said in the built-in voice instead. Chunks are cut per sentence, so the end of one sentence never
 // waits for the next one's voice.
-func (m *viaMuse) say(ctx context.Context, v speech.Voice, text string, out func([]int16) error) error {
+// fellBack says the built-in voice was asked.
+func (m *viaMuse) say(ctx context.Context, v speech.Voice, text string, out func([]int16) error) (fellBack bool, err error) {
 	held := make([]int16, 0, 2*museChunk)
 	started := false
 	flush := func() error {
@@ -424,9 +441,10 @@ func (m *viaMuse) say(ctx context.Context, v speech.Voice, text string, out func
 			return ctx.Err()
 		})
 	}
-	err := speak(v)
+	err = speak(v)
 	if err != nil && ctx.Err() == nil && !v.Local() && !started {
 		slog.Warn("muse: the speech endpoint failed, so the answer is in the built-in voice", "voice", v, "err", err)
+		fellBack = true
 		held = held[:0]
 		if lerr := speak(speech.BuiltIn); lerr != nil {
 			err = fmt.Errorf("%w; %w", err, lerr)
@@ -435,12 +453,12 @@ func (m *viaMuse) say(ctx context.Context, v speech.Voice, text string, out func
 		}
 	}
 	if err != nil {
-		return err
+		return fellBack, err
 	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return fellBack, err
 	}
-	return flush()
+	return fellBack, flush()
 }
 
 // wavFile wraps 16 kHz 16-bit mono samples as the voice note Muse takes.

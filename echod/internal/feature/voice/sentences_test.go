@@ -2,10 +2,12 @@ package voice
 
 import (
 	"slices"
+	"strings"
 	"testing"
 )
 
 func TestSplitSentences(t *testing.T) {
+	long := strings.Repeat("あ", maxQuoteRunes)
 	for in, want := range map[string]struct {
 		complete []string
 		rest     string
@@ -18,6 +20,8 @@ func TestSplitSentences(t *testing.T) {
 		"本当！？すごい":             {[]string{"本当！？"}, "すごい"},
 		"行こう。」と彼。":            {[]string{"行こう。」", "と彼。"}, ""},
 		"段落一\n\n段落二":          {[]string{"段落一"}, "段落二"},
+		// A bracket never closed stops holding sentences together once it has gone on too long.
+		"「" + long + "。次の文。": {[]string{"「" + long + "。", "次の文。"}, ""},
 	} {
 		complete, rest := splitSentences(in)
 		if !slices.Equal(complete, want.complete) || rest != want.rest {

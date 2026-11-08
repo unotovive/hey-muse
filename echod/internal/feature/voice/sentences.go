@@ -69,14 +69,18 @@ const (
 	sentenceEnds = "。！？!?"
 	closers      = "」』）)】〉》”’\"'"
 	openers      = "「『（(【〈《“‘"
+	// maxQuoteRunes is how long brackets hold sentences together: a bracket left open (or one that
+	// opened in an earlier piece) must not keep a whole answer from being said until it ends.
+	maxQuoteRunes = 40
 )
 
 // splitSentences cuts s after each run of 。！？!? (with the closing brackets and quotes right after
 // it) and at each run of line breaks, and returns the sentences, trimmed, and what follows the last
-// cut. A mark inside brackets ends nothing: 「本当？」と言った。 is one sentence. A period is not
+// cut. A mark inside brackets ends nothing: 「本当？」と言った。 is one sentence, though only for
+// maxQuoteRunes after the bracket opened, so one never closed does not hold the rest. A period is not
 // a sentence end, so 3.5 stays whole.
 func splitSentences(s string) (complete []string, rest string) {
-	start, depth := 0, 0
+	start, depth, opened := 0, 0, 0
 	cut := func(end, next int) {
 		if piece := strings.TrimSpace(s[start:end]); piece != "" {
 			complete = append(complete, piece)
@@ -95,10 +99,14 @@ func splitSentences(s string) (complete []string, rest string) {
 			depth = 0
 			continue
 		case strings.ContainsRune(openers, r):
+			if depth == 0 {
+				opened = i
+			}
 			depth++
 		case strings.ContainsRune(closers, r) && depth > 0:
 			depth--
-		case strings.ContainsRune(sentenceEnds, r) && depth == 0:
+		case strings.ContainsRune(sentenceEnds, r) && (depth == 0 || utf8.RuneCountInString(s[opened:i]) > maxQuoteRunes):
+			depth = 0
 			i += n
 			for i < len(s) {
 				r, n := utf8.DecodeRuneInString(s[i:])

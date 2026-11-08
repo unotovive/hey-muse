@@ -12,6 +12,9 @@ import (
 	"testing"
 	"time"
 
+	esphome "github.com/ygelfand/go-esphome-device"
+
+	"github.com/HuskerMinion/techo5/echod/internal/feature/activity"
 	"github.com/HuskerMinion/techo5/echod/internal/lib/muse"
 	"github.com/HuskerMinion/techo5/echod/internal/lib/speech"
 )
@@ -56,9 +59,11 @@ func (l fakeLink) Ask(ctx context.Context, wav []byte, _ string, on func(muse.Re
 	return l.ask(ctx, wav, on)
 }
 
-// speaking is a voice of n samples at 16 kHz handed over per at a time, as a read brings them.
+// speaking is a voice of n samples at 16 kHz handed over per at a time, as a read brings them: n for
+// every sentence, which may be fetched side by side.
 func speaking(n, per int) speakFunc {
 	return func(ctx context.Context, _ speech.Voice, text string, out func([]int16) error) error {
+		n := n
 		for n > 0 {
 			k := min(per, n)
 			if err := out(make([]int16, k)); err != nil {
@@ -206,6 +211,44 @@ func TestMuseSpeaksSentencesAsTheyArrive(t *testing.T) {
 	if !sameKinds(kinds, want) || previews != 2 {
 		t.Errorf("events %v with %d previews, want %v with 2", kinds, previews, want)
 	}
+	// The part was announced with its first sentence; its end carries the whole reply, for the record.
+	for _, e := range p.all() {
+		if e.kind == evMusePartEnd && e.text != "今日は晴れです。気温は20度。" {
+			t.Errorf("the message ended as %q, want the whole reply", e.text)
+		}
+	}
+}
+
+// What the turn and the log keep of a reply said a sentence at a time is the whole of it, not the
+// first sentence it was announced with.
+func TestMuseRecordsTheWholeStreamedReply(t *testing.T) {
+	var lastReply *esphome.TextSensor
+	for _, e := range activity.Get().Entities() {
+		if ts, ok := e.(*esphome.TextSensor); ok && ts.ObjectID == "last_reply" {
+			lastReply = ts
+		}
+	}
+	if lastReply == nil {
+		t.Fatal("no last_reply sensor")
+	}
+	p := &posted{}
+	m := newViaMuse(fakeLink{ask: func(_ context.Context, _ []byte, on func(muse.ReplyEvent)) (muse.Reply, error) {
+		on(muse.ReplyText{Text: "今日は晴れです。"})
+		on(muse.Settled{Text: "今日は晴れです。気温は20度。"})
+		return muse.Reply{Text: "今日は晴れです。気温は20度。"}, nil
+	}}, builtIn, speaking(museChunk, museChunk), p.post)
+	m.answer(context.Background(), someAudio, "")
+
+	c := &conversation{phase: phaseThinking, log: activity.Get()}
+	c.log.Replied("今日は晴れです。") // what evReplyText, sent with the first sentence, left
+	for _, e := range p.all() {
+		if e.kind == evMusePartEnd {
+			c.handle(e)
+		}
+	}
+	if got := lastReply.Get(); got != "今日は晴れです。気温は20度。" {
+		t.Errorf("the log kept %q", got)
+	}
 }
 
 // What the server rewrites after it was said is not said again, nor said in its new words; the
@@ -242,6 +285,10 @@ func TestMuseThinkingSoundAfterDelay(t *testing.T) {
 		}}, builtIn, speaking(museChunk, museChunk), (&posted{}).post)
 		m.thinking = func() { chimes.Add(1) }
 		m.thinkingAfter = 10 * time.Millisecond
+		if c.wait == 0 {
+			// A quick answer is one well within the wait, however busy the machine running this is.
+			m.thinkingAfter = time.Second
+		}
 		m.answer(context.Background(), someAudio, "")
 		time.Sleep(20 * time.Millisecond)
 		if got := chimes.Load(); got != c.want {
@@ -531,6 +578,38 @@ func TestMuseVoiceAndItsFallback(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// Once the endpoint has failed and a sentence was said in the built-in voice, the rest of the turn
+// is too: an endpoint that is down is not asked again for every sentence.
+func TestMuseStaysInBuiltInVoiceAfterFallback(t *testing.T) {
+	var mu sync.Mutex
+	var asked []speech.Voice
+	builtInAsked := make(chan struct{}, 4)
+	speak := func(ctx context.Context, v speech.Voice, text string, out func([]int16) error) error {
+		mu.Lock()
+		asked = append(asked, v)
+		mu.Unlock()
+		if !v.Local() {
+			return errors.New("speech: dial tcp: i/o timeout")
+		}
+		builtInAsked <- struct{}{}
+		return speaking(museChunk, museChunk)(ctx, v, text, out)
+	}
+	m := newViaMuse(fakeLink{ask: func(_ context.Context, _ []byte, on func(muse.ReplyEvent)) (muse.Reply, error) {
+		on(muse.ReplyText{Text: "一つ目。"})
+		select {
+		case <-builtInAsked:
+		case <-time.After(2 * time.Second):
+			t.Error("the first sentence did not fall back")
+		}
+		on(muse.Settled{Text: "一つ目。二つ目。"})
+		return muse.Reply{Text: "一つ目。二つ目。"}, nil
+	}}, func() speech.Voice { return "coral" }, speak, (&posted{}).post)
+	m.answer(context.Background(), someAudio, "")
+	if want := []speech.Voice{"coral", speech.BuiltIn, speech.BuiltIn}; !slices.Equal(asked, want) {
+		t.Errorf("asked %v, want %v", asked, want)
 	}
 }
 
