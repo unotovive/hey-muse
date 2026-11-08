@@ -38,7 +38,7 @@ ip -4 addr show | grep -v 127.0.0.1 | grep inet
 
 ### 2. systemd ユニットを入れる
 
-`/etc/wsl.conf` の `[boot]` に `systemd=true` が必要です（`install.sh` が確認します）。WSL の中で `install.sh` を実行します。`sudo` のパスワードを 1 回聞かれます。何度実行しても安全です。ユニットの `User=` は、実行したユーザーに自動で置き換わります。
+`/etc/wsl.conf` の `[boot]` に `systemd=true` が必要です（`install.sh` が確認し、なければ止まります）。WSL の中で `install.sh` を実行します。`sudo` のパスワードを 1 回聞かれます。何度実行しても安全です。ユニットの `User=` とリポジトリの場所は、実行したユーザーと `install.sh` 自身の場所に自動で置き換わります。clone 先は下の例と違っていてもかまいません。
 
 ```bash
 cd ~/projects/musekusa/hey-muse
