@@ -51,7 +51,7 @@ On an Echo Show 5 2nd gen with its bootloader unlocked and LineageOS 18.1 on it,
 [TECHO5's getting started guide](docs/getting-started.md) leaves you:
 
 ```sh
-git clone https://github.com/wobsoriano/hey-muse
+git clone https://github.com/unotovive/hey-muse
 cd hey-muse
 python3 tools/install-show.py
 ```

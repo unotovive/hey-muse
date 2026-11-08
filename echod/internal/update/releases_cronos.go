@@ -3,4 +3,4 @@
 package update
 
 // releases is where the Echo Show 5's releases are published.
-const releases = "https://github.com/wobsoriano/hey-muse/releases"
+const releases = "https://github.com/unotovive/hey-muse/releases"

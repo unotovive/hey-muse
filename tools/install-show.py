@@ -63,7 +63,7 @@ from techo5lib import (CONSOLE_TECHO5, Adb, Console, Fail, Fastboot, Release, as
                        need, new_api_key, note, pick_unit, run_main, step, valid_api_key, wait_for, wifi_conf,
                        write_private)
 
-REPO = 'wobsoriano/hey-muse'
+REPO = 'unotovive/hey-muse'
 # The LineageOS kernel commit TECHO5's kernel is rebuilt from: the vendor modules only load on it.
 # All three boards run this same commit, which is why one daemon and one installer serve them.
 KERNEL_RELEASE = '4.9.337-g8d928c5176cc'
@@ -307,7 +307,7 @@ def show_version(tag):
     """A Show release's tag as something that orders: vX.Y.Z, or this fork's vX.Y.Z-muse.N, which comes
     after the vX.Y.Z it is built on and before the next. Without the suffix read, no release of the
     fork was "earlier" than another, and one with no boot image of its own found none to use."""
-    m = re.match(r'^v(\d+)\.(\d+)\.(\d+)(?:-muse\.(\d+))?$', tag)
+    m = re.match(r'^v(\d+)\.(\d+)\.(\d+)(?:-(?:muse|ja)\.(\d+))?$', tag)
     return tuple(int(x or 0) for x in m.groups()) if m else None
 
 

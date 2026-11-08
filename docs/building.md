@@ -34,7 +34,7 @@ over SSH), and the kernel needs a Linux machine or virtual machine.
 Get the code (the three repositories side by side, if you build for more than one device):
 
 ```
-git clone https://github.com/wobsoriano/hey-muse
+git clone https://github.com/unotovive/hey-muse
 cd techo5
 ```
 

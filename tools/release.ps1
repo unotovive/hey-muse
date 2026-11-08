@@ -4,7 +4,7 @@
 
 .DESCRIPTION
   The daemon's built-in updater fetches
-  https://github.com/wobsoriano/hey-muse/releases/latest/download/manifest.json (stable) and
+  https://github.com/unotovive/hey-muse/releases/latest/download/manifest.json (stable) and
   installs the binary it names. This script produces both files and publishes them with gh.
 
 .EXAMPLE
@@ -398,7 +398,7 @@ if ($skylightGiven) {
     Test-Image $SkylightStore -NoFile $unitFirmware
 }
 if (-not $SignKey -or -not (Test-Path $SignKey)) { throw "no release signing key: set TECHO5_SIGN_KEY or pass -SignKey" }
-$repo = 'wobsoriano/hey-muse'
+$repo = 'unotovive/hey-muse'
 $root = Resolve-Path (Join-Path $PSScriptRoot '..')
 $bin = Join-Path $root 'bin'
 New-Item -ItemType Directory -Force $bin | Out-Null

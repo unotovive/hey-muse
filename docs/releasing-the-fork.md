@@ -1,6 +1,6 @@
 # Releasing this fork
 
-This fork is `wobsoriano/hey-muse`. It adds [Muse](muse.md) to TECHO5 and publishes its own releases
+This fork is `unotovive/hey-muse`. It adds [Muse](muse.md) to TECHO5 and publishes its own releases
 for the Echo Show, signed with its own key. [building.md](building.md#releases-maintainer) describes
 upstream's release, which runs from Windows. This page is the same job from a Mac with no Docker and
 one Show on the network.
@@ -10,7 +10,7 @@ scripts and have not been run.
 
 ## What differs from upstream
 
-- The daemon's updater reads `https://github.com/wobsoriano/hey-muse/releases`
+- The daemon's updater reads `https://github.com/unotovive/hey-muse/releases`
   (`echod/internal/update/releases_cronos.go`) and trusts this fork's public key
   (`echod/internal/update/trust.go`, and the same key as `RELEASE_KEY` in `tools/techo5lib.py`).
 - `tools/install-show.py` (`REPO`), `tools/release.ps1` and the attestation check in
@@ -107,7 +107,7 @@ Assistant's update card shows a version with a suffix is **not verified**.
    and `tools/techo5lib.py` accepted the signature.
 
    ```sh
-   R=https://github.com/wobsoriano/hey-muse/releases
+   R=https://github.com/unotovive/hey-muse/releases
    (cd echod && go run ./cmd/mkmanifest -version $V -title "TECHO5 $V" -notes "<what changed>" \
      -release-url $R/tag/$V -from $R/download/$V \
      -arm ../bin/echod-arm -rootfs-arm ../bin/techo5-rootfs-$V.tar.gz \
@@ -119,7 +119,7 @@ Assistant's update card shows a version with a suffix is **not verified**.
 
    ```sh
    git tag $V && git push fork $V
-   gh release create $V --repo wobsoriano/hey-muse --title $V --notes "<what changed>" --latest \
+   gh release create $V --repo unotovive/hey-muse --title $V --notes "<what changed>" --latest \
      bin/echod-arm bin/techo5-rootfs-$V.tar.gz bin/manifest.json bin/manifest.json.sig bin/SHA256SUMS
    ```
 
@@ -130,7 +130,7 @@ Assistant's update card shows a version with a suffix is **not verified**.
    release's manifest. Create that release once, then replace its two files with each release.
 
    ```sh
-   gh release upload dev bin/manifest.json bin/manifest.json.sig --repo wobsoriano/hey-muse --clobber
+   gh release upload dev bin/manifest.json bin/manifest.json.sig --repo unotovive/hey-muse --clobber
    ```
 
 8. Check from the outside.
@@ -163,7 +163,7 @@ on Linux and builds an attested `echod-arm`. To ship that binary in place of a l
 the tag first, then:
 
 ```sh
-gh run download --repo wobsoriano/hey-muse -n techo5-$V -D bin
+gh run download --repo unotovive/hey-muse -n techo5-$V -D bin
 PREBUILT_DAEMON=bin/echod-arm HOST=<the Show's address> tools/linux/deploy-rootfs.sh --version $V --install
 ```
 

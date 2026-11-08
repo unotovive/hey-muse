@@ -23,6 +23,7 @@ env:
 
 jobs:
   image:
+    if: github.repository == 'HuskerMinion/techo5'
     runs-on: ubuntu-latest
     # Writing is for publishing on a release tag: the package, and the attestation that goes with it.
     permissions:
