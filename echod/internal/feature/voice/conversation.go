@@ -1168,6 +1168,14 @@ func deviceEnds(be backend, followUp bool) bool {
 	return !followUp && !config.Get().Microphone.PipelineEnds
 }
 
+// echoVADSocket is where the local Silero speech detector listens (tools/echo-asr).
+const echoVADSocket = "/run/echo-vad.sock"
+
+// dialNeural opens a turn's connection to the local Silero speech detector; a test replaces it.
+var dialNeural = func(ctx context.Context) (*endpoint.Neural, error) {
+	return endpoint.DialNeural(ctx, echoVADSocket)
+}
+
 // sentWhole is whether be is an answerer sent the utterance whole once the device decides it has ended
 // (the direct pipeline and Muse), rather than one that listens along (Home Assistant, realtime voice).
 func sentWhole(be backend) bool {
@@ -1799,7 +1807,7 @@ func (c *conversation) pumpFrom(ctx context.Context, be backend, slot int, follo
 	var neural *endpoint.Neural
 	if answerer {
 		var err error
-		neural, err = endpoint.DialNeural(ctx, "/run/echo-vad.sock")
+		neural, err = dialNeural(ctx)
 		if err == nil {
 			defer func() {
 				if neural != nil {
@@ -1847,7 +1855,12 @@ func (c *conversation) pumpFrom(ctx context.Context, be backend, slot int, follo
 			ep = endpoint.New(settings())
 		}
 		ended, endedAt := false, 0
-		if neural != nil {
+		// Silero hears nothing of the wake sound, the history before it included: it decides once and
+		// for good (Neural.Feed), so the wake word's end and the quiet of someone waiting for the sound
+		// would end the turn on the first frame after it. It starts on what follows the sound, as the
+		// fresh energy detector does; a request said inside the sound is saidCheck's. Its EndedAt
+		// counts from there.
+		if neural != nil && !watching {
 			var err error
 			ended, err = neural.Feed(frame)
 			endedAt = neural.EndedAt()
@@ -1855,8 +1868,6 @@ func (c *conversation) pumpFrom(ctx context.Context, be backend, slot int, follo
 				slog.Warn("local speech detector failed; using energy detector", "err", err)
 				neural.Close()
 				neural = nil
-			} else if watching {
-				// Not inside the wake sound: the first frame after it ends the turn if speech already has.
 				ended = false
 			}
 		}
