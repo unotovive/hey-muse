@@ -4,8 +4,8 @@
 
 | 項目 | 内容 | 状態 |
 |---|---|---|
-| 1 | （別タスク。ブートローダー解除と起動の確認） | 別タスクで記録 |
-| 2 | （別タスク。署名つきイメージの導入の確認） | 別タスクで記録 |
+| 1 | ブートローダー解除と起動の確認 | 別途記録（実機待ち） |
+| 2 | 署名つきイメージの導入の確認 | 別途記録（実機待ち） |
 | 3 | 母艦停止時の音声ノートへの切替 | 未実施（実機待ち） |
 | 4 | 録音終了から最初の音声までの時間 | 未実施（実機待ち） |
 | 5 | Nature Remo と家電コマンドのテスト | 実施済み・合格 |
@@ -17,7 +17,7 @@
 
 ## 項目 1・2（別タスクの範囲）
 
-項目 1 と 2 は Task 6 の担当で、ここには記録しません。ブートローダーの解除が終わるまで、以降の実機の項目は進められません。
+項目 1 と 2 はブートローダー解除と起動の作業の側で記録し、ここには記録しません。解除が終わるまで、以降の実機の項目は進められません。
 
 ## 項目 3 母艦停止時の音声ノートへの切替（未実施・実機待ち）
 
@@ -30,7 +30,7 @@
    ```
 
 2. 端末に「Hey Muse、今日の天気は」と話しかけます。
-3. 端末の USB コンソールまたは SSH でログを確認します。ログは `/data/techo5-linux/techo5.log` です（SSH が有効なとき。Dot では `echod.log`）。
+3. 端末の USB コンソールまたは SSH でログを確認します。ログは、SSH が有効なときの既定で `/data/techo5-linux/techo5.log` です（Dot では `echod.log`）。違うときは `ls /data/techo5-linux/` で探します。
 
    ```sh
    grep 'local recognition unavailable' /data/techo5-linux/techo5.log | tail -3
@@ -143,4 +143,4 @@ Test-NetConnection 母艦のLAN_IP -Port 50024
 | ARMv7 ビルド | `cd echod && GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -o /tmp/echod-arm-check ./cmd/echod` | 成功。32 ビット ARM の静的 ELF、約 72 MB |
 | CI | GitHub Actions の `v1.6.30-ja.2` の run（42517139377） | `uboot` と `build` が成功、`panel` は実行されず |
 
-CI の run は https://github.com/unotovive/hey-muse/actions/runs/42517139377 です。`gh run view` で確認しました。リリースはドラフトで、施主の公開操作を待っています。
+CI の run は https://github.com/unotovive/hey-muse/actions/runs/42517139377 です。`gh run view` で確認しました。リリースは、`gh release view v1.6.30-ja.2 --repo unotovive/hey-muse --json isDraft,assets` で、`isDraft` が `true`（ドラフト）、添付は `echod-arm`、`manifest.json`、`manifest.json.sig`、`SHA256SUMS`、`techo5-boot-checkers-v1.6.30-ja.2.img`、`techo5-rootfs-v1.6.30-ja.2.tar.gz` の 6 つでした。施主の公開操作を待っています。

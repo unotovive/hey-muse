@@ -67,14 +67,16 @@ systemctl is-active muse-asr && journalctl -u muse-asr -n 5 --no-pager
 手順 1 のスクリプトが、タスク `hey-muse WSL` を登録しています。ログオン時に `wsl.exe -d Ubuntu --exec /bin/sleep infinity` を 1 本起動し、WSL が idle で終了するのを防ぎます。タスクは実行時間の制限なし、バッテリー駆動でも開始・継続する設定です。ディストリビューション名は `wsl -l -q` で確認し、`Ubuntu` がなければ止まります（`docker-desktop` は使いません）。別の名前なら `-Distro 名前` を付けて実行します。
 
 ```powershell
-schtasks /Query /TN "hey-muse WSL" /V /FO LIST | Select-String "Task To Run","Stop the task if it runs longer than","Power Management"
+schtasks /Query /TN "hey-muse WSL" /V /FO LIST | Select-String "実行するタスク","タスクを停止するまでの時間","電源管理"
 ```
+
+日本語の Windows では項目名が日本語で出ます（英語の Windows では `Task To Run`、`Stop the task if it runs longer than`、`Power Management`）。絞り込みの語は、お使いの Windows の表記に合わせてください。
 
 期待する結果は次のとおりです。
 
-- `Task To Run:` の行に `wsl.exe -d Ubuntu --exec /bin/sleep infinity` が出ます。
-- `Stop the task if it runs longer than:` が `Disabled` です。
-- `Power Management` に電源条件の停止がありません（`Stop On Battery Mode: No Start On Batteries`）。
+- 「実行するタスク」の行に `wsl.exe -d Ubuntu --exec /bin/sleep infinity` が出ます。
+- 「タスクを停止するまでの時間」が、時間の値（`72:00:00` など）でなく「無効」（`Disabled`）です。
+- 「電源管理」に「バッテリ モードで停止」と「バッテリで開始しない」が含まれません（英語表記では `Stop On Battery Mode` と `No Start On Batteries`）。
 
 ### 4. 再起動して確認する
 
@@ -190,19 +192,52 @@ Echo Show では、P2P 地震情報（https://www.p2pquake.net/）の WebSocket 
 
 ## 第 7 部 端末設定の配置
 
-端末に置く設定は、母艦（または Windows）の `~/.config/hey-muse/` で用意し、USB 経由でまとめて送ります。ここでは Nature Remo と Google カレンダーを使う構成を前提にします。
+端末に置く設定は、Windows 側で用意し、USB 経由でまとめて送ります。送信に使う `deploy_usb.py` は Windows の Python で動かします（USB のシリアル接続に Windows の API を使うため、WSL の中では動きません）。ここでは Nature Remo と Google カレンダーを使う構成を前提にします。以下の `~` は Windows のホームフォルダー、`BASE` は `~/Documents/muse_on_echo` のことです。
 
-> 番号について: 計画では第 5・6 部としていましたが、その番号は在室検知と地震情報の節がすでに使っているため、この端末設定と次の Muse の節は第 7・8 部にしました。在室検知は第 5 部、地震情報は第 6 部です。
+### 0. 端末を `v1.6.30-ja.2` にする
+
+端末が新しいリリースで動いていることを先に確かめます。方法は 2 つあります。
+
+- 設定画面から: 端末の設定画面で更新を確認し、`v1.6.30-ja.2` を入れます。リリースが公開（ドラフト解除）されていることが前提です。
+- 母艦から: 端末の IP アドレスを指定し、ルートファイルシステムを作って送ります。
+
+  ```bash
+  HOST=<端末IP> tools/linux/deploy-rootfs.sh --version v1.6.30-ja.2 --install --reboot
+  ```
+
+  `--version` は端末に記録する版名、`--install` は使っていない側のスロットへ入れること、`--reboot` は入れたあとに再起動して新しい側で起動することです。
+
+更新後に確認します。
+
+```bash
+ssh root@<端末IP> 'techo5 --version; slotctl status'
+```
+
+期待する結果: `v1.6.30-ja.2` と出て、再起動から 5 分後に `slotctl status` が `good` になります。
 
 ### 1. 設定ファイルを用意する
 
-| ファイル（母艦） | 端末での名前 | 内容 |
-|---|---|---|
-| `home-local.json` | `home-local.json` | `backend`、`calendars`、`voice_devices` |
-| `natureremo.env` | `natureremo.env` | `NATURE_REMO_TOKEN=…`（機種が決まるまで空でも可） |
-| `google-token.json` | `google-token.json` | 第 4 部で作ったトークン |
+`deploy_usb.py config` が読む場所は次のとおりです（実装に合わせています）。
 
-`home-local.json` は `tools/mothership/home-local.example.json` を元に作ります。Nature Remo を使うときの形は次のとおりです。`key` は SwitchBot 用なので空のままにします。`calendars` の `id` は第 4 部の手順 5 で表示されたものです（下はダミー値）。
+| 母艦側のファイル | 端末での名前 | 必須か | 内容 |
+|---|---|---|---|
+| `BASE/speech-bridge/home-local.json` | `home-local.json` | 必須 | `backend`、`calendars`、`voice_devices` |
+| `BASE/speech-bridge/home-requests.sqlite` | `initial-power.json`（中身を取り出して送る） | 必須 | 電源の最後の向きの表 `power_last` |
+| `~/natureremo.env`（`--remo-env ファイル` で変更可） | `natureremo.env` | あるときだけ | `NATURE_REMO_TOKEN=…` |
+| `~/.config/hey-muse/google-token.json` | `google-token.json` | あるときだけ | 第 4 部で作ったトークン |
+| `~/switchbot_token.env`、`BASE/calendar-feeds.txt` | `switchbot.env`、`calendar-feeds.txt` | あるときだけ | SwitchBot の資格情報、iCal の購読 URL |
+
+さらに、`deploy_usb.py` は `BASE/speech-bridge/` にある `echo_home.py` と `hall_light.py`、`BASE/assets/hey-muse/tools/` にある `techo5lib` を読み込みます。`BASE` の下にこの構成がなければ、`ModuleNotFoundError` で止まります。`tools/mothership/` の `echo_home.py` と `hall_light.py` を `BASE/speech-bridge/` に置いてください。
+
+`home-requests.sqlite` は、旧版の電源操作の記録で、`echo_home.py` が最初の電源操作のときに作ります。Nature Remo だけの新しい構成では、まだ無いので、空の表を手で作ります（Python の標準の sqlite3 を使います）。
+
+```text
+python -c "import sqlite3; c=sqlite3.connect(r'BASE/speech-bridge/home-requests.sqlite'); c.execute('create table if not exists power_last (device text primary key, direction text)'); c.commit()"
+```
+
+（`BASE` は実際のパスに置き換えます。）空の表のままなら、端末へ送られる `initial-power.json` は `{}` になります。
+
+`home-local.json` は `tools/mothership/home-local.example.json` を元に、上の場所に作ります。Nature Remo を使うときの形は次のとおりです。`key` は SwitchBot 用なので空のままにします。`calendars` の `id` は第 4 部の手順 5 で表示されたものです（下はダミー値）。
 
 ```json
 {
@@ -213,17 +248,17 @@ Echo Show では、P2P 地震情報（https://www.p2pquake.net/）の WebSocket 
 }
 ```
 
-Remo の機種が決まったら、`voice_devices` に Remo アプリの機器名と種類（照明は `LIGHT`、エアコンは `AC`）を書き、`natureremo.env` にトークンを入れて、もう一度手順 2 を実行します。書き方は `tools/standalone-home/README.md` の「Nature Remo を使う」にあります。
+Remo の機種が決まったら、`voice_devices` に Remo アプリの機器名と種類（照明は `LIGHT`、エアコンは `AC`）を書き、`natureremo.env` にトークンを入れて、もう一度手順 2 を実行します。`natureremo.env` を別の場所に置くときは `--remo-env ファイル` で指定します。書き方は `tools/standalone-home/README.md` の「Nature Remo を使う」にあります。
 
 ### 2. 端末へ送る
 
 端末を USB でつなぎ、シリアル番号を指定して送ります。
 
-```
-python3 tools/standalone-home/deploy_usb.py config --serial SERIAL
+```text
+python tools/standalone-home/deploy_usb.py config --serial SERIAL
 ```
 
-`natureremo.env` と `google-token.json` は、母艦に存在するときだけ送られます。端末側の置き場所は `/data/misc/techo5/standalone-home/` です。
+実行は Windows の Python で行います。`natureremo.env`、`google-token.json` などの「あるときだけ」のファイルは、存在しなければ黙って送られません。送り忘れに注意してください。端末側の置き場所は `/data/misc/techo5/standalone-home/` です。
 
 ### 3. 有効にして確認する
 
@@ -249,7 +284,7 @@ ls -l /data/misc/techo5/standalone-home/
 これらは端末の設定画面の「画面」カードで入り切りします。内容は第 5 部と第 6 部を見てください。施主向けの目安は次のとおりです。
 
 - 地震情報: 新しい端末では切れています。「地震情報を表示」を入れます。既定は震度 3 以上（`min_scale` 30）です。都道府県と音は `state.json` の `quake` で設定します。
-- 在室検知: 「人感検知」を入れ、消灯までの分数を選びます。就寝中に点かないよう、消灯を 5 分程度にするのが目安です。
+- 人感検知（在室検知）: 「人感検知」を入れ、消灯までの分数を選びます。就寝中に点かないよう、消灯を 5 分程度にするのが目安です。
 - 手で覆って停止: 「手で覆って停止」を入れると、アラームやタイマーをカメラへ手をかざして止められます。Home Assistant を使っている場合に限り、「Gestures」スイッチでも切り替えられます。使わなくても支障はありません。
 
 ## 第 8 部 Muse の契約とペアリング
