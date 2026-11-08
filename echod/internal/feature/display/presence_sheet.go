@@ -39,14 +39,20 @@ func withPresence(rows []settingRow) []settingRow {
 	if !camera.Available() {
 		return rows
 	}
-	p := config.Get().Presence
-	rows = append(rows,
-		settingRow{label: tr("presence_heading"), kind: ctlHeading},
-		settingRow{id: "presence", label: tr("presence_label"), sub: tr("presence_description"),
-			kind: ctlToggle, on: p.On})
+	return append(rows, presenceRows(config.Get().Presence)...)
+}
+
+// presenceRows are the room's rows for the given settings. The gestures row does not depend on presence
+// detection, since a hand over the camera works with detection off.
+func presenceRows(p config.Presence) []settingRow {
+	rows := []settingRow{
+		{label: tr("presence_heading"), kind: ctlHeading},
+		{id: "presence", label: tr("presence_label"), sub: tr("presence_description"), kind: ctlToggle, on: p.On},
+	}
 	if p.On {
 		rows = append(rows, settingRow{id: "awayoff", label: tr("screen_off_when_nobody_is_near"),
 			sub: tr("presence_return"), kind: ctlChoice, value: awayLabel(p.PresenceScreenOff())})
 	}
-	return rows
+	return append(rows, settingRow{id: "gestures", label: tr("gestures_label"), sub: tr("gestures_description"),
+		kind: ctlToggle, on: p.Gestures})
 }

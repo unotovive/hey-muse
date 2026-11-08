@@ -1327,6 +1327,8 @@ func (d *Display) rowTap(id string, p part, opt int) {
 		dlna.Get().Set(!config.Get().Streaming.DLNA)
 	case "presence":
 		safe.Go("presence from the screen", func() { presence.Get().SetOn(!config.Get().Presence.On) })
+	case "gestures":
+		safe.Go("gestures from the screen", func() { presence.Get().SetGestures(!config.Get().Presence.Gestures) })
 	case "settingslock":
 		if security.LockSet() {
 			if err := security.Get().SetPIN(""); err != nil {
