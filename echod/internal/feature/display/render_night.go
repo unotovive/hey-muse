@@ -39,7 +39,7 @@ var nightInk = clockInk{nightRed, nightGhost, flipTop, flipLower, flipHinge, fli
 func (s scene) redClockFace() bool {
 	return s.redClock && s.phase == "idle" && s.call.Phase == phone.Idle && !s.setupAsking && !s.showVideoAsk &&
 		!s.showWifi && !s.bt.Pairing && !s.showCamera && !s.showAnnouncement && !s.showReminder &&
-		!(s.showDash && s.dashAsked)
+		!s.showQuake && !(s.showDash && s.dashAsked)
 }
 
 // redClockPage is the night as a clock alone.

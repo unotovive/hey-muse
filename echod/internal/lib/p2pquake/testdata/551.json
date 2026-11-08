@@ -1,0 +1,19 @@
+{
+  "id": "6730a8f2c4e1d2a3b4c5d6e7",
+  "code": 551,
+  "time": "2026/11/09 10:15:22.415",
+  "issue": {"source": "気象庁", "time": "2026/11/09 10:15:00", "type": "DetailScale", "correct": "None"},
+  "earthquake": {
+    "time": "2026/11/09 10:12:00",
+    "hypocenter": {"name": "千葉県北西部", "latitude": 35.6, "longitude": 140.1, "depth": 60, "magnitude": 5.0},
+    "maxScale": 40,
+    "domesticTsunami": "None",
+    "foreignTsunami": "Unknown"
+  },
+  "points": [
+    {"pref": "千葉県", "addr": "千葉中央区", "isArea": false, "scale": 40},
+    {"pref": "千葉県", "addr": "市原市", "isArea": false, "scale": 30},
+    {"pref": "東京都", "addr": "東京千代田区", "isArea": false, "scale": 30},
+    {"pref": "神奈川県", "addr": "横浜中区", "isArea": false, "scale": 20}
+  ]
+}

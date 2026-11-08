@@ -131,6 +131,7 @@ func (st *Store) Get() Config {
 	}
 	c.Timers.Local = slices.Clone(st.c.Timers.Local)
 	c.Screen.WorldClocks = slices.Clone(st.c.Screen.WorldClocks)
+	c.Quake.Prefs = slices.Clone(st.c.Quake.Prefs)
 	c.Deck = st.c.Deck.clone()
 	c.Video = st.c.Video.clone()
 	c.Share = st.c.Share.clone()

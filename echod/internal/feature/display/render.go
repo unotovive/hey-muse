@@ -32,6 +32,7 @@ import (
 	"github.com/HuskerMinion/techo5/echod/internal/lib/avatar"
 	"github.com/HuskerMinion/techo5/echod/internal/lib/hass"
 	"github.com/HuskerMinion/techo5/echod/internal/lib/locale"
+	"github.com/HuskerMinion/techo5/echod/internal/lib/p2pquake"
 	"github.com/HuskerMinion/techo5/echod/internal/lib/rainbow"
 )
 
@@ -270,6 +271,11 @@ type scene struct {
 	reminder     remind.Reminder
 	showReminder bool
 	reminderFrom string
+
+	// quake is an earthquake, tsunami or early-warning message on the screen (feature/quake), with
+	// showQuake saying so.
+	quake     p2pquake.Alert
+	showQuake bool
 
 	// setupAsking is the setup page asking something of whoever is at the device: a browser waiting to
 	// be let in, or takes of a word to start or a recording of them running (takes, when nobody is
@@ -628,7 +634,7 @@ func (r *renderer) draw(s scene) {
 	// The red night clock is the whole screen: nothing else, not even the header, is drawn over it,
 	// and it stays up while an alarm or a timer rings (a tap on it stops the ring). A call has lifted
 	// the night light and takes the screen; a turn, a camera, an announcement or a reminder is shown in
-	// its place at the night light's level.
+	// its place at the night light's level, and so is an earthquake (redClockFace).
 	if s.redClockFace() && s.camtest == nil {
 		r.redClockPage(s)
 		return
@@ -648,6 +654,12 @@ func (r *renderer) draw(s scene) {
 	}
 	if s.ring.any() {
 		r.ringingPage(s)
+		return
+	}
+	// An earthquake: under a call and a ring, which are somebody being answered, and over every other
+	// page. It goes by itself when its time is up, or at a tap.
+	if s.showQuake {
+		r.quakePage(s)
 		return
 	}
 	if s.pin.open {

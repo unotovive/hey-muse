@@ -50,6 +50,7 @@ import (
 	"github.com/HuskerMinion/techo5/echod/internal/feature/notify"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/phone"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/presence"
+	"github.com/HuskerMinion/techo5/echod/internal/feature/quake"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/remind"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/security"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/setup"
@@ -606,6 +607,9 @@ func build() *Display {
 	talkback.Get().Changed.Listen(func(struct{}) { d.wake() })
 	alarm.Get().Changed.Listen(func(struct{}) { d.wake() })
 	remind.Get().Changed.Listen(func(struct{}) { d.wake() })
+	// Its coming up and its going, by a tap or when its time runs out: the page never waits for
+	// anything else to be taken down.
+	quake.Get().Changed.Listen(func(struct{}) { d.wake() })
 	notify.Get().Changed.Listen(func(struct{}) { d.wake() })
 	notify.SetNight(nightNow)
 	timer.Get().Changed.Listen(func(struct{}) { d.wake() })
@@ -1111,7 +1115,8 @@ func (d *Display) gesture(g touch.Gesture) {
 	_, _, _, asking := video.Get().Asking()
 	// Not on the video page either: its controls work at night as by day (the night light's rule is
 	// the clock's, a hand in the dark more likely a knock than a request).
-	glowing := d.nightGlow && !d.wifiOpen && !asksAtDevice() && !asking && !d.videoOnScreen
+	_, _, quaking := quake.Get().Showing()
+	glowing := d.nightGlow && !d.wifiOpen && !asksAtDevice() && !asking && !d.videoOnScreen && !quaking
 	// A dashboard a tap on the night light opened is used as by day, at the night light's level. Only
 	// that one: a dashboard left up from the day, or put up by Home Assistant, stays under the night.
 	// And only while it is what is drawn: the settings or the drawer opened from it are not shown over
@@ -1205,6 +1210,16 @@ func (d *Display) gesture(g touch.Gesture) {
 	if st := d.ringing(time.Now()); st.any() {
 		if g.Kind == touch.Tap {
 			d.ringTap(g.X, g.Y, st)
+		}
+		d.wake()
+		return
+	}
+
+	// An earthquake's page is the whole screen, under a call and a ring: a tap anywhere puts it away,
+	// and nothing reaches the page behind it.
+	if _, _, up := quake.Get().Showing(); up {
+		if g.Kind == touch.Tap {
+			quake.Get().Dismiss()
 		}
 		d.wake()
 		return
@@ -2486,6 +2501,7 @@ func (d *Display) frame() (next time.Duration) {
 	ring := d.ringing(now)
 	call := phone.Get().State()
 	_, reminding := remind.Get().Showing()
+	_, _, quaking := quake.Get().Showing()
 	night := nightNow(now)
 	if d.dev != nil {
 		// The tint is laid on in Present, so a deck kept as it was would keep the old one: a change
@@ -2496,10 +2512,11 @@ func (d *Display) frame() (next time.Duration) {
 		}
 		d.dev.SetLift(config.Get().Screen.AdaptiveBacklight && liftOffered())
 	}
-	if !on && (call.Phase != phone.Idle || (!night && (ring.any() || reminding))) {
+	if !on && (call.Phase != phone.Idle || (!night && (ring.any() || reminding || quaking))) {
 		// A call lights a dark panel, at night to half brightness (relight): its page is how it is
-		// answered. By day a ring and a reminder do too, the ring's page being how it is stopped and a
-		// reminder being its words. At night they leave the panel dark: "stop" or a tap ends a ring.
+		// answered. By day a ring, a reminder and an earthquake do too, the ring's page being how it is
+		// stopped and a reminder and an earthquake being their words. At night they leave the panel
+		// dark: "stop" or a tap ends a ring.
 		d.apply(true, d.ceilingOrDefault(), false)
 		on = true
 	}
@@ -2550,7 +2567,7 @@ func (d *Display) frame() (next time.Duration) {
 	sheetUp, wifiUp, camUp := d.sheet, d.wifiOpen, d.camtest != nil
 	updateVisible := d.updateShown(now)
 	d.mu.Unlock()
-	busy := updateVisible || view.Phase != "idle" || call.Phase != phone.Idle || ring.any() || reminding || sheetUp || pinIsOpen() ||
+	busy := updateVisible || view.Phase != "idle" || call.Phase != phone.Idle || ring.any() || reminding || quaking || sheetUp || pinIsOpen() ||
 		d.wakeLight(now) > 0 || d.popupUp() != nil || asksAtDevice() || wifiUp || camUp || video.Get().State().Active()
 	if d.awayTick(now, on, busy, night) {
 		d.mu.Lock()
@@ -2895,6 +2912,10 @@ func (d *Display) frame() (next time.Duration) {
 	s.announcePeers = len(announce.Peers())
 	s.announcement, s.showAnnouncement = announce.Get().Showing()
 	s.reminder, s.showReminder = remind.Get().Showing()
+	s.quake, _, s.showQuake = quake.Get().Showing()
+	if s.showQuake {
+		boring = false // a page of its own, not the clock
+	}
 	s.notification, s.showNotification = notify.Get().Card()
 	d.gateNotice(&s, nightNow(now))
 	s.popup = d.popupUp()

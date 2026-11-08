@@ -39,6 +39,7 @@ type Config struct {
 	Doorbell       Doorbell       `json:"doorbell,omitempty"`
 	Streaming      Streaming      `json:"streaming,omitempty"`
 	Presence       Presence       `json:"presence,omitempty"`
+	Quake          Quake          `json:"quake,omitempty"`
 	Screen         Screen         `json:"screen"`
 	Home           Home           `json:"home"`
 	Security       Security       `json:"security"`
@@ -123,6 +124,7 @@ func (w Writer) TalkBack() TalkBackWriter             { return TalkBackWriter(w)
 func (w Writer) Doorbell() DoorbellWriter             { return DoorbellWriter(w) }
 func (w Writer) Streaming() StreamingWriter           { return StreamingWriter(w) }
 func (w Writer) Presence() PresenceWriter             { return PresenceWriter(w) }
+func (w Writer) Quake() QuakeWriter                   { return QuakeWriter(w) }
 func (w Writer) Deck() DeckWriter                     { return DeckWriter(w) }
 func (w Writer) Video() VideoWriter                   { return VideoWriter(w) }
 func (w Writer) Tailscale() TailscaleWriter           { return TailscaleWriter(w) }

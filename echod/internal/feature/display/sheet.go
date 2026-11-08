@@ -201,7 +201,7 @@ func categoryRows(sv sheetView) (rows []settingRow, note string) {
 		if hasEqualizer && hasMicrophone() {
 			rows = append(rows, settingRow{id: "turnstyle", label: tr("turn_screen"), sub: tr("classic_or_a_picture_that_moves_with_the_voice"), kind: ctlChoice, value: turnStyles[turnStyleIndex()].label})
 		}
-		return withPresence(rows), ""
+		return withQuake(withPresence(rows)), ""
 	case catSound:
 		mic := tr("ui_listening")
 		if st.muted {
@@ -1329,6 +1329,10 @@ func (d *Display) rowTap(id string, p part, opt int) {
 		safe.Go("presence from the screen", func() { presence.Get().SetOn(!config.Get().Presence.On) })
 	case "gestures":
 		safe.Go("gestures from the screen", func() { presence.Get().SetGestures(!config.Get().Presence.Gestures) })
+	case "quake":
+		if err := config.Set().Quake().On(!config.Get().Quake.On); err != nil {
+			slog.Warn("saving the earthquake page setting failed", "err", err)
+		}
 	case "settingslock":
 		if security.LockSet() {
 			if err := security.Get().SetPIN(""); err != nil {

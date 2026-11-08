@@ -1,0 +1,11 @@
+{
+  "id": "6730a9c1c4e1d2a3b4c5d6e8",
+  "code": 552,
+  "time": "2026/11/09 10:20:05.123",
+  "cancelled": false,
+  "issue": {"source": "気象庁", "time": "2026/11/09 10:20:00", "type": "Focus"},
+  "areas": [
+    {"grade": "Watch", "immediate": false, "name": "千葉県九十九里・外房", "firstHeight": {"condition": "津波到達中と推測"}, "maxHeight": {"description": "１ｍ", "value": 1}},
+    {"grade": "Watch", "immediate": false, "name": "伊豆諸島", "firstHeight": {"arrivalTime": "2026/11/09 10:40:00"}, "maxHeight": {"description": "１ｍ", "value": 1}}
+  ]
+}

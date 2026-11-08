@@ -1,0 +1,19 @@
+{
+  "id": "6730a7e0c4e1d2a3b4c5d6e9",
+  "code": 556,
+  "time": "2026/11/09 10:12:10.250",
+  "cancelled": false,
+  "test": false,
+  "issue": {"time": "2026/11/09 10:12:08", "eventId": "20261109101200", "serial": "3"},
+  "earthquake": {
+    "originTime": "2026/11/09 10:12:00",
+    "arrivalTime": "2026/11/09 10:12:01",
+    "condition": "",
+    "hypocenter": {"name": "千葉県北西部", "reduceName": "千葉県", "latitude": 35.6, "longitude": 140.1, "depth": 60, "magnitude": 5.4}
+  },
+  "areas": [
+    {"pref": "千葉", "name": "千葉県北西部", "scaleFrom": 45, "scaleTo": 50, "kindCode": "19", "arrivalTime": null},
+    {"pref": "東京", "name": "東京都２３区", "scaleFrom": 40, "scaleTo": 45, "kindCode": "10", "arrivalTime": "2026/11/09 10:12:15"},
+    {"pref": "千葉", "name": "千葉県南部", "scaleFrom": 40, "scaleTo": 45, "kindCode": "10", "arrivalTime": "2026/11/09 10:12:12"}
+  ]
+}
