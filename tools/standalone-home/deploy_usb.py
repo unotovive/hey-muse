@@ -93,8 +93,12 @@ def deploy(args):
             cfg["voice_scenes"] = {k: {op: name} for (k, op), name in light.VOICE_SCENES.items()}
             cfg["hall"] = dict(name="廊下の電気", type="Color Bulb", transport="cloud")
             add("home-local.json", json.dumps(cfg, ensure_ascii=False).encode())
-            add("switchbot.env", (Path.home() / "switchbot_token.env").read_bytes())
-            add("calendar-feeds.txt", (BASE / "calendar-feeds.txt").read_bytes())
+            # 資格情報とカレンダー購読は存在するものだけ送る（Remo のみの構成では switchbot.env が無い）。
+            for name, source in (("switchbot.env", Path.home() / "switchbot_token.env"),
+                                 ("natureremo.env", args.remo_env or Path.home() / "natureremo.env"),
+                                 ("calendar-feeds.txt", BASE / "calendar-feeds.txt")):
+                if source.is_file():
+                    add(name, source.read_bytes())
             with sqlite3.connect(f"file:{(bridge / 'home-requests.sqlite').as_posix()}?mode=ro", uri=True) as db:
                 add("initial-power.json", json.dumps(dict(db.execute("select device,direction from power_last"))).encode())
         else:
@@ -131,8 +135,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("part", choices=("config", "daemon"))
     parser.add_argument("--serial", required=True)
-    for flag in ("audio", "binary"):
-        parser.add_argument("--" + flag, type=Path)
+    for flag in ("audio", "binary", "remo-env"):
+        parser.add_argument("--" + flag, type=Path, dest=flag.replace("-", "_"))
     args = parser.parse_args()
     if args.part == "daemon" and not args.binary:
         parser.error("daemon requires --binary")

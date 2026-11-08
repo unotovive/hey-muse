@@ -11,6 +11,15 @@ func (h *Home) CheckTargets(ctx context.Context) (int, error) {
 	if err := h.read("home-local.json", &cfg); err != nil {
 		return 0, err
 	}
+	b, err := h.backend(cfg)
+	if err != nil {
+		return 0, err
+	}
+	return b.check(ctx, cfg)
+}
+
+func (b switchBot) check(ctx context.Context, cfg settings) (int, error) {
+	h := b.h
 	devices, err := h.devices(ctx)
 	if err != nil {
 		return 0, err

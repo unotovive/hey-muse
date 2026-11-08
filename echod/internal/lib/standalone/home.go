@@ -24,6 +24,13 @@ type Home struct {
 	powerMu    sync.Mutex
 	limitMu    sync.Mutex
 	retryAfter time.Time
+
+	remoMu           sync.Mutex
+	remoAppliances   []remoAppliance
+	remoAppliancesAt time.Time
+	remoDevices      []remoDevice
+	remoDevicesAt    time.Time
+	remoRetryAfter   time.Time
 }
 
 func (h *Home) Enabled() bool {
@@ -51,6 +58,8 @@ type Result struct {
 type target struct{ Name, Type string }
 type control struct{ Label, Icon, Toggle, On, Off string }
 type settings struct {
+	Backend     string `json:"backend"`
+	RemoLocal   bool   `json:"remo_local"` // Remo ローカル API の枠。v1 は読み取るのみで送信は Cloud。
 	Calendars   []struct{ Name string }
 	Scenes      []string
 	Sensor      string             `json:"environment_device"`
@@ -110,14 +119,15 @@ func (h *Home) Dashboard(ctx context.Context, op, id string) (Result, error) {
 	case "scene":
 		return h.scene(ctx, cfg, id)
 	case "environment":
-		if cfg.Sensor == "" {
-			return Result{}, errors.New("environment sensor is not configured")
-		}
-		var env Environment
-		if err := h.api(ctx, "devices/"+segment(cfg.Sensor)+"/status", nil, &env); err != nil {
+		b, err := h.backend(cfg)
+		if err != nil {
 			return Result{}, err
 		}
-		return Result{OK: env.Temperature != nil || env.Humidity != nil || env.CO2 != nil || env.Battery != nil, Environment: &env}, nil
+		env, err := b.environment(ctx, cfg)
+		if err != nil {
+			return Result{}, err
+		}
+		return Result{OK: env.Temperature != nil || env.Humidity != nil || env.CO2 != nil || env.Battery != nil, Environment: env}, nil
 	}
 	return Result{}, errors.New("unknown home operation")
 }

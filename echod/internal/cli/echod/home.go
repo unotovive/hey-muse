@@ -10,9 +10,14 @@ import (
 
 // Read through the same Go entry points as the standby screen without actuating devices.
 func newHomeCheckCmd() *cobra.Command {
-	return &cobra.Command{Use: "home-check", Short: "Check the native calendar and SwitchBot connection", Args: cobra.NoArgs,
+	return &cobra.Command{Use: "home-check", Short: "Check the native calendar and home appliance connection", Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			h := standalone.Device
+			name, err := h.BackendName()
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "Backend: %s\n", name)
 			agenda, err := h.Dashboard(cmd.Context(), "agenda", "")
 			if err != nil {
 				return err

@@ -32,6 +32,32 @@
 
 `calendar-feeds.txt` には `home-local.json` の `calendars` と同じ順に購読 URL を1行ずつ保存します。秘密情報を含む設定と予定キャッシュは管理者用ディレクトリに置きます。
 
+## Nature Remo を使う
+
+`home-local.json` の `backend` に `nature_remo` を指定すると、SwitchBot の代わりに Nature Remo の Cloud API（`https://api.nature.global`）で家電を操作し、温度・湿度を取得します。`backend` を省略または `switchbot` にすると従来どおりです。Remo ではシーンと電源ボタンは表示されません。
+
+トークンは https://home.nature.global/ で発行し、`~/natureremo.env`（または `deploy_usb.py config --remo-env <ファイル>`）に次の1行で保存すると、`natureremo.env` として端末へ送られます。`switchbot.env` と `calendar-feeds.txt` は存在するときだけ送られます。
+
+```
+NATURE_REMO_TOKEN=取得したトークン
+```
+
+`voice_devices` の `name` は Remo アプリの機器名（nickname）、`type` は照明が `LIGHT`、エアコンが `AC` です。
+
+```json
+{
+  "backend": "nature_remo",
+  "remo_local": false,
+  "calendars": [],
+  "voice_devices": {
+    "living": {"name": "リビング照明", "type": "LIGHT"},
+    "ac": {"name": "エアコン", "type": "AC"}
+  }
+}
+```
+
+`remo_local` はローカル API 用の枠で、現在は `home-check` に表示するだけです。送信は Cloud API のみです。機器一覧とセンサー値は60秒キャッシュされ、429 が返ると `Retry-After`（無ければ300秒）の間は送信を止めます。
+
 ## 元の構成に戻す
 
 初回の導入時に保存した待機画面の設定、起動設定、実行ファイルに戻すには、USB コンソールで次を実行します。

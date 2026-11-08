@@ -167,6 +167,9 @@ func (h *Home) executeScene(ctx context.Context, id string) error {
 	return h.api(ctx, "scenes/"+segment(id)+"/execute", struct{}{}, nil)
 }
 func (h *Home) scene(ctx context.Context, cfg settings, id string) (Result, error) {
+	if !usesSwitchBot(cfg) {
+		return Result{}, errors.New("scene is not configured")
+	}
 	if strings.HasPrefix(id, "power/") {
 		return h.power(ctx, cfg, id)
 	}
@@ -191,6 +194,10 @@ func (h *Home) scene(ctx context.Context, cfg settings, id string) (Result, erro
 }
 
 func (h *Home) power(ctx context.Context, cfg settings, action string) (Result, error) {
+	if !usesSwitchBot(cfg) {
+		// SwitchBot 以外ではシーン・電源ボタンを出さない。
+		return Result{OK: true}, nil
+	}
 	h.powerMu.Lock()
 	defer h.powerMu.Unlock()
 	list, err := h.scenes(ctx)
@@ -251,10 +258,12 @@ func deviceID(devices []botDevice, t target) (string, error) {
 	return matches[0], nil
 }
 
-func (h *Home) Appliance(ctx context.Context, key, action string) error {
-	var cfg settings
-	if err := h.read("home-local.json", &cfg); err != nil {
-		return err
+type switchBot struct{ h *Home }
+
+func (b switchBot) appliance(ctx context.Context, cfg settings, key, action string, value int) error {
+	h := b.h
+	if value != 0 {
+		return errors.New("SwitchBot backend does not support this action")
 	}
 	if (key == "monitor" || key == "projector") && action == "toggle" {
 		list, err := h.scenes(ctx)
@@ -300,4 +309,15 @@ func (h *Home) Appliance(ctx context.Context, key, action string) error {
 		return err
 	}
 	return h.api(ctx, "devices/"+segment(id)+"/commands", map[string]string{"commandType": "command", "command": command, "parameter": "default"}, nil)
+}
+
+func (b switchBot) environment(ctx context.Context, cfg settings) (*Environment, error) {
+	if cfg.Sensor == "" {
+		return nil, errors.New("environment sensor is not configured")
+	}
+	var env Environment
+	if err := b.h.api(ctx, "devices/"+segment(cfg.Sensor)+"/status", nil, &env); err != nil {
+		return nil, err
+	}
+	return &env, nil
 }

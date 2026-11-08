@@ -75,7 +75,7 @@ func TestSwitchBotDispatch(t *testing.T) {
 	if _, err := h.Dashboard(ctx, "scene", "s2"); err == nil || posts != 1 {
 		t.Fatal("sent unauthorized scene")
 	}
-	if err := h.Appliance(ctx, "hall", "off"); err != nil || lastPath != "/v1.1/devices/bulb1/commands" || lastCommand["command"] != "turnOff" || posts != 2 {
+	if err := h.Appliance(ctx, "hall", "off", 0); err != nil || lastPath != "/v1.1/devices/bulb1/commands" || lastCommand["command"] != "turnOff" || posts != 2 {
 		t.Fatal("wrong device command", err)
 	}
 	failPost = true

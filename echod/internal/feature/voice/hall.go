@@ -117,7 +117,7 @@ func (h *hallTurns) executeCommand(ctx context.Context, session string, command 
 	ok := false
 	start := time.Now()
 	if standalone.Device.Enabled() {
-		ok = standalone.Device.Appliance(ctx, command.target, command.action) == nil
+		ok = standalone.Device.Appliance(ctx, command.target, command.action, 0) == nil
 	} else if err == nil && json.Unmarshal(raw, &cfg) == nil && strings.HasSuffix(cfg.URL, "/echo-home/v1") {
 		var result struct{ OK bool }
 		url := strings.TrimSuffix(cfg.URL, "/echo-home/v1") + "/echo-hall/v1"
