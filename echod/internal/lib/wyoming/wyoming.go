@@ -30,7 +30,7 @@ type Format struct {
 // Mic is what the device's microphone gives: 16 kHz, 16-bit, mono.
 var Mic = Format{Rate: 16000, Width: 2, Channels: 1}
 
-const dialTimeout = 5 * time.Second
+const dialTimeout = 2 * time.Second
 
 // maxBody bounds what one event may carry, so a server that is not a Wyoming server cannot have the
 // device allocate whatever a stray length says.

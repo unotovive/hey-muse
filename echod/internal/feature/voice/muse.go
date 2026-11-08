@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log/slog"
-	"os"
 	"strings"
 	"time"
 
@@ -38,6 +37,11 @@ type speakFunc func(ctx context.Context, v speech.Voice, text string, out func(s
 // it is given, so each read must not take a slot of its own.
 const museChunk = mic.Rate / 10
 
+const (
+	sttFailuresToSkip = 2
+	sttSkipFor        = time.Minute
+)
+
 type viaMuse struct {
 	link       museLink
 	voice      func() speech.Voice // the one the settings choose, asked for every reply
@@ -47,15 +51,20 @@ type viaMuse struct {
 	transcribe func(context.Context, config.Brain, []byte) (string, error)
 	classify   func(context.Context, string) (string, error)
 	early      *earlySTT
-	nextProbe  int
-	hall       hallTurns
-	sessionID  string // owned by the send queue and captured by End
+	// After sttFailuresToSkip failures in a row the owner's recogniser is left alone for sttSkipFor,
+	// so a mothership that is down does not cost its connect timeout on every turn.
+	sttFailures  int
+	sttSkipUntil time.Time
+	now          func() time.Time
+	nextProbe    int
+	hall         hallTurns
+	sessionID    string // owned by the send queue and captured by End
 	utterance
 }
 
 func newViaMuse(link museLink, voice func() speech.Voice, speak speakFunc, post func(event)) *viaMuse {
 	return &viaMuse{link: link, voice: voice, speak: speak, post: post,
-		brain: func() config.Brain { return config.Get().Brain }, transcribe: transcribe, classify: classifyReadOnly}
+		brain: func() config.Brain { return config.Get().Brain }, transcribe: transcribe, classify: classifyReadOnly, now: time.Now}
 }
 
 type museTextLink interface {
@@ -68,7 +77,7 @@ type museTextLink interface {
 func (m *viaMuse) ask(ctx context.Context, pcm []byte, sessionID string, on func(muse.ReplyEvent)) (muse.Reply, error) {
 	samples := endpoint.Trim(samplesOf(pcm))
 	b := m.brain()
-	if textLink, ok := m.link.(museTextLink); ok && strings.TrimSpace(b.STT) != "" {
+	if textLink, ok := m.link.(museTextLink); ok && strings.TrimSpace(b.STT) != "" && !m.skipLocalSTT() {
 		sttCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
 		text, err := m.finalTranscript(sttCtx, b, bytesOf(samples))
 		cancel()
@@ -76,6 +85,7 @@ func (m *viaMuse) ask(ctx context.Context, pcm []byte, sessionID string, on func
 			return muse.Reply{}, ctx.Err()
 		}
 		if err == nil {
+			m.sttFailures = 0
 			text = strings.TrimSpace(text)
 			if text == "" {
 				return muse.Reply{}, nil
@@ -115,12 +125,22 @@ func (m *viaMuse) ask(ctx context.Context, pcm []byte, sessionID string, on func
 			reply.Heard = text
 			return reply, err
 		}
-		if _, statErr := os.Stat("/data/misc/techo5/idle-home.json"); statErr == nil {
-			return muse.Reply{Text: "聞き取れませんでした。もう一度お願いします。"}, nil
+		if m.sttFailures++; m.sttFailures >= sttFailuresToSkip {
+			m.sttSkipUntil = m.clock().Add(sttSkipFor)
 		}
 		slog.Warn("muse: local recognition unavailable, using Muse voice recognition", "err", err)
 	}
 	return m.link.Ask(ctx, wavFile(media.Normalize(samples)), sessionID, on)
+}
+
+// skipLocalSTT is true while the owner's recogniser has failed often enough to be left alone.
+func (m *viaMuse) skipLocalSTT() bool { return m.clock().Before(m.sttSkipUntil) }
+
+func (m *viaMuse) clock() time.Time {
+	if m.now == nil {
+		return time.Now()
+	}
+	return m.now()
 }
 
 func (m *viaMuse) startTurn(phrase string, followUp bool) error {

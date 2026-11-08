@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/HuskerMinion/techo5/echod/internal/config"
 	"github.com/HuskerMinion/techo5/echod/internal/lib/muse"
@@ -83,5 +84,70 @@ func TestMuseLocalSilenceDoesNotAsk(t *testing.T) {
 	m.transcribe = func(context.Context, config.Brain, []byte) (string, error) { return " ", nil }
 	if reply, err := m.ask(context.Background(), someAudio, "echo-test", func(muse.ReplyEvent) {}); err != nil || reply.Text != "" || l.text != "" {
 		t.Fatal("silence was not ignored")
+	}
+}
+
+func TestMuseSkipsLocalSTTAfterFailures(t *testing.T) {
+	askCalls := 0
+	l := &textTestLink{fakeLink: fakeLink{ask: func(context.Context, []byte, func(muse.ReplyEvent)) (muse.Reply, error) {
+		askCalls++
+		return muse.Reply{Text: "fallback"}, nil
+	}}}
+	m := newViaMuse(l, builtIn, speaking(320, 320), func(event) {})
+	clock := time.Unix(1000, 0)
+	m.now = func() time.Time { return clock }
+	m.brain = func() config.Brain { return config.Brain{STT: "local:50024", Language: "ja"} }
+	transcribeCalls := 0
+	fail := true
+	m.transcribe = func(context.Context, config.Brain, []byte) (string, error) {
+		transcribeCalls++
+		if fail {
+			return "", errors.New("offline")
+		}
+		return "こんにちは", nil
+	}
+	turn := func() {
+		t.Helper()
+		if _, err := m.ask(context.Background(), someAudio, "echo-test", func(muse.ReplyEvent) {}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	turn()
+	if transcribeCalls != 1 || askCalls != 1 {
+		t.Fatalf("turn 1: transcribe=%d ask=%d", transcribeCalls, askCalls)
+	}
+	turn()
+	if transcribeCalls != 2 || askCalls != 2 {
+		t.Fatalf("turn 2: transcribe=%d ask=%d", transcribeCalls, askCalls)
+	}
+	clock = clock.Add(30 * time.Second)
+	turn()
+	if transcribeCalls != 2 || askCalls != 3 {
+		t.Fatalf("turn 3 inside the window: transcribe=%d ask=%d", transcribeCalls, askCalls)
+	}
+	clock = clock.Add(31 * time.Second)
+	fail = false
+	turn()
+	if transcribeCalls != 3 || askCalls != 3 || l.text != "こんにちは" || m.sttFailures != 0 {
+		t.Fatalf("turn 4 after the window: transcribe=%d ask=%d text=%q failures=%d", transcribeCalls, askCalls, l.text, m.sttFailures)
+	}
+}
+
+func TestMuseFallsBackToVoiceNoteEvenWithIdleHome(t *testing.T) {
+	askCalls := 0
+	l := &textTestLink{fakeLink: fakeLink{ask: func(context.Context, []byte, func(muse.ReplyEvent)) (muse.Reply, error) {
+		askCalls++
+		return muse.Reply{Text: "Muse の返事"}, nil
+	}}}
+	m := newViaMuse(l, builtIn, speaking(320, 320), func(event) {})
+	m.brain = func() config.Brain { return config.Brain{STT: "local:50024", Language: "ja"} }
+	transcribeCalls := 0
+	m.transcribe = func(context.Context, config.Brain, []byte) (string, error) {
+		transcribeCalls++
+		return "", errors.New("offline")
+	}
+	reply, err := m.ask(context.Background(), someAudio, "echo-test", func(muse.ReplyEvent) {})
+	if err != nil || reply.Text != "Muse の返事" || transcribeCalls != 1 || askCalls != 1 {
+		t.Fatalf("reply=%+v err=%v transcribe=%d ask=%d", reply, err, transcribeCalls, askCalls)
 	}
 }
