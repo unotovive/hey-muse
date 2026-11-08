@@ -32,6 +32,23 @@
 
 `calendar-feeds.txt` には `home-local.json` の `calendars` と同じ順に購読 URL を1行ずつ保存します。秘密情報を含む設定と予定キャッシュは管理者用ディレクトリに置きます。
 
+## Google カレンダー（API）を使う
+
+iCal 購読は反映が数時間遅れることがあるため、OAuth（`calendar.readonly`）の Google Calendar API でも予定を取得できます。端末の `google-token.json` があればこちらを使い、無ければ従来の `calendar-feeds.txt` に戻ります。API 側の取得に失敗したときは前回の予定と「更新待ち」を表示します。
+
+1. Google Cloud プロジェクトと OAuth クライアント（デスクトップ）を作り、JSON を `~/.config/hey-muse/google-client.json` に保存します。手順は `docs/ja/setup.md` の第 4 部です。
+2. PC で一度だけ同意してトークンを作ります。
+
+```
+python3 -m venv ~/.venvs/muse-tools && ~/.venvs/muse-tools/bin/pip install -r requirements.txt
+~/.venvs/muse-tools/bin/python google_auth.py --client ~/.config/hey-muse/google-client.json
+```
+
+3. 表示されたカレンダーの `id` と名前を、`home-local.json` の `calendars` に `{"id": "...", "name": "..."}` で書きます。API 経路では `id` が必須です。
+4. `deploy_usb.py config --serial SERIAL` を実行すると、`~/.config/hey-muse/google-token.json` が `google-token.json` として端末へ送られます。
+
+`google-token.json` にはリフレッシュトークンが入るため、権限 0600 で扱い、コミットしないでください。
+
 ## Nature Remo を使う
 
 `home-local.json` の `backend` に `nature_remo` を指定すると、SwitchBot の代わりに Nature Remo の Cloud API（`https://api.nature.global`）で家電を操作し、温度・湿度を取得します。`backend` を省略または `switchbot` にすると従来どおりです。Remo ではシーンと電源ボタンは表示されません。

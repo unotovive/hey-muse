@@ -68,6 +68,10 @@ func (h *Home) calendar(ctx context.Context, addr, name string, now, end time.Ti
 }
 
 func (h *Home) refresh(ctx context.Context, cfg settings, now time.Time) (snapshot, error) {
+	var tok googleToken
+	if h.read("google-token.json", &tok) == nil {
+		return h.refreshGoogle(ctx, cfg, tok, now)
+	}
 	raw, err := os.ReadFile(filepath.Join(h.dir, "calendar-feeds.txt"))
 	if err != nil {
 		return snapshot{}, err
@@ -84,6 +88,25 @@ func (h *Home) refresh(ctx context.Context, cfg settings, now time.Time) (snapsh
 		}
 		seen[addr] = true
 		rows, err := h.calendar(ctx, addr, cfg.Calendars[i].Name, now, data.Until)
+		if err != nil {
+			return snapshot{}, err
+		}
+		data.Events = append(data.Events, rows...)
+	}
+	slices.SortStableFunc(data.Events, func(a, b Event) int { return a.Start.Compare(b.Start) })
+	return data, nil
+}
+
+func (h *Home) refreshGoogle(ctx context.Context, cfg settings, tok googleToken, now time.Time) (snapshot, error) {
+	if len(cfg.Calendars) == 0 {
+		return snapshot{}, errors.New("no calendars configured")
+	}
+	data := snapshot{Events: []Event{}, Updated: now, Until: now.AddDate(0, 0, 8)}
+	for _, c := range cfg.Calendars {
+		if c.ID == "" {
+			return snapshot{}, errors.New("calendar id required")
+		}
+		rows, err := h.googleEvents(ctx, tok, c.ID, c.Name, now, data.Until)
 		if err != nil {
 			return snapshot{}, err
 		}

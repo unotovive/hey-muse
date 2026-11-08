@@ -31,6 +31,10 @@ type Home struct {
 	remoDevices      []remoDevice
 	remoDevicesAt    time.Time
 	remoRetryAfter   time.Time
+
+	googleMu          sync.Mutex
+	googleAccessToken string
+	googleUntil       time.Time
 }
 
 func (h *Home) Enabled() bool {
@@ -60,7 +64,7 @@ type control struct{ Label, Icon, Toggle, On, Off string }
 type settings struct {
 	Backend     string `json:"backend"`
 	RemoLocal   bool   `json:"remo_local"` // Remo ローカル API の枠。v1 は読み取るのみで送信は Cloud。
-	Calendars   []struct{ Name string }
+	Calendars   []struct{ ID, Name string }
 	Scenes      []string
 	Sensor      string             `json:"environment_device"`
 	Controls    map[string]control `json:"power_controls"`

@@ -1,0 +1,56 @@
+# セットアップ（日本語）
+
+この文書の他の部は、別のタスクで追加されます。ここには第 4 部「Google カレンダー」を置きます。
+
+## 第 4 部 Google カレンダー
+
+待機画面の予定を Google Calendar API（読み取り専用）から取得します。iCal 購読より反映が早く、更新に失敗したときは前回の予定を「更新待ち」として表示します。Google Cloud の設定とブラウザでの同意は、カレンダーの持ち主が自分で行います。
+
+### 1. Google Cloud プロジェクトを作る
+
+1. https://console.cloud.google.com/ を開き、新しいプロジェクトを作ります。名前は自由です（例: `hey-muse`）。
+2. 「API とサービス」→「ライブラリ」で「Google Calendar API」を検索し、有効にします。
+
+### 2. OAuth 同意画面とテストユーザー
+
+1. 「API とサービス」→「OAuth 同意画面」を開き、ユーザーの種類は「外部」を選びます。
+2. アプリ名とメールアドレスを入れて保存します。公開は不要で、公開ステータスは「テスト」のままにします。
+3. 「テストユーザー」に、予定を読むカレンダーの持ち主の Google アカウントを追加します。
+4. スコープは、同意時に `calendar.readonly` だけが要求されます。追加の登録は不要です。
+
+注意: 公開ステータスが「テスト」のとき、リフレッシュトークンは 7 日で失効します。失効すると予定が取得できず「更新待ち」になります。長く使うには、同意画面を「本番環境」に公開してください。個人利用では審査は不要で、同意時に「未確認のアプリ」の警告が出ますが、詳細から続行できます。
+
+### 3. OAuth クライアント（デスクトップ）を作る
+
+1. 「API とサービス」→「認証情報」→「認証情報を作成」→「OAuth クライアント ID」を選びます。
+2. アプリケーションの種類は「デスクトップ アプリ」にします。
+3. 作成後に JSON をダウンロードし、`~/.config/hey-muse/google-client.json` に保存します。権限は 0600 にします。
+
+### 4. 同意してトークンを作る
+
+```
+python3 -m venv ~/.venvs/muse-tools
+~/.venvs/muse-tools/bin/pip install -r tools/standalone-home/requirements.txt
+~/.venvs/muse-tools/bin/python tools/standalone-home/google_auth.py --client ~/.config/hey-muse/google-client.json
+```
+
+ブラウザが開くので、手順 2 で登録したアカウントで同意します。成功すると `~/.config/hey-muse/google-token.json` ができ、使えるカレンダーの `id` と名前が一覧で表示されます。
+
+### 5. 使うカレンダーを設定する
+
+表示された一覧から使うカレンダーを選び、`home-local.json` の `calendars` に書きます。API 経路では `id` が必須です。
+
+```json
+"calendars": [
+  {"id": "xxxxxxxx@group.calendar.google.com", "name": "家族"},
+  {"id": "you@gmail.com", "name": "自分"}
+]
+```
+
+### 6. トークンを端末へ送る
+
+```
+python3 tools/standalone-home/deploy_usb.py config --serial SERIAL
+```
+
+`~/.config/hey-muse/google-token.json` が `google-token.json` として端末へ送られます。端末にこのファイルがあるあいだは API を使い、削除すると従来の `calendar-feeds.txt`（iCal）に戻ります。`google-token.json` と `google-client.json` は秘密情報なので、リポジトリにコミットしないでください。

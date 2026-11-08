@@ -98,7 +98,9 @@ def deploy(args):
             # 資格情報とカレンダー購読は存在するものだけ送る（Remo のみの構成では switchbot.env が無い）。
             for name, source in (("switchbot.env", Path.home() / "switchbot_token.env"),
                                  ("natureremo.env", args.remo_env or Path.home() / "natureremo.env"),
-                                 ("calendar-feeds.txt", BASE / "calendar-feeds.txt")):
+                                 ("calendar-feeds.txt", BASE / "calendar-feeds.txt"),
+                                 # Google Calendar API を使う構成では google_auth.py が作ったトークン（あれば iCal より優先される）。
+                                 ("google-token.json", Path.home() / ".config/hey-muse/google-token.json")):
                 if source.is_file():
                     add(name, source.read_bytes())
             with sqlite3.connect(f"file:{(bridge / 'home-requests.sqlite').as_posix()}?mode=ro", uri=True) as db:
