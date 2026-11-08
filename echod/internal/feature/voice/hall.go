@@ -35,14 +35,15 @@ func hallDirection(text string) string {
 var powerWords = regexp.MustCompile(`つけ|付け|点け|消[すしさせえ]|けして|けさな|灯り|点灯|消灯|明るく|暗く|オン|オフ|入れ|切[っるら]|ついて|付いて`)
 var otherDevice = regexp.MustCompile(`リビング|サーキュレータ|扇風機|クーラー|掃除機|カーテン|プラグ|プロジェクタ|モニタ|ミラーボール`)
 var otherAction = regexp.MustCompile(`開け|あけて|開い|閉め|しめて|閉じ|切り替|切替|動か|止め|回し|スタート|ストップ|電源`)
-var applianceWords = regexp.MustCompile(`廊下|ろうか|電気|でんき|照明|ライト|電源|明かり|エアコン|モニター`)
+var applianceWords = regexp.MustCompile(`廊下|ろうか|電気|でんき|照明|ライト|電源|明かり|エアコン|冷房|暖房|モニター`)
+var acRequest = regexp.MustCompile(`(?:冷房|暖房|[0-9０-９]{2}度).*(?:にして|に切り替え|設定して)`)
 var specificDevice = regexp.MustCompile(`電気|でんき|照明|ライト|灯り|明かり|電源|エアコン|モニター`)
 var requestEnding = regexp.MustCompile(`(?:して|入れて|落として|やめて|しないで|ないで|ますか|なの|ですか|[？?])(?:ください|下さい)?[。！？!?]?$`)
 var barePower = regexp.MustCompile(`^(?:それを?|そこを?|あれを?)?(?:つけ|付け|点け|けして|消[すしさせえ]|オンに|オフに|点灯して|消灯して|開け|あけて|閉め|しめて|切り替え|切替え)`)
 var repeatPower = regexp.MustCompile(`^(もう一度|もう一回|もういっかい|やり直し|またやって|同じこと|それをやって|お願い)[。！!？?]?$`)
 
 func (h *hallTurns) hold(session, text string) bool {
-	if otherDevice.MatchString(text) && (powerWords.MatchString(text) || otherAction.MatchString(text) || requestEnding.MatchString(text)) || barePower.MatchString(text) || applianceWords.MatchString(text) && powerWords.MatchString(text) ||
+	if otherDevice.MatchString(text) && (powerWords.MatchString(text) || otherAction.MatchString(text) || requestEnding.MatchString(text)) || barePower.MatchString(text) || acRequest.MatchString(text) || applianceWords.MatchString(text) && powerWords.MatchString(text) ||
 		specificDevice.MatchString(text) && requestEnding.MatchString(text) {
 		return true
 	}
@@ -117,7 +118,7 @@ func (h *hallTurns) executeCommand(ctx context.Context, session string, command 
 	ok := false
 	start := time.Now()
 	if standalone.Device.Enabled() {
-		ok = standalone.Device.Appliance(ctx, command.target, command.action, 0) == nil
+		ok = standalone.Device.Appliance(ctx, command.target, command.action, command.value) == nil
 	} else if err == nil && json.Unmarshal(raw, &cfg) == nil && strings.HasSuffix(cfg.URL, "/echo-home/v1") {
 		var result struct{ OK bool }
 		url := strings.TrimSuffix(cfg.URL, "/echo-home/v1") + "/echo-hall/v1"
@@ -125,6 +126,7 @@ func (h *hallTurns) executeCommand(ctx context.Context, session string, command 
 		if command.target != "hall" {
 			payload["op"] = "appliance"
 			payload["target"] = command.target
+			payload["value"] = command.value
 		}
 		err = mothership.HomeRequest(ctx, url, cfg.Key, payload, &result)
 		ok = err == nil && result.OK
