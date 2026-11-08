@@ -104,3 +104,11 @@ func Canceled() {
 		speaker.Sound().Chime(speaker.CancelSound())
 	}
 }
+
+// Thinking says a question was heard and its answer is still coming, when that takes long enough to
+// be mistaken for the device having ignored it. It only sounds, and not in quiet hours.
+func Thinking() {
+	if !config.Quiet() {
+		speaker.Sound().Chime(speaker.ThinkingSound())
+	}
+}

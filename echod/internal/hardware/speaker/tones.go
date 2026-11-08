@@ -28,6 +28,10 @@ var (
 	// an answer.
 	ToneCancel = []Note{{Freq: 698, Ms: 60}, {Freq: 466, Ms: 90}}
 
+	// ToneThinking is two soft notes, the same and then a step up: the question was heard and the
+	// answer is still coming. Neither falling like a cancel nor ending low like a failure.
+	ToneThinking = []Note{{Freq: 587, Ms: 70}, {Freq: 0, Ms: 60}, {Freq: 659, Ms: 90}}
+
 	// TonePairing and TonePairingOff are Bluetooth pairing mode asked for from a button: three notes,
 	// so they are not mistaken for mute's two, rising for on and falling for off.
 	TonePairing    = []Note{{Freq: 523, Ms: 70}, {Freq: 659, Ms: 70}, {Freq: 988, Ms: 140}}
@@ -156,6 +160,10 @@ func FailureSound() []Note { return ownOr(ClipFailure, ToneTrouble) }
 
 // CancelSound is what a request dropped on purpose sounds like: the owner's recording, or ToneCancel.
 func CancelSound() []Note { return ownOr(ClipCanceled, ToneCancel) }
+
+// ThinkingSound is what an answer still coming sounds like: ToneThinking. It has no recording of
+// the owner's to stand in for it.
+func ThinkingSound() []Note { return ToneThinking }
 
 // VolumeSound is the click a volume change makes, ButtonSound a button held, BTConnectSound a
 // Bluetooth device connecting, and DropInSound the chime that comes before a Drop In: each the owner's

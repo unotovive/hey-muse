@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -87,26 +88,39 @@ func sameKinds(a, b []eventKind) bool {
 // Twenty milliseconds of something said, as the microphone hands it over.
 var someAudio = bytesOf(make([]int16, 320))
 
+// The reply is on the screen before any of it is said. Speech now runs beside the answer, so what
+// is checked is that each sentence is already shown when its voice is asked for.
 func TestMuseShowsReplyBeforeSettleAndSpeech(t *testing.T) {
 	c := &conversation{phase: phaseThinking, shown: State{Phase: "thinking"}}
+	var mu sync.Mutex
 	var spoken []string
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	m := newViaMuse(fakeLink{ask: func(_ context.Context, _ []byte, on func(muse.ReplyEvent)) (muse.Reply, error) {
 		for _, text := range []string{"はい", "はい、こんにちは。"} {
 			on(muse.ReplyText{Text: text})
-			if c.shown.DisplayPhase() != "replying" || c.shown.Reply != text || len(spoken) != 0 {
-				t.Fatalf("preview before settle: state=%+v spoken=%v", c.shown, spoken)
+			mu.Lock()
+			shown := c.shown
+			mu.Unlock()
+			if shown.DisplayPhase() != "replying" || shown.Reply != text {
+				t.Errorf("preview before settle: state=%+v", shown)
 			}
 		}
 		on(muse.Settled{Text: "はい、こんにちは。"})
 		return muse.Reply{Text: "はい、こんにちは。"}, nil
 	}}, builtIn, func(_ context.Context, _ speech.Voice, text string, _ func([]int16) error) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if !strings.Contains(c.shown.Reply, text) {
+			t.Errorf("%q said before it was shown (shown %q)", text, c.shown.Reply)
+		}
 		spoken = append(spoken, text)
 		return nil
 	}, func(e event) {
 		if e.kind == evReplyPreview {
+			mu.Lock()
 			c.handle(e)
+			mu.Unlock()
 		}
 	})
 	m.answer(ctx, someAudio, "")
@@ -117,6 +131,122 @@ func TestMuseShowsReplyBeforeSettleAndSpeech(t *testing.T) {
 	c.handle(event{kind: evReplyPreview, text: "stale", ctx: ctx})
 	if c.shown.Reply == "stale" {
 		t.Fatal("canceled preview replaced the next turn")
+	}
+}
+
+// sentenceVoice records the sentences asked for, and says museChunk of each.
+type sentenceVoice struct {
+	mu    sync.Mutex
+	said  []string
+	asked chan string
+}
+
+func newSentenceVoice() *sentenceVoice { return &sentenceVoice{asked: make(chan string, 16)} }
+
+func (v *sentenceVoice) speak(ctx context.Context, voice speech.Voice, text string, out func([]int16) error) error {
+	v.mu.Lock()
+	v.said = append(v.said, text)
+	v.mu.Unlock()
+	v.asked <- text
+	return speaking(museChunk, museChunk)(ctx, voice, text, out)
+}
+
+func (v *sentenceVoice) all() []string {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return slices.Clone(v.said)
+}
+
+func (v *sentenceVoice) waitFor(t *testing.T, text string) {
+	t.Helper()
+	select {
+	case got := <-v.asked:
+		if got != text {
+			t.Errorf("asked to say %q, want %q", got, text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Errorf("%q was not said before the answer settled", text)
+	}
+}
+
+// Each sentence is said as soon as the reply shown contains it, not when the message is done; an
+// unfinished one waits for the settled text.
+func TestMuseSpeaksSentencesAsTheyArrive(t *testing.T) {
+	v := newSentenceVoice()
+	p := &posted{}
+	m := newViaMuse(fakeLink{ask: func(_ context.Context, _ []byte, on func(muse.ReplyEvent)) (muse.Reply, error) {
+		on(muse.Heard{Text: "天気は"})
+		on(muse.ReplyText{Text: "今日は晴れです。"})
+		v.waitFor(t, "今日は晴れです。")
+		on(muse.ReplyText{Text: "今日は晴れです。気温は20度"})
+		if got := v.all(); !slices.Equal(got, []string{"今日は晴れです。"}) {
+			t.Errorf("an unfinished sentence was said: %q", got)
+		}
+		on(muse.Settled{Text: "今日は晴れです。気温は20度。"})
+		return muse.Reply{Text: "今日は晴れです。気温は20度。"}, nil
+	}}, builtIn, v.speak, p.post)
+	m.answer(context.Background(), someAudio, "")
+
+	if got := v.all(); !slices.Equal(got, []string{"今日は晴れです。", "気温は20度。"}) {
+		t.Errorf("said %q", got)
+	}
+	var kinds []eventKind
+	previews := 0
+	for _, k := range p.kinds() {
+		if k == evReplyPreview {
+			// The first sentence is shown before it is said; later previews come while it plays.
+			if previews++; previews == 1 && len(kinds) != 1 {
+				t.Errorf("the first preview after %v", kinds)
+			}
+			continue
+		}
+		kinds = append(kinds, k)
+	}
+	want := []eventKind{evHeard, evReplyText, evStreamAudio, evStreamAudio, evMusePartEnd, evStreamEnd, evRunEnd}
+	if !sameKinds(kinds, want) || previews != 2 {
+		t.Errorf("events %v with %d previews, want %v with 2", kinds, previews, want)
+	}
+}
+
+// What the server rewrites after it was said is not said again, nor said in its new words; the
+// settled text resumes after the sentences already said.
+func TestMuseIgnoresRewrittenPrefix(t *testing.T) {
+	v := newSentenceVoice()
+	m := newViaMuse(fakeLink{ask: func(_ context.Context, _ []byte, on func(muse.ReplyEvent)) (muse.Reply, error) {
+		on(muse.ReplyText{Text: "今日は晴れです。"})
+		v.waitFor(t, "今日は晴れです。")
+		on(muse.ReplyText{Text: "今日は雨です。気温は20度。"})
+		on(muse.Settled{Text: "今日は雨です。気温は20度。"})
+		return muse.Reply{Text: "今日は雨です。気温は20度。"}, nil
+	}}, builtIn, v.speak, (&posted{}).post)
+	m.answer(context.Background(), someAudio, "")
+	if got := v.all(); !slices.Equal(got, []string{"今日は晴れです。", "気温は20度。"}) {
+		t.Errorf("said %q", got)
+	}
+}
+
+// A chime says the answer is on its way when nothing has been heard for a while, once; an answer
+// that is quick has none.
+func TestMuseThinkingSoundAfterDelay(t *testing.T) {
+	for name, c := range map[string]struct {
+		wait time.Duration
+		want int32
+	}{
+		"slow":  {wait: 50 * time.Millisecond, want: 1},
+		"quick": {want: 0},
+	} {
+		var chimes atomic.Int32
+		m := newViaMuse(fakeLink{ask: func(ctx context.Context, _ []byte, on func(muse.ReplyEvent)) (muse.Reply, error) {
+			time.Sleep(c.wait)
+			return muse.Reply{Text: "はい。"}, nil
+		}}, builtIn, speaking(museChunk, museChunk), (&posted{}).post)
+		m.thinking = func() { chimes.Add(1) }
+		m.thinkingAfter = 10 * time.Millisecond
+		m.answer(context.Background(), someAudio, "")
+		time.Sleep(20 * time.Millisecond)
+		if got := chimes.Load(); got != c.want {
+			t.Errorf("%s: %d chimes, want %d", name, got, c.want)
+		}
 	}
 }
 

@@ -5,10 +5,13 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/HuskerMinion/techo5/echod/internal/config"
+	"github.com/HuskerMinion/techo5/echod/internal/feature/feedback"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/media"
 	gadget "github.com/HuskerMinion/techo5/echod/internal/feature/muse"
 	"github.com/HuskerMinion/techo5/echod/internal/hardware/mic"
@@ -37,6 +40,9 @@ type speakFunc func(ctx context.Context, v speech.Voice, text string, out func(s
 // it is given, so each read must not take a slot of its own.
 const museChunk = mic.Rate / 10
 
+// museThinkingAfter is how long a question goes unanswered before a chime says Muse is on it.
+const museThinkingAfter = 5 * time.Second
+
 const (
 	sttFailuresToSkip = 2
 	sttSkipFor        = time.Minute
@@ -59,12 +65,16 @@ type viaMuse struct {
 	nextProbe    int
 	hall         hallTurns
 	sessionID    string // owned by the send queue and captured by End
+	// thinking is played once when no voice has started thinkingAfter after the question ended.
+	thinking      func()
+	thinkingAfter time.Duration
 	utterance
 }
 
 func newViaMuse(link museLink, voice func() speech.Voice, speak speakFunc, post func(event)) *viaMuse {
 	return &viaMuse{link: link, voice: voice, speak: speak, post: post,
-		brain: func() config.Brain { return config.Get().Brain }, transcribe: transcribe, classify: classifyReadOnly, now: time.Now}
+		brain: func() config.Brain { return config.Get().Brain }, transcribe: transcribe, classify: classifyReadOnly, now: time.Now,
+		thinking: feedback.Thinking, thinkingAfter: museThinkingAfter}
 }
 
 type museTextLink interface {
@@ -200,54 +210,103 @@ func speakMuse(ctx context.Context, v speech.Voice, text string, out func(sample
 	}.Speak(ctx, v, text, out)
 }
 
-// Each completed chat message can be spoken before the overall task is finished.
-// The playback stream closes only after Ask returns, so a pause between messages
-// does not end the turn. The Muse read loop keeps collecting updates during TTS.
+// The answer is said a sentence at a time, each as soon as the reply shown contains it, while Muse
+// is still writing the rest. A completed chat message, a settled answer and the final one are
+// flushed whole before the call returns, so the playback of one message ends (evMusePartEnd) before
+// the next begins. The playback stream closes only after Ask returns, so a pause between messages
+// does not end the turn.
 func (m *viaMuse) answer(ctx context.Context, pcm []byte, sessionID string) {
 	ctx = muse.WithLatency(ctx)
 	muse.LogLatency(ctx, slog.Default(), "recognition_start")
 	start := time.Now()
-	var heardAt, repliedAt, firstAudioAt time.Duration
-	var preview, spoken string
+	var heardAt, repliedAt time.Duration
+	var firstAudioAt atomic.Int64
+	var preview, messages string
+	var cursor sentenceCursor
+	var part *ttsQueue // the message being said, nil between messages
+	var spoke bool
 	var speechErr error
 	askCtx, stopAsk := context.WithCancel(ctx)
 	defer stopAsk()
+	defer func() {
+		if part != nil {
+			_ = part.Close() // the turn was stopped: nothing is reported
+		}
+	}()
 
-	speakPart := func(part, display string) {
-		if part == "" || speechErr != nil || ctx.Err() != nil {
+	// Nothing heard for a while after the question: one short chime says the answer is on its way.
+	var audible atomic.Bool
+	if m.thinking != nil && m.thinkingAfter > 0 {
+		chime := time.AfterFunc(m.thinkingAfter, func() {
+			if !audible.Load() && ctx.Err() == nil {
+				m.thinking()
+			}
+		})
+		defer chime.Stop()
+	}
+	emit := func(samples []int16) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if !audible.Swap(true) {
+			muse.LogLatency(ctx, slog.Default(), "first_audio_chunk")
+			firstAudioAt.Store(int64(time.Since(start)))
+		}
+		m.post(event{kind: evStreamAudio, audio: bytesOf(samples), ctx: ctx})
+		return nil
+	}
+	v := m.voice()
+	fetch := func(qctx context.Context, text string, out func([]int16) error) error {
+		err := m.say(qctx, v, text, out)
+		if err != nil && qctx.Err() == nil {
+			stopAsk() // the voice has failed: there is no use waiting for more to say
+		}
+		return err
+	}
+	say := func(sentences []string, display string) {
+		if len(sentences) == 0 || speechErr != nil || ctx.Err() != nil {
 			return
 		}
-		if repliedAt == 0 {
-			repliedAt = time.Since(start)
+		if part == nil {
+			if repliedAt == 0 {
+				repliedAt = time.Since(start)
+			}
+			muse.LogLatency(ctx, slog.Default(), "speech_start", "characters", len([]rune(sentences[0])))
+			m.post(event{kind: evReplyText, text: display, ctx: ctx})
+			part, spoke = newTTSQueue(ctx, fetch, emit), true
 		}
-		muse.LogLatency(ctx, slog.Default(), "speech_start", "characters", len([]rune(part)))
-		m.post(event{kind: evReplyText, text: display, ctx: ctx})
-		first, err := m.say(ctx, part, start)
-		if firstAudioAt == 0 {
-			firstAudioAt = first
+		for _, s := range sentences {
+			part.Push(s)
+		}
+	}
+	// endPart waits for the message being said to have played.
+	endPart := func() {
+		if part == nil {
+			return
+		}
+		q := part
+		part = nil
+		err := q.Close()
+		if ctx.Err() != nil {
+			return
 		}
 		if err != nil {
-			speechErr = err
+			if speechErr == nil {
+				speechErr = err
+			}
 			stopAsk()
 			return
 		}
-		if first > 0 && ctx.Err() == nil {
+		if !q.FirstAudio().IsZero() {
 			m.post(event{kind: evMusePartEnd, ctx: ctx})
 		}
 	}
-	// Settled and the final return value contain the entire answer. Speak only
-	// the remainder, including a partial last message returned at the turn cap.
-	speakRemainder := func(full string) {
+	// Settled and the final return value contain the entire answer: what has not been said of it,
+	// a partial last message returned at the turn cap included, is said now.
+	sayRest := func(full string) {
 		full = speech.Spoken(full)
-		tail, ok := strings.CutPrefix(full, spoken)
-		if !ok {
-			return
-		} // already spoken text was edited on the server
-		part := strings.TrimSpace(tail)
-		if part != "" {
-			speakPart(part, full)
-			spoken = full
-		}
+		say(cursor.Next(full, true), full)
+		endPart()
 	}
 	reply, err := m.ask(askCtx, pcm, sessionID, func(e muse.ReplyEvent) {
 		if askCtx.Err() != nil {
@@ -266,31 +325,34 @@ func (m *viaMuse) answer(ctx context.Context, pcm []byte, sessionID string) {
 				}
 				preview = text
 				m.post(event{kind: evReplyPreview, text: text, ctx: ctx})
+				say(cursor.Next(text, false), text)
 			}
 		case muse.MessageReady:
-			part := speech.Spoken(v.Text)
-			if part == "" {
+			msg := speech.Spoken(v.Text)
+			if msg == "" {
 				return
 			}
-			if spoken != "" {
-				spoken += "\n\n"
+			if messages != "" {
+				messages += "\n\n"
 			}
-			spoken += part
-			display := spoken
-			if strings.HasPrefix(preview, spoken) {
+			messages += msg
+			display := messages
+			if strings.HasPrefix(preview, messages) {
 				display = preview
 			}
-			speakPart(part, display)
+			say(cursor.Next(messages, true), display)
+			endPart()
 		case muse.Settled:
-			speakRemainder(v.Text)
+			sayRest(v.Text)
 		}
 	})
 	if ctx.Err() != nil {
 		return
 	}
-	if err == nil {
-		speakRemainder(reply.Text)
+	if err == nil && speechErr == nil {
+		sayRest(reply.Text)
 	}
+	endPart()
 	if ctx.Err() != nil {
 		return
 	}
@@ -306,40 +368,43 @@ func (m *viaMuse) answer(ctx context.Context, pcm []byte, sessionID string) {
 	if strings.HasSuffix(final, "?") || strings.HasSuffix(final, "？") {
 		m.post(event{kind: evContinue, ctx: ctx})
 	}
-	if spoken != "" {
+	if spoke {
 		m.post(event{kind: evStreamEnd, ctx: ctx})
 	}
 	m.post(event{kind: evRunEnd, ctx: ctx})
 	muse.LogLatency(ctx, slog.Default(), "voice_done")
-	slog.Info("muse turn answered", "heard_ms", heardAt.Milliseconds(), "replied_ms", repliedAt.Milliseconds(), "first_audio_ms", firstAudioAt.Milliseconds(), "spoken_ms", time.Since(start).Milliseconds())
+	slog.Info("muse turn answered", "heard_ms", heardAt.Milliseconds(), "replied_ms", repliedAt.Milliseconds(), "first_audio_ms", time.Duration(firstAudioAt.Load()).Milliseconds(), "spoken_ms", time.Since(start).Milliseconds())
 }
 
-// say sends PCM for one message. Its caller owns the lifetime of the turn.
-func (m *viaMuse) say(ctx context.Context, text string, start time.Time) (firstAudio time.Duration, err error) {
+// say speaks one sentence in voice v, handing out its samples in chunks of at least museChunk. If
+// the endpoint fails before any chunk was handed out, a piece held back included, the sentence is
+// said in the built-in voice instead. Chunks are cut per sentence, so the end of one sentence never
+// waits for the next one's voice.
+func (m *viaMuse) say(ctx context.Context, v speech.Voice, text string, out func([]int16) error) error {
 	held := make([]int16, 0, 2*museChunk)
-	flush := func() {
-		if len(held) == 0 || ctx.Err() != nil {
-			return
+	started := false
+	flush := func() error {
+		if len(held) == 0 {
+			return nil
 		}
-		if firstAudio == 0 {
-			muse.LogLatency(ctx, slog.Default(), "first_audio_chunk")
-			firstAudio = time.Since(start)
-		}
-		m.post(event{kind: evStreamAudio, audio: bytesOf(held), ctx: ctx})
+		started = true
+		chunk := slices.Clone(held)
 		held = held[:0]
+		return out(chunk)
 	}
 	speak := func(v speech.Voice) error {
 		return m.speak(ctx, v, text, func(samples []int16) error {
 			held = append(held, samples...)
 			if len(held) >= museChunk {
-				flush()
+				if err := flush(); err != nil {
+					return err
+				}
 			}
 			return ctx.Err()
 		})
 	}
-	v := m.voice()
-	err = speak(v)
-	if err != nil && ctx.Err() == nil && !v.Local() && firstAudio == 0 {
+	err := speak(v)
+	if err != nil && ctx.Err() == nil && !v.Local() && !started {
 		slog.Warn("muse: the speech endpoint failed, so the answer is in the built-in voice", "voice", v, "err", err)
 		held = held[:0]
 		if lerr := speak(speech.BuiltIn); lerr != nil {
@@ -348,11 +413,13 @@ func (m *viaMuse) say(ctx context.Context, text string, start time.Time) (firstA
 			err = nil
 		}
 	}
-	if err != nil || ctx.Err() != nil {
-		return firstAudio, err
+	if err != nil {
+		return err
 	}
-	flush()
-	return firstAudio, nil
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return flush()
 }
 
 // wavFile wraps 16 kHz 16-bit mono samples as the voice note Muse takes.
