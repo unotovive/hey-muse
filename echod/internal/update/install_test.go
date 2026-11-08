@@ -9,7 +9,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/HuskerMinion/techo5/echod/internal/layout"
 )
@@ -95,7 +97,7 @@ func TestInstallRefusesAManifestItCannotUse(t *testing.T) {
 		"no hash":     {Version: "0.0.1", Binaries: map[string]Binary{arch: {URL: good.URL, Size: 1}}},
 		"no size":     {Version: "0.0.1", Binaries: map[string]Binary{arch: {URL: good.URL, SHA256: good.SHA256}}},
 	} {
-		if err := Install(context.Background(), m, nil); err == nil {
+		if err := Install(context.Background(), m, nil, nil); err == nil {
 			t.Errorf("%s: installed something unusable", name)
 		}
 	}
@@ -127,6 +129,48 @@ func TestProgressReachesTheEnd(t *testing.T) {
 	}
 	if last < 0.9 {
 		t.Errorf("finished at %v", last)
+	}
+}
+
+// A binary swap restarts this process; only a slot device reboots, and the display words the two
+// apart, so the name it is handed has to be the right one for the device it is on.
+func TestRestartStepNamesWhatActuallyHappens(t *testing.T) {
+	if got := restartStep(true); got != "rebooting" {
+		t.Errorf("a slot install's last step is %q; want rebooting", got)
+	}
+	if got := restartStep(false); got != "restarting" {
+		t.Errorf("a binary swap's last step is %q; want restarting", got)
+	}
+}
+
+// The step after the download reports nothing of its own — slotctl says nothing at all until it
+// returns — so the display is told it is still going, and told again until it is over. Without that,
+// a dialog is dropped for silence in the middle of unpacking the rootfs.
+func TestTheInstallingStepSaysItIsStillGoing(t *testing.T) {
+	old := installingEvery
+	installingEvery = time.Millisecond
+	t.Cleanup(func() { installingEvery = old })
+
+	var reports atomic.Int32
+	stop := stillInstalling(func(string) { reports.Add(1) })
+	time.Sleep(30 * time.Millisecond)
+	stop()
+
+	if got := reports.Load(); got < 2 {
+		t.Errorf("the install was mentioned %d times while it ran; want it repeated", got)
+	}
+	// It stops with the step, rather than reporting for the rest of the install.
+	settled := reports.Load()
+	time.Sleep(20 * time.Millisecond)
+	if got := reports.Load(); got != settled {
+		t.Errorf("the step carried on reporting after it was over: %d then %d", settled, got)
+	}
+
+	// A caller with no display is not given a goroutine to run.
+	if stop := stillInstalling(nil); stop == nil {
+		t.Error("stillInstalling(nil) returned nothing to call")
+	} else {
+		stop()
 	}
 }
 
@@ -181,13 +225,28 @@ func TestDownloadStopsAtTheOfferedSize(t *testing.T) {
 		t.Errorf("%v, want something about how many bytes arrived", err)
 	}
 
-	st, statErr := os.Stat(to)
-	if statErr != nil {
-		t.Fatal(statErr)
+	if _, err := os.Stat(to); err == nil {
+		t.Error("a download that was refused was left where it would be installed from")
 	}
-	if st.Size() > b.Size+1 {
-		t.Errorf("wrote %d bytes for a download offered as %d", st.Size(), b.Size)
+	if written(t, dir) > b.Size+1 {
+		t.Errorf("wrote %d bytes for a download offered as %d", written(t, dir), b.Size)
 	}
+}
+
+// written is the most any one file in dir holds.
+func written(t *testing.T, dir string) int64 {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var most int64
+	for _, e := range entries {
+		if info, err := e.Info(); err == nil && info.Size() > most {
+			most = info.Size()
+		}
+	}
+	return most
 }
 
 // An old manifest is signed as well as a new one, so the only thing standing between a device and a
@@ -204,7 +263,7 @@ func TestInstallRefusesAnOlderVersionThanTheOneRunning(t *testing.T) {
 	b := Binary{URL: "http://example/echod", SHA256: strings.Repeat("a", 64), Size: 1}
 	m := Manifest{Version: "v0.7.9", Binaries: map[string]Binary{arch: b}}
 
-	err := Install(context.Background(), m, nil)
+	err := Install(context.Background(), m, nil, nil)
 	if err == nil {
 		t.Fatal("an older release was installed over a newer one")
 	}

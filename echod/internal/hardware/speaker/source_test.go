@@ -39,6 +39,24 @@ func newTestPlayer() *Player {
 	return p
 }
 
+// A source letting go leaves the one that took the speaker after it in place.
+func TestDetachLeavesAnotherSource(t *testing.T) {
+	p := newTestPlayer()
+	first, second := &recorder{fill: 10}, &recorder{fill: 20}
+	p.Attach(first)
+	p.Attach(second)
+	p.Detach(first)
+
+	if got := played(t, p); got[0] != 20 {
+		t.Errorf("after the first let go = %d, want the second source's 20", got[0])
+	}
+
+	p.Detach(second)
+	if got := played(t, p); got[0] != 0 {
+		t.Errorf("after both let go = %d, want silence", got[0])
+	}
+}
+
 func TestNothingAttachedPlaysTheQueueAlone(t *testing.T) {
 	p := newTestPlayer()
 	p.pending = []int16{100, 200, 300}
@@ -105,5 +123,48 @@ func TestDetachingStopsTheSource(t *testing.T) {
 
 	if got := played(t, p)[0]; got != 0 {
 		t.Errorf("detached = %d, want silence", got)
+	}
+}
+
+// An attached source is something playing while it places sound, and through two seconds of silence
+// after, the gap between two tracks. One left attached with nothing to place, as Sendspin's is while
+// Music Assistant has it paused, is not, or feature/takes would refuse to record over a pause.
+func TestASourceWithNothingToPlaceIsNotSounding(t *testing.T) {
+	p := newTestPlayer()
+	if p.Sounding() {
+		t.Fatal("nothing attached is sounding")
+	}
+	rec := &recorder{}
+	p.Attach(rec)
+	if !p.Sounding() {
+		t.Fatal("a source just attached is not sounding")
+	}
+	for range srcQuietAfter - 1 {
+		played(t, p)
+	}
+	if !p.Sounding() {
+		t.Fatal("a source silent for less than two seconds is not sounding")
+	}
+	played(t, p)
+	if p.Sounding() {
+		t.Fatal("a source silent for two seconds is still sounding")
+	}
+
+	rec.fill = 10
+	played(t, p)
+	if !p.Sounding() {
+		t.Fatal("a source placing sound again is not sounding")
+	}
+	rec.fill = 0
+	for range srcQuietAfter {
+		played(t, p)
+	}
+	p.Attach(&recorder{})
+	if !p.Sounding() {
+		t.Fatal("a new source took the silence of the one before it")
+	}
+	p.Attach(nil)
+	if p.Sounding() {
+		t.Fatal("a detached source is sounding")
 	}
 }

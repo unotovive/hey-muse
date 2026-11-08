@@ -9,7 +9,11 @@
 # what makes `apk add bluez` possible later.
 #
 #   mkrootfs.sh -i <indir> -o <out.tar.gz> [-w <workdir>] [-V <version>] [-z <timezone>]
-#               [-a <arch>] [-A <apk binary>]
+#               [-a <arch>] [-A <apk binary>] [-W alpine]
+#
+# -W alpine: wpa_supplicant from the board's package list, not the pinned 2.9 set (a board on a
+# mainline kernel whose Wi-Fi works with Alpine's own; the Echos' needs 2.9). Without it the build
+# fails when inputs/apks312 is missing, as it always has.
 #
 # <indir> layout (what deploy-rootfs.sh stages):
 #   bin/techo5 bin/fbprobe bin/audioprobe bin/rebootto bin/btbridge  Go binaries, armv7
@@ -18,16 +22,28 @@
 #   bin/techo5-pico                                        the built-in voice's helper (C, build-pico.sh), optional;
 #                                                          its data is in the overlay, usr/share/techo5/pico
 #   bin/techo5-ffmpeg                                      the Show's video decoder (C, build-ffmpeg.sh), optional
-#   tools/slotctl tools/techo5-lib.sh tools/packages-rootfs.txt
+#   bin/techo5-shairport-sync, bin/techo5-nqptp            AirPlay 2's receiver and clock (build-shairport-sync.sh), optional
+#   bin/tailscaled                                         Tailscale's daemon, static arm64 (build-tailscaled.sh), optional
+#   bin/techo5-ffmpeg64                                    its static aarch64 build (build-ffmpeg-arm64.sh), athena's
+#                                                          and the Skylight's, for their 64-bit kernels, optional
+#   bin/techo5-gpu                                         the GPU helper (tools/gpu/build.sh), optional; with it
+#   inputs/techo5-mesa.tar.gz                              the lean Mesa it loads (build-mesa.sh), laid over /usr
+#   bin/techo5-jpeg                                        the JPEG decoder (tools/jpeg/build.sh), athena's, optional
+#   tools/slotctl tools/bootctl tools/techo5-lib.sh tools/packages-rootfs.txt
 #   overlay/                                               tools/linux/rootfs from the repo
-#   inputs/alpine-minirootfs-*-armv7.tar.gz
+#   inputs/alpine-minirootfs-*-<arch>.tar.gz               <arch>: -a's, else apk's own (armv7, or
+#                                                          aarch64 for a 64-bit build)
 #   inputs/vendor.tar.gz                                   optional, development only: LineageOS's vendor/.
 #                                                          Published images never carry it: each unit keeps
 #                                                          its own in the store (etc/techo5/boot.sh)
-#   inputs/apks312/*.apk                                   wpa_supplicant 2.9 + libssl1.1 + libcrypto1.1
+#   inputs/kernel.tar.gz                                   optional, development only: a mainline kernel's
+#                                                          modules and firmware. Published images never
+#                                                          carry it
+#   inputs/apks312/*.apk                                   wpa_supplicant 2.9 + libssl1.1 + libcrypto1.1,
+#                                                          unless -W alpine
 set -e
 
-IN=; OUT=; WORK=/data/techo5-linux/build; VERSION=dev; TZNAME=UTC; ARCH=; APK=apk
+IN=; OUT=; WORK=/data/techo5-linux/build; VERSION=dev; TZNAME=UTC; ARCH=; APK=apk; WPA=
 while [ $# -gt 0 ]; do
 	case "$1" in
 	-i) IN=$2; shift 2;;
@@ -37,17 +53,32 @@ while [ $# -gt 0 ]; do
 	-z) TZNAME=$2; shift 2;;
 	-a) ARCH=$2; shift 2;;
 	-A) APK=$2; shift 2;;
+	-W) WPA=$2; shift 2;;
 	*) echo "mkrootfs: unknown argument $1" >&2; exit 1;;
 	esac
 done
-[ -n "$IN" ] && [ -n "$OUT" ] || { echo "usage: mkrootfs.sh -i indir -o out.tar.gz [-w workdir] [-V version] [-z timezone]" >&2; exit 1; }
+[ -n "$IN" ] && [ -n "$OUT" ] || { echo "usage: mkrootfs.sh -i indir -o out.tar.gz [-w workdir] [-V version] [-z timezone] [-a arch] [-A apk] [-W alpine]" >&2; exit 1; }
+case "$WPA" in '' | alpine) ;; *) echo "mkrootfs: -W takes alpine, not $WPA" >&2; exit 1;; esac
+# Every Echo image needs the pinned wpa_supplicant 2.9: without -W alpine a build that did not stage
+# it stops before it starts.
+[ "$WPA" = alpine ] || ls "$IN"/inputs/apks312/*.apk >/dev/null 2>&1 ||
+	{ echo "mkrootfs: no $IN/inputs/apks312/*.apk (wpa_supplicant 2.9); -W alpine takes Alpine's own instead" >&2; exit 1; }
 
 say() { echo "mkrootfs: $*"; }
 R=$WORK/root
 rm -rf "$R"
 mkdir -p "$R"
 
-mini=$(ls "$IN"/inputs/alpine-minirootfs-*-armv7.tar.gz | head -1)
+# The base for the architecture being built, the packages' (-a on a host, else apk's own on the device:
+# not uname's, which says aarch64 for an armv7 userspace on a 64-bit kernel). armv7 for every board,
+# aarch64 for a 64-bit build; a staging directory may hold both.
+base=${ARCH:-$($APK --print-arch 2>/dev/null)}
+base=${base:-armv7}
+mini=$(ls "$IN"/inputs/alpine-minirootfs-*-"$base".tar.gz 2>/dev/null | head -1)
+[ -n "$mini" ] || { echo "mkrootfs: no inputs/alpine-minirootfs-*-$base.tar.gz" >&2; exit 1; }
+# One base only: with an old one beside a new one, the first would be taken, and apk add does not
+# upgrade the packages a base already has.
+[ "$(ls "$IN"/inputs/alpine-minirootfs-*-"$base".tar.gz | wc -l)" -eq 1 ] || { echo "mkrootfs: more than one inputs/alpine-minirootfs-*-$base.tar.gz: keep only the one techo5lib.py names" >&2; exit 1; }
 say "base: $(basename "$mini")"
 tar -xzf "$mini" -C "$R"
 
@@ -60,21 +91,27 @@ arch=
 pkgs=$(sed 's/#.*//' "$IN/tools/packages-rootfs.txt" | tr '\n' ' ')
 say "apk add: $pkgs"
 $APK --root "$R" $arch --no-cache add $pkgs
-say "apk add (local): $(ls "$IN"/inputs/apks312/*.apk | xargs -n1 basename | tr '\n' ' ')"
-# Alpine 3.12's packages are signed by the -524d27bb key, which Alpine still ships for armv7 and which
-# the minirootfs puts in /etc/apk/keys, so apk verifies these like any other package and no
-# --allow-untrusted is needed. It stays as a fallback for a root whose keyring does not have that key
-# (a different base image, or a host apk pointed at its own keys) rather than as the normal path: an
-# unsigned install of four packages that go into every image is not something to do without noticing.
-# What they are is checked before they get here — fetch-inputs.py matches each one against Alpine's
-# package index and against the package's own datahash.
-if ! $APK --root "$R" $arch --no-cache add "$IN"/inputs/apks312/*.apk; then
-	say "warning: the v3.12 packages did not verify against $R/etc/apk/keys; installing them untrusted"
-	$APK --root "$R" $arch --no-cache add --allow-untrusted "$IN"/inputs/apks312/*.apk
+# A board whose Wi-Fi works with Alpine's own wpa_supplicant (the Surface RT, a mainline kernel) asks
+# for it with -W alpine, stages no apks312 and has wpa_supplicant in its package list instead.
+if [ "$WPA" != alpine ]; then
+	say "apk add (local): $(ls "$IN"/inputs/apks312/*.apk | xargs -n1 basename | tr '\n' ' ')"
+	# Alpine 3.12's packages are signed by the -524d27bb key, which Alpine still ships for armv7 and which
+	# the minirootfs puts in /etc/apk/keys, so apk verifies these like any other package and no
+	# --allow-untrusted is needed. It stays as a fallback for a root whose keyring does not have that key
+	# (a different base image, or a host apk pointed at its own keys) rather than as the normal path: an
+	# unsigned install of four packages that go into every image is not something to do without noticing.
+	# What they are is checked before they get here — fetch-inputs.py matches each one against Alpine's
+	# package index and against the package's own datahash.
+	if ! $APK --root "$R" $arch --no-cache add "$IN"/inputs/apks312/*.apk; then
+		say "warning: the v3.12 packages did not verify against $R/etc/apk/keys; installing them untrusted"
+		$APK --root "$R" $arch --no-cache add --allow-untrusted "$IN"/inputs/apks312/*.apk
+	fi
+else
+	say "-W alpine: wpa_supplicant comes from the package list"
 fi
 $APK --root "$R" $arch info -v | sort > "$R/etc/techo5-packages"
 
-# Muse setup over Bluetooth LE (echod lib/bluez gatt.go): bluetoothd offers an ATT MTU of 517, the
+# Muse setup over Bluetooth LE (echod lib/bluez gatt_peripheral.go): bluetoothd offers an ATT MTU of 517, the
 # Android Muse app writes MTU-3 bytes uncapped, and Android refuses a write over 512, so setup stalls
 # after its Wi-Fi step. 256 is what Meta's own installer sets.
 if [ -f "$R/etc/bluetooth/main.conf" ]; then
@@ -96,6 +133,21 @@ if [ -d "$R/etc/avahi" ]; then
 	rm -f "$R"/etc/avahi/services/*.service
 fi
 
+# bluetoothd says the device is a loudspeaker (major 4, audio/video; minor 5) from the start, and again
+# on each hci0 a restarted bridge brings up: with no Class of its own it writes 0 as the adapter
+# registers, and a phone that sees the device then shows it with no audio device type (#105).
+# t5_bt_up and t5_bt_again (techo5-lib.sh) write the same class after it.
+bc="$R/etc/bluetooth/main.conf"
+if [ -f "$bc" ] && grep -Eq '^#?[[:space:]]*Class[[:space:]]*=' "$bc"; then
+	sed -i -E 's/^#?[[:space:]]*Class[[:space:]]*=.*/Class = 0x000414/' "$bc"
+elif [ -f "$bc" ] && grep -q '^\[General\]' "$bc"; then
+	sed -i 's/^\[General\]$/[General]\nClass = 0x000414/' "$bc"
+else
+	mkdir -p "$R/etc/bluetooth"
+	printf '[General]\nClass = 0x000414\n' >> "$bc"
+fi
+grep -q '^Class = 0x000414$' "$bc" || { echo "mkrootfs: could not set the class in $bc" >&2; exit 1; }
+
 # Vendor tree: Wi-Fi/BT modules, firmware (firmware_class.path=/vendor/firmware on
 # the kernel command line), the audio tuning the daemon reads. It is Amazon's and the chip makers',
 # so an image leaves /vendor empty: the unit's own tree, kept in the store, is mounted there at boot.
@@ -105,8 +157,7 @@ if [ -e "$IN/inputs/vendor.tar.gz" ]; then
 	tar -xzf "$IN/inputs/vendor.tar.gz" -C "$R" vendor
 	# The Wi-Fi driver the device boots with (etc/techo5/device.conf in the overlay; the Show's by default).
 	WIFI_MODULE=/vendor/lib/modules/mt76x8_wlan.ko
-	[ -r "$IN/overlay/etc/techo5/device.conf" ] && WIFI_MODULE=$(sed -n 's/^WIFI_MODULE=//p' "$IN/overlay/etc/techo5/device.conf" | tr -d '
-"')
+	[ -r "$IN/overlay/etc/techo5/device.conf" ] && WIFI_MODULE=$(sed -n 's/^WIFI_MODULE=//p' "$IN/overlay/etc/techo5/device.conf" | tr -d '\r"')
 	[ -e "$R$WIFI_MODULE" ] || { echo "mkrootfs: vendor tree has no $WIFI_MODULE" >&2; exit 1; }
 else
 	say "no vendor tree: the unit's own is mounted at /vendor"
@@ -114,7 +165,7 @@ fi
 
 # Our binaries and scripts.
 install -d "$R/usr/local/bin" "$R/usr/local/sbin" "$R/lib" "$R/var/lib/bluetooth" "$R/var/lib/bluealsa" "$R/usr/var/lib/bluealsa"
-for b in techo5 fbprobe audioprobe rebootto btbridge techo5-aec techo5-librespot techo5-pico techo5-ffmpeg; do
+for b in techo5 fbprobe audioprobe rebootto btbridge techo5-aec techo5-librespot techo5-pico techo5-ffmpeg techo5-ffmpeg64 techo5-gpu techo5-jpeg tailscaled techo5-shairport-sync techo5-nqptp; do
 	[ -e "$IN/bin/$b" ] && install -m 755 "$IN/bin/$b" "$R/usr/local/bin/$b"
 done
 
@@ -127,6 +178,8 @@ if [ -e "$IN/bin/techo5-ffmpeg" ]; then
 	grep -Eq "^inet:.*[:,]techo5-video(,|\$)" "$R/etc/group" || sed -i -E "/^inet:/{s/:\$/:techo5-video/;t;s/\$/,techo5-video/}" "$R/etc/group"
 fi
 install -m 755 "$IN/tools/slotctl" "$R/usr/local/sbin/slotctl"
+# The boot layer's A/B record tool: slotctl and boot.sh use it, and it changes nothing without one.
+install -m 755 "$IN/tools/bootctl" "$R/usr/local/sbin/bootctl"
 install -m 644 "$IN/tools/techo5-lib.sh" "$R/lib/techo5-lib.sh"
 
 # Overlay from the repo (tools/linux/rootfs), CRLF-safe.
@@ -135,12 +188,32 @@ say "overlay"
 find "$R/etc/techo5" "$R/usr/local/sbin" "$R/lib/techo5-lib.sh" "$R/etc/inittab" "$R/etc/profile.d/techo5.sh" "$R/etc/hostname" "$R/etc/motd" \
 	-type f -exec sed -i 's/\r$//' {} +
 chmod 755 "$R"/etc/techo5/*.sh "$R"/usr/local/sbin/*
+# License texts are read, never run: a checkout on Windows hands every file over as executable.
+[ -d "$R/usr/share/licenses" ] && find "$R/usr/share/licenses" -type f -exec chmod 644 {} +
+
+# The GPU helper's Mesa (panfrost, EGL, GLES, GBM; tools/linux/build-mesa.sh) and what it links to.
+if [ -f "$IN/inputs/techo5-mesa.tar.gz" ]; then
+	say "Mesa for the GPU helper"
+	$APK --root "$R" $arch --no-cache add libdrm expat zlib zstd-libs libstdc++ libgcc
+	tar -xzf "$IN/inputs/techo5-mesa.tar.gz" -C "$R"
+	$APK --root "$R" $arch info -v | sort > "$R/etc/techo5-packages"
+fi
+
+# Optional mainline modules and firmware, built from the same kernel as boot.
+if [ -f "$IN/inputs/kernel.tar.gz" ]; then
+	say "kernel modules and firmware (development image: not for publishing)"
+	tar -xzf "$IN/inputs/kernel.tar.gz" -C "$R"
+fi
 
 # State that must survive an image change lives on userdata.
 rm -rf "$R/etc/dropbear"
 ln -s /data/techo5-linux/dropbear "$R/etc/dropbear"
 rm -f "$R/etc/resolv.conf"
 ln -s /run/resolv.conf "$R/etc/resolv.conf"
+# The hosts file too: boot.sh writes localhost there, and echod adds the .local names it was given
+# (Home Assistant's, Music Assistant's), which nothing else here can look up (internal/lib/localname).
+rm -f "$R/etc/hosts"
+ln -s /run/hosts "$R/etc/hosts"
 
 # Root: no password, and no SSH key in the image. Keys live on userdata and only arrive from Home
 # Assistant (echod's ssh_keys action); echod starts dropbear when the SSH switch is on.
@@ -161,6 +234,13 @@ mkdir -p "$R/store" "$R/data" "$R/run" "$R/proc" "$R/sys" "$R/dev" "$R/tmp" "$R/
 chmod 1777 "$R/tmp"
 # The daemon's own version line comes from running it, which on a host goes through QEMU.
 echo "techo5 rootfs $VERSION built $(date -u '+%Y-%m-%dT%H:%MZ'), daemon $("$R/usr/local/bin/techo5" --version 2>/dev/null | head -1)" > "$R/etc/techo5-release"
+
+# A board's own last changes to the root (users, permissions: the Surface RT's image makes one),
+# staged as tools/rootfs-post.sh. Run here, by sh, with the root as its argument.
+if [ -f "$IN/tools/rootfs-post.sh" ]; then
+	say "rootfs-post.sh"
+	sh "$IN/tools/rootfs-post.sh" "$R"
+fi
 
 say "packing"
 rm -f "$OUT"

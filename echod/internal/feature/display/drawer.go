@@ -4,6 +4,7 @@ package display
 
 import (
 	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -15,6 +16,9 @@ import (
 
 // openDrawer brings the drawer in on a tab.
 func (d *Display) openDrawer(tab int) {
+	if !slices.Contains(shownTabIDs(), tab) {
+		tab = drawerCameras // one this screen does not offer
+	}
 	d.mu.Lock()
 	d.drawer, d.drawerTab, d.drawerScroll, d.drawerPick, d.pickScroll = true, tab, 0, "", 0
 	d.weatherUntil, d.radar = time.Time{}, false
@@ -27,7 +31,7 @@ func (d *Display) openDrawer(tab int) {
 		// before it is pressed. See home.PokeGroup.
 		go home.Get().PokeGroup()
 	}
-	slog.Info("drawer", "open", drawerTabs[tab])
+	slog.Info("drawer", "open", tabName(tab))
 	d.wake()
 }
 
@@ -113,6 +117,10 @@ func (d *Display) drawerRowTap(id string) {
 		d.mu.Unlock()
 		return
 	}
+	if strings.HasPrefix(id, "todo:") {
+		d.todoTap(id)
+		return
+	}
 	kind, n, ok := strings.Cut(id, ":")
 	i, err := strconv.Atoi(n)
 	if !ok || err != nil || i < 0 {
@@ -133,6 +141,13 @@ func (d *Display) drawerRowTap(id string) {
 				}
 			}(list[i])
 		}
+	case "grid":
+		d.closeDrawer()
+		go func() {
+			if err := home.Get().ShowGrid(nil, cameraScreenTime()); err != nil {
+				slog.Warn("screen: camera grid", "err", err)
+			}
+		}()
 	case "cam":
 		if cams := home.Get().Cameras(); i < len(cams) {
 			d.closeDrawer()

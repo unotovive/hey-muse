@@ -129,7 +129,7 @@ func (d *Display) showsNowPlaying() bool {
 	// A stream this player is only carrying is still what the room is doing, so the face is its as
 	// much as the radio's: the state it draws was already being worked out and only this gate was
 	// missing, because a carried stream never satisfies Playing().
-	if media.Get().ExternalPlaying() {
+	if media.Get().ExternalShowing() {
 		return true
 	}
 	if _, _, _, ok := media.Get().Held(); ok {
@@ -141,6 +141,17 @@ func (d *Display) showsNowPlaying() bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return time.Since(d.radioCue) < radioCueFor
+}
+
+// musicFaceUp is whether the face a tap lands on is now playing: music wanting it, and not quiet so
+// long that the clock has taken the face back (musicAway), where a tap is the clock's again.
+func (d *Display) musicFaceUp() bool {
+	if !d.showsNowPlaying() {
+		return false
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return !d.musicAway
 }
 
 // pickStation is a tap on the station list: stop, or play the row.
@@ -185,13 +196,13 @@ func (r *roundRenderer) nowPlayingFace(s roundScene) {
 
 	station := currentStation(rd)
 	if station == "" {
-		station = "Music"
+		station = tr("music")
 	}
-	label := "PLAYING"
+	label := tr("ui_playing")
 	if s.paused {
-		label = "PAUSED"
+		label = tr("ui_paused")
 	}
-	label = clip(r.label, r, label+" · "+strings.ToUpper(station), 330)
+	label = clip(r.label, r, label+" · "+upper(station), 330)
 	r.centered(r.label, label, 304, colMusic)
 	if rd.Title != "" {
 		r.centered(r.title, clip(r.title, r, rd.Title, 350), 340, colText)
@@ -206,7 +217,7 @@ func (r *roundRenderer) nowPlayingFace(s roundScene) {
 	r.discAt(doneX-18, doneY, doneR, color.RGBA{36, 42, 52, 255})
 	r.discAt(doneX+18, doneY, doneR, color.RGBA{36, 42, 52, 255})
 	r.line(doneX-18, doneY, doneX+18, doneY, 2*doneR, color.RGBA{36, 42, 52, 255})
-	r.centered2(r.small, "Done", int(doneX), int(doneY)+6, colText)
+	r.centered2(r.small, tr("done"), int(doneX), int(doneY)+6, colText)
 	// The star on the right saves what is playing to favorites, and fills in once it has.
 	r.discAt(starX, starY, starR, color.RGBA{36, 42, 52, 255})
 	starColor := color.RGBA{150, 158, 170, 255}
@@ -244,14 +255,14 @@ func (r *roundRenderer) radioList(s roundScene) {
 
 	switch {
 	case len(rows) == 0 && rd.Loading:
-		r.centered(r.title, "Loading…", 250, colDim)
+		r.centered(r.title, tr("ui_loading"), 250, colDim)
 		return
 	case len(rows) == 0:
-		msg := "No stations"
+		msg := tr("ui_no_stations")
 		if rd.Problem != "" {
 			msg = rd.Problem
 		} else if !rd.Configured {
-			msg = "Radio needs a Home Assistant token"
+			msg = tr("ui_radio_needs_a_home_assistant_token")
 		}
 		r.paragraph(r.body, msg, 230, colDim, 3)
 		return
@@ -263,12 +274,12 @@ func (r *roundRenderer) radioList(s roundScene) {
 	sel := min(max(s.radioSel, 0), len(rows)-1)
 	name := func(i int) string {
 		if rows[i] == stopRow {
-			return "Stop the music"
+			return tr("drawer_stop_music")
 		}
 		return rows[i]
 	}
 	cur := currentStation(rd)
-	r.centered(r.small, fmt.Sprintf("%d of %d", sel+1, len(rows)), 150, colDim)
+	r.centered(r.small, fmt.Sprintf(tr("level_of"), sel+1, len(rows)), 150, colDim)
 	if sel > 0 {
 		r.centered(r.body, clip(r.body, r, name(sel-1), 300), 200, colDim)
 	}
@@ -282,14 +293,14 @@ func (r *roundRenderer) radioList(s roundScene) {
 	if sel+1 < len(rows) {
 		r.centered(r.body, clip(r.body, r, name(sel+1), 300), max(y+14, 318), colDim)
 	}
-	hint := "turn · tap to play"
+	hint := tr("drawer_turn_tap_to_play")
 	if rows[sel] == stopRow {
-		hint = "turn · tap to stop"
+		hint = tr("drawer_turn_tap_to_stop")
 		if grouped {
-			hint = "turn · tap to stop all rooms"
+			hint = tr("drawer_turn_tap_to_stop_all_rooms")
 		}
 	}
-	r.centered(r.small, hint, 392, colDim)
+	r.centered(r.small, clip(r.small, r, hint, chord(382)-56), 392, colDim)
 
 	// Where in the list, round the ring.
 	const from, span = 1.25 * math.Pi, 1.5 * math.Pi
@@ -307,12 +318,12 @@ func (r *roundRenderer) radioList(s roundScene) {
 func (r *roundRenderer) sourceButtons(rd home.Radio) {
 	sources := home.RadioSources()
 	if len(sources) < 2 {
-		r.centered(r.label, strings.ToUpper(home.SourceLabel(rd.Source)), 118, colMusic)
+		r.centered(r.label, upper(home.SourceLabel(rd.Source)), 118, colMusic)
 		return
 	}
 	for i, src := range sources {
 		x0, x1 := sourceButton(i, len(sources))
-		name := shortSource(src)
+		name := clip(r.label, r, shortSource(src), x1-x0-32)
 		cx := (x0 + x1) / 2
 		if src == rd.Source {
 			r.line(float64(x0+14), sourceY, float64(x1-14), sourceY, 30, colMusic)
@@ -351,11 +362,11 @@ func sourceAt(x, y int) string {
 func shortSource(src string) string {
 	switch src {
 	case "local":
-		return "Local"
+		return tr("ui_local")
 	case "popular":
-		return "Popular"
+		return tr("ui_popular")
 	}
-	return "Favorites"
+	return tr("drawer_favorites")
 }
 
 // clip shortens a line to fit width pixels in face.
@@ -363,11 +374,7 @@ func clip(face font.Face, r *roundRenderer, s string, width int) string {
 	if r.width(face, s) <= width {
 		return s
 	}
-	rs := []rune(s)
-	for len(rs) > 1 && r.width(face, string(rs)+"…") > width {
-		rs = rs[:len(rs)-1]
-	}
-	return string(rs) + "…"
+	return clipRunes(s, 1, func(line string) bool { return r.width(face, line) <= width })
 }
 
 // radarFace is the rain map filling the circle, home marked in the middle, the loop's time on top
@@ -376,13 +383,13 @@ func (r *roundRenderer) radarFace(s roundScene) {
 	r.clear()
 	v := s.radar
 	if len(v.Frames) == 0 {
-		r.centered(r.label, "RADAR", 150, colRadar)
-		msg := "Loading the rain map…"
+		r.centered(r.label, tr("ui_radar_variant"), 150, colRadar)
+		msg := tr("loading_the_rain_map")
 		if !v.Loading && v.Problem != "" {
-			msg = "No rain map: " + v.Problem
+			msg = tr("no_rain_map") + v.Problem
 		}
 		r.paragraph(r.body, msg, 240, colDim, 3)
-		r.centered(r.small, "swipe for the forecast", 400, colDim)
+		r.centered(r.small, tr("ui_swipe_for_the_forecast"), 400, colDim)
 		return
 	}
 	n := len(v.Frames)
@@ -426,9 +433,9 @@ func (r *roundRenderer) radarFace(s roundScene) {
 	}
 	drawPlaces(r.dst, r.small, places, keep, boxIn, 6)
 
-	label := "Radar " + clockHM(f.At.Local())
+	label := tr("ui_radar") + " " + clockHM(f.At.Local())
 	if i == n-1 {
-		label += " (latest)"
+		label += " (" + tr("ui_radar_latest") + ")"
 	}
 	w := r.width(r.label, label)
 	r.line(float64(center-w/2-10), 62, float64(center+w/2+10), 62, 32, color.RGBA{0, 0, 0, 160})

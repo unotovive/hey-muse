@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -32,7 +33,7 @@ func Gateway() net.IP {
 func gatewayIn(table string) net.IP {
 	for _, line := range strings.Split(table, "\n")[1:] {
 		f := strings.Fields(line)
-		if len(f) < 3 || f[0] != iface || f[1] != "00000000" {
+		if len(f) < 3 || f[0] != iface() || f[1] != "00000000" {
 			continue
 		}
 		raw, err := hex.DecodeString(f[2])
@@ -55,4 +56,108 @@ func Answers(ctx context.Context, ip net.IP) bool {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	return exec.CommandContext(ctx, "ping", "-c", "1", "-W", "2", ip.String()).Run() == nil
+}
+
+// Group is the IP stack's count of packets addressed to a group (multicast or broadcast, IPv4 and
+// IPv6) since the device booted.
+type Group struct {
+	// In and Out are what was taken in and sent out. A copy of what the device sends to a group loops
+	// back and is counted as taken in too, so only taking in more than was sent shows the network
+	// itself was heard; and not even that on a quiet network, where the router's membership queries
+	// and the device's answers to them (which do not loop back) cancel out.
+	In, Out uint64
+
+	// Router is the router adverts and multicast listener queries taken in. Only a router sends these,
+	// never the device itself, so any rise is the network heard.
+	Router uint64
+
+	// McastIn and McastOut are the multicast part of In and Out alone, without broadcasts: a radio
+	// can lose its multicast filter while broadcasts still arrive (TECHO5 #458).
+	McastIn, McastOut uint64
+
+	// From is which files the counts were read from, FromIPv4 and FromIPv6: two readings from different
+	// files cannot be compared, since the one that was missed would read as a jump.
+	From uint8
+}
+
+// The files a Group is read from.
+const (
+	FromIPv4 uint8 = 1 << iota
+	FromIPv6
+)
+
+// GroupPackets is the IP stack's group counters. The Wi-Fi driver's multicast count stays at 0 on the
+// Echo Dot, so the IP stack's are the ones to read. ok is false when neither file can be read.
+func GroupPackets() (g Group, ok bool) {
+	if b, err := os.ReadFile("/proc/net/netstat"); err == nil {
+		if g4, found := group4(string(b)); found {
+			g.In, g.Out, g.From, ok = g.In+g4.In, g.Out+g4.Out, g.From|FromIPv4, true
+			g.McastIn, g.McastOut = g.McastIn+g4.McastIn, g.McastOut+g4.McastOut
+		}
+	}
+	if b, err := os.ReadFile("/proc/net/snmp6"); err == nil {
+		if g6, found := group6(string(b)); found {
+			g.In, g.Out, g.Router, g.From, ok = g.In+g6.In, g.Out+g6.Out, g.Router+g6.Router, g.From|FromIPv6, true
+			g.McastIn, g.McastOut = g.McastIn+g6.McastIn, g.McastOut+g6.McastOut
+		}
+	}
+	return g, ok
+}
+
+// group4 reads the IpExt lines of /proc/net/netstat: a line of names, then a line of values.
+func group4(netstat string) (g Group, ok bool) {
+	var names []string
+	for _, line := range strings.Split(netstat, "\n") {
+		f := strings.Fields(line)
+		if len(f) == 0 || f[0] != "IpExt:" {
+			continue
+		}
+		if names == nil {
+			names = f
+			continue
+		}
+		for i := 1; i < len(f) && i < len(names); i++ {
+			v, err := strconv.ParseUint(f[i], 10, 64)
+			if err != nil {
+				continue
+			}
+			switch names[i] {
+			case "InMcastPkts", "InBcastPkts":
+				g.In, ok = g.In+v, true
+			case "OutMcastPkts", "OutBcastPkts":
+				g.Out += v
+			}
+			switch names[i] {
+			case "InMcastPkts":
+				g.McastIn += v
+			case "OutMcastPkts":
+				g.McastOut += v
+			}
+		}
+		break
+	}
+	return g, ok
+}
+
+// group6 reads /proc/net/snmp6: one counter per line, the name then the value.
+func group6(snmp6 string) (g Group, ok bool) {
+	for _, line := range strings.Split(snmp6, "\n") {
+		f := strings.Fields(line)
+		if len(f) != 2 {
+			continue
+		}
+		v, err := strconv.ParseUint(f[1], 10, 64)
+		if err != nil {
+			continue
+		}
+		switch f[0] {
+		case "Ip6InMcastPkts":
+			g.In, g.McastIn, ok = v, v, true
+		case "Ip6OutMcastPkts":
+			g.Out, g.McastOut = v, v
+		case "Icmp6InRouterAdvertisements", "Icmp6InGroupMembQueries":
+			g.Router += v
+		}
+	}
+	return g, ok
 }

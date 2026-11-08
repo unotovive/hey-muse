@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/HuskerMinion/techo5/echod/internal/feature/media"
+	"github.com/HuskerMinion/techo5/echod/internal/feature/phone"
 	"github.com/HuskerMinion/techo5/echod/internal/hardware/speaker"
 )
 
@@ -38,10 +39,16 @@ type stream struct {
 	held    []int16
 	flowing bool
 
+	// louder is the reply's compressor while Louder speech is on, kept across flushes.
+	louder media.Louder
+
 	bytes       int
 	peak        int
 	splicesAt   uint64
 	underrunsAt uint64
+
+	// ended is done called: send and done are the conversation's, on its one goroutine.
+	ended bool
 
 	// energy and samples are the reply's loudness so far, for the speech normalizer in flush.
 	energy  float64
@@ -62,8 +69,15 @@ func newStream(splices, underruns uint64, buffer time.Duration) *stream {
 }
 
 // send hands a chunk to whoever is playing it. A queue this deep only fills if audio is arriving
-// faster than it plays, in which case a dropped chunk is the least of it.
+// faster than it plays, in which case a dropped chunk is the least of it. A chunk after the end is
+// dropped: the queue is closed, and a send on it would end the conversation.
 func (s *stream) send(chunk playbackChunk) {
+	if s.ended {
+		if chunk.consumed != nil {
+			chunk.consumed <- false
+		}
+		return
+	}
 	select {
 	case s.chunks <- chunk:
 	default:
@@ -75,8 +89,14 @@ func (s *stream) send(chunk playbackChunk) {
 	}
 }
 
-// done says no more chunks are coming, which is what ends the errand.
-func (s *stream) done() { close(s.chunks) }
+// done says no more chunks are coming, which is what ends the errand; once.
+func (s *stream) done() {
+	if s.ended {
+		return
+	}
+	s.ended = true
+	close(s.chunks)
+}
 
 // play is the errand: it takes chunks until there are no more and queues them once enough has arrived
 // to play through a dip. Returning hands over to the driver, which waits for the audio to be heard.
@@ -87,8 +107,7 @@ func (s *stream) play(ctx context.Context, p *speaker.Player, started func()) er
 			return nil
 		case chunk, ok := <-s.chunks:
 			if !ok {
-				// Whatever is still held will never be joined by more, so it just plays.
-				s.flush(p)
+				s.finish(p)
 				return nil
 			}
 			if chunk.partEnd {
@@ -103,6 +122,34 @@ func (s *stream) play(ctx context.Context, p *speaker.Player, started func()) er
 				chunk.consumed <- true
 			}
 		}
+	}
+}
+
+// fetch is the errand for a reply fetched from its url while Home Assistant is still writing it: the
+// body arrives the way a streamed reply does, and goes through the same cushion. A fetch that fails
+// before any audio is the url's fault, and is said; one that fails part way has played what came.
+func (s *stream) fetch(ctx context.Context, p *speaker.Player, url string, started func()) error {
+	err := media.FetchVoice(ctx, url, func(data []byte) { s.take(data, p, started) })
+	if ctx.Err() != nil {
+		return nil
+	}
+	s.finish(p)
+	if err != nil && s.bytes > 0 {
+		slog.Warn("the early reply ended early", "err", err, "bytes", s.bytes)
+		return nil
+	}
+	return err
+}
+
+// finish plays whatever is still held, which will never be joined by more.
+func (s *stream) finish(p *speaker.Player) {
+	s.flush(p)
+	if s.bytes > 0 {
+		at := s.playingAt
+		if at.IsZero() {
+			at = time.Now() // a reply shorter than the cushion starts here
+		}
+		replyPlaying(at, replyAudioSeconds(s.bytes), true)
 	}
 }
 
@@ -145,6 +192,7 @@ func (s *stream) take(data []byte, p *speaker.Player, started func()) {
 	}
 	s.flowing = true
 	s.flush(p)
+	replyPlaying(s.playingAt, replyAudioSeconds(s.bytes), false)
 }
 
 // flush queues what is held, brought toward the speech loudness target. The gain follows the
@@ -159,7 +207,11 @@ func (s *stream) flush(p *speaker.Player) {
 	if gain := media.SpeechGain(s.energy, s.samples); gain > 1 {
 		out = media.Scale(out, gain)
 	}
-	p.PlayVoice(out)
+	// A reply to a turn during a call goes to the far end too, with Assistant replies go into calls on.
+	if phone.RepliesIntoCall() {
+		phone.Get().Say(out)
+	}
+	p.PlayVoice(media.ForSpeaker(out, &s.louder))
 }
 
 // heldSamples is a duration as a count of 16 kHz samples.

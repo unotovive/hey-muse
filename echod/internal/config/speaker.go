@@ -3,9 +3,16 @@ package config
 // Speaker is how loud the device is, how voice is stretched to the playback rate, and whether the
 // driver's tuning is applied.
 type Speaker struct {
-	Volume     int        `json:"volume"`
+	Volume int `json:"volume"`
+	// GainDB is an optional boost in dB over the vendor's gain, zero being the vendor's: the TAS5805M
+	// amplifier's on a Show 5 that has one, the codec's speaker driver on the Echo Dot and Echo 2nd gen.
+	// The same 1 dB a step on each, and this device's own (KeepOwn, not shared).
+	GainDB     int        `json:"gain_db,omitempty"`
 	Resampling Resampling `json:"resampling"`
 	ASP        bool       `json:"asp"`
+	// Stereo preserves separate L/R on athena when explicitly chosen.
+	// False/missing means the original mono behavior and survives upgrades.
+	Stereo     bool       `json:"stereo,omitempty"`
 	OutputMode OutputMode `json:"output_mode,omitempty"`
 
 	// QuietHours is when the device makes no sound of its own, as "22-7", empty for never. See
@@ -23,6 +30,14 @@ type Speaker struct {
 	// on, so a restart inside the same hours does not turn down a device somebody turned up since.
 	NightOf string `json:"night_of,omitempty"`
 
+	// VoiceOffset and CallOffset are how far the assistant's voice (replies, announcements and the
+	// device's spoken words, never music) and a call's audio (the intercom and the phone) sit from the
+	// volume, in volume steps: negative is quieter, positive louder, zero the volume itself, which is
+	// what a device that never set them plays at. A raise stops at the night volume through quiet hours,
+	// and a muted or zero volume keeps both silent (speaker.LaneStep).
+	VoiceOffset int `json:"voice_offset,omitempty"`
+	CallOffset  int `json:"call_offset,omitempty"`
+
 	// Bass and Treble are the listener's own shelves in dB, zero for the tuning as the vendor left
 	// it. They apply only while the tuning is on, since they are a stage of it (lib/asp/tone.go).
 	Bass   float64 `json:"bass,omitempty"`
@@ -37,6 +52,23 @@ type Speaker struct {
 	// ClassicSounds is TECHO5's own notes for muting and a finished timer, where the default is the
 	// Home Assistant satellites' recorded ones.
 	ClassicSounds bool `json:"classic_sounds,omitempty"`
+
+	// NoBluetoothVolume keeps the device's volume its own while a phone or a computer plays to it over
+	// Bluetooth: the source's volume level scales only its own audio, and neither side moves the other's
+	// (btaudio's Bluetooth sets the volume, on unless this is set, #245).
+	NoBluetoothVolume bool `json:"no_bluetooth_volume,omitempty"`
+
+	// LouderSpeech compresses replies and announcements on their way to the speaker, so the quiet
+	// parts of words are heard (media.Louder, #304). Off by default.
+	LouderSpeech bool `json:"louder_speech,omitempty"`
+
+	// ClearerSpeech takes the tuning's low-band lift down while replies and announcements play
+	// (speaker.Player.SetClearerSpeech, techo5-dot#25). Off by default.
+	ClearerSpeech bool `json:"clearer_speech,omitempty"`
+
+	// LouderTop takes the top volume steps into the tuning hotter, where the tuning has a lift for
+	// them (speaker.Player.SetLouderTop, #304). Off by default.
+	LouderTop bool `json:"louder_top,omitempty"`
 
 	// SoundsMoved is whether the wake sounds have been moved to Home Assistant's: once, for a device
 	// saved when Chirp was the default, and only for a word still on it (config.Load).
@@ -55,6 +87,10 @@ const (
 
 	// DefaultASP applies the driver's tuning, which is what the vendor's firmware does.
 	DefaultASP = true
+
+	// SpeakerGainMax is an optional amplifier boost, not another volume scale. Zero keeps
+	// the vendor's unity gain. Boosts can distort, especially with raised bass or treble.
+	SpeakerGainMax = 6
 )
 
 func defaultSpeaker() Speaker {
@@ -87,6 +123,10 @@ func (w SpeakerWriter) Volume(v int) error {
 	return w.st.Update(func(c *Config) { c.Speaker.Volume = v })
 }
 
+func (w SpeakerWriter) GainDB(v int) error {
+	return w.st.Update(func(c *Config) { c.Speaker.GainDB = max(0, min(v, SpeakerGainMax)) })
+}
+
 func (w SpeakerWriter) NightVolume(v int) error {
 	return w.st.Update(func(c *Config) { c.Speaker.NightVolume = v })
 }
@@ -116,6 +156,11 @@ func (w SpeakerWriter) Resampling(v Resampling) error {
 	return w.st.Update(func(c *Config) { c.Speaker.Resampling = v })
 }
 
+// Stereo saves whether athena's internal speakers play in stereo.
+func (w SpeakerWriter) Stereo(on bool) error {
+	return w.st.Update(func(c *Config) { c.Speaker.Stereo = on })
+}
+
 // OutputMode saves the selected audio output mode.
 func (w SpeakerWriter) OutputMode(v OutputMode) error {
 	return w.st.Update(func(c *Config) { c.Speaker.OutputMode = v })
@@ -131,6 +176,22 @@ func (w SpeakerWriter) Bass(v float64) error {
 
 func (w SpeakerWriter) Treble(v float64) error {
 	return w.st.Update(func(c *Config) { c.Speaker.Treble = v })
+}
+
+func (w SpeakerWriter) NoBluetoothVolume(v bool) error {
+	return w.st.Update(func(c *Config) { c.Speaker.NoBluetoothVolume = v })
+}
+
+func (w SpeakerWriter) LouderSpeech(v bool) error {
+	return w.st.Update(func(c *Config) { c.Speaker.LouderSpeech = v })
+}
+
+func (w SpeakerWriter) ClearerSpeech(v bool) error {
+	return w.st.Update(func(c *Config) { c.Speaker.ClearerSpeech = v })
+}
+
+func (w SpeakerWriter) LouderTop(v bool) error {
+	return w.st.Update(func(c *Config) { c.Speaker.LouderTop = v })
 }
 
 func (w SpeakerWriter) ClassicSounds(v bool) error {
@@ -192,3 +253,16 @@ func (r Resampling) Label() string {
 	}
 	return string(r)
 }
+
+// VoiceOffset saves how far the assistant's voice sits from the volume, clamped to the range of steps.
+func (w SpeakerWriter) VoiceOffset(v int) error {
+	return w.st.Update(func(c *Config) { c.Speaker.VoiceOffset = ClampOffset(v) })
+}
+
+// CallOffset saves how far a call's audio sits from the volume, clamped to the range of steps.
+func (w SpeakerWriter) CallOffset(v int) error {
+	return w.st.Update(func(c *Config) { c.Speaker.CallOffset = ClampOffset(v) })
+}
+
+// ClampOffset keeps an offset from the volume within one volume range either way.
+func ClampOffset(v int) int { return max(-VolumeSteps, min(v, VolumeSteps)) }

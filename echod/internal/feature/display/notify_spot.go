@@ -1,0 +1,103 @@
+//go:build spot
+
+package display
+
+import (
+	"strings"
+	"time"
+
+	"github.com/HuskerMinion/techo5/echod/internal/feature/notify"
+	"github.com/HuskerMinion/techo5/echod/internal/lib/mdi"
+)
+
+// A notification from Home Assistant on the round face: the icon, the title, the words, and the way
+// out. A circle has no corner to put a card in, so it takes the face, as an announcement does.
+
+// notifyFaceLines is as many lines of the message as the face holds.
+const notifyFaceLines = 3
+
+// A note of the device's own (notify.Note) says what to check, which takes more words than a
+// notification's news: they are smaller, and there are more lines of them.
+const (
+	noteFaceLines = 5
+	noteFaceStep  = 30
+)
+
+// A large or huge notification (notify's size) keeps the face's shape and gives the message more of it:
+// a wider, taller band for the words, set as large as the band takes them, and no icon on a huge one.
+func (r *roundRenderer) sizedNotifyFace(n notify.Notification) {
+	huge := n.Size == notify.SizeHuge
+	head := "NOTIFICATION"
+	if n.Title != "" {
+		head = upper(n.Title)
+	}
+	hf := r.textFace(true, 22)
+	r.centered(hf, r.fit(hf, head, 340), 118, colAccent)
+	top, width, high := 140, 380, 190
+	if huge {
+		top, width, high = 134, 400, 226
+	}
+	sizes := stepsDown(64, 28, 4)
+	if huge {
+		sizes = stepsDown(150, 26, 6)
+	}
+	lines, face, lineH := r.fitWords(true, n.Message, width, high, sizes)
+	if face != nil {
+		y := top + (high-len(lines)*lineH)/2 + face.Metrics().Ascent.Ceil()
+		for _, line := range lines {
+			r.centered(face, line, y, colText)
+			y += lineH
+		}
+	}
+	r.centered(r.small, "tap to dismiss", top+high+34, colDim)
+}
+
+func (r *roundRenderer) notifyFace(s roundScene) {
+	n := s.notification
+	if n.Size != notify.SizeNormal && !n.Own {
+		r.sizedNotifyFace(n)
+		return
+	}
+	y := 150
+	if _, ok := mdi.Rune(n.Icon); ok {
+		const size = 40
+		r.mdiIcon(n.Icon, center-r.s(size)/2, y-r.s(size)-8, size, colAccent)
+		y += 10
+	}
+	head := "NOTIFICATION"
+	if n.Title != "" {
+		head = upper(n.Title)
+	}
+	r.centered(r.label, clip(r.label, r, head, 340), y, colAccent)
+
+	face, most, step := r.title, notifyFaceLines, 40
+	if n.Own {
+		face, most, step = r.small, noteFaceLines, noteFaceStep
+	}
+	lines := r.wrap(face, n.Message, 340)
+	if len(lines) > most {
+		lines = append(lines[:most-1], clip(face, r, strings.Join(lines[most-1:], " "), 340))
+	}
+	y += 60
+	for _, line := range lines {
+		r.centered(face, line, y, colText)
+		y += step
+	}
+	r.centered(r.small, "tap to dismiss", y+16, colDim)
+}
+
+// notifyLights puts the menu away for a notification of words and lights a dark face for either kind,
+// once per notification and by day (noticeLights). At night it leaves the face as it is: the menu is
+// put away by the touch that releases the notification (gesture), and a dark face stays dark until
+// that touch lights it.
+func (d *Display) notifyLights() {
+	night := nightNow(time.Now())
+	d.mu.Lock()
+	on := d.on
+	if _, card := notify.Get().Card(); card && d.menuOpen && !night {
+		d.closeMenu()
+	}
+	d.mu.Unlock()
+	d.noticeLights(on, night)
+	d.wake()
+}

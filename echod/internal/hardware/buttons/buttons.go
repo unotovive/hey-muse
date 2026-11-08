@@ -1,4 +1,4 @@
-// Package buttons owns the four buttons on top of the device.
+// Package buttons owns the four buttons on top of the device, and the power key of one that has one.
 //
 // It reads the input nodes and says what happened. It does not know what any of it means: that a long
 // press of the action button reaches the second assistant belongs to whatever is listening, and
@@ -33,6 +33,10 @@ const (
 	VolumeDown Name = "volume_down"
 	VolumeUp   Name = "volume_up"
 	Action     Name = "action"
+
+	// Power is a power key that is not the mute. None of the Echos has one (the Show 5's KEY_POWER is
+	// its mute button), so only a device whose codes name it reports it.
+	Power Name = "power"
 )
 
 // LongPress is how long a button must be held to count as held rather than pressed, and
@@ -78,6 +82,16 @@ const doubleTap = 400 * time.Millisecond
 // LongHolds reports whether this device reports LongHold at all.
 func LongHolds() bool { return longHoldAfter > 0 }
 
+// Has reports whether this device has the button at all, for listing only the buttons it has.
+func Has(n Name) bool {
+	for _, c := range codes {
+		if c == n {
+			return true
+		}
+	}
+	return false
+}
+
 // Event is one thing a button did.
 type Event struct {
 	Name Name
@@ -102,6 +116,11 @@ type Controller struct {
 
 	// tapped is when each button last reported a Tap, for recognizing the second of a pair.
 	tapped map[Name]time.Time
+
+	// down counts each button's presses still down, and went is when each last went down; see
+	// Pressed.
+	down map[Name]int
+	went map[Name]time.Time
 }
 
 var (
@@ -118,12 +137,26 @@ func Get() *Controller {
 func (c *Controller) Name() string { return "buttons" }
 
 // Start opens the input nodes. It is an error to find none: the buttons are the one part of the
-// device that should work whatever else is wrong, so silently having none is worth a restart.
+// device that should work whatever else is wrong, so silently having none is worth a restart. A
+// device without buttons of its own (Here) opens nothing, and Run waits for the end.
 func (c *Controller) Start(context.Context) error {
+	if !Here {
+		slog.Info("no buttons of the device's own to read")
+		return nil
+	}
 	devices, err := input.List()
 	if err != nil {
 		return fmt.Errorf("buttons: listing input devices: %w", err)
 	}
+	kept := devices[:0]
+	for _, d := range devices {
+		if notButtons[d.Name] {
+			_ = d.Close()
+			continue
+		}
+		kept = append(kept, d)
+	}
+	devices = kept
 	if len(devices) == 0 {
 		return fmt.Errorf("buttons: no input devices")
 	}
@@ -230,11 +263,39 @@ func (c *Controller) emit(name Name, kind Kind) {
 	}
 }
 
+// Pressed reports whether a button is down now, and when it last went down. A press still reads as
+// down while its listeners hear the release, so whatever a tap does is done before it is let go: the
+// mute's watch after a hold leaves the line alone in between, where the hardware may have moved it
+// for the press before the tap arrives.
+func (c *Controller) Pressed(name Name) (down bool, at time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.down[name] > 0, c.went[name]
+}
+
+// mark records a button going down or coming up, for Pressed.
+func (c *Controller) mark(name Name, down bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.down == nil {
+		c.down, c.went = map[Name]int{}, map[Name]time.Time{}
+	}
+	if down {
+		c.down[name]++
+		c.went[name] = time.Now()
+		return
+	}
+	if c.down[name] > 0 {
+		c.down[name]--
+	}
+}
+
 func (c *Controller) watch(ctx context.Context, d *input.Device) error {
 	down := map[uint16]*held{}
 	defer func() {
-		for _, h := range down {
+		for code, h := range down {
 			h.stop()
+			c.mark(codes[code], false)
 		}
 	}()
 
@@ -270,6 +331,7 @@ func (c *Controller) watch(ctx context.Context, d *input.Device) error {
 
 // pressed starts tracking a button that has just gone down.
 func (c *Controller) pressed(name Name) *held {
+	c.mark(name, true)
 	h := &held{}
 
 	// A repeating button acts at once and then ramps, so a tap moves one step.
@@ -308,6 +370,7 @@ func (c *Controller) pressed(name Name) *held {
 // released finishes a button. A tap is reported here for anything that did not already report one on
 // the way down, and nothing is reported for a button that was held: the hold was the event.
 func (c *Controller) released(name Name, h *held) {
+	defer c.mark(name, false)
 	h.stop()
 
 	h.mu.Lock()

@@ -9,9 +9,11 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 
 	"github.com/chromedp/cdproto/emulation"
 	"github.com/chromedp/cdproto/page"
+	"github.com/chromedp/cdproto/target"
 	"github.com/chromedp/chromedp"
 )
 
@@ -20,6 +22,10 @@ type browser struct {
 	cfg    config
 	ctx    context.Context // the browser's own; a tab is a child of it
 	cancel func()
+
+	// pages is the web pages' own contexts, each to its one tab (pages.go): any other window that
+	// appears in one is that page's popup, and is closed (closePopups).
+	pages sync.Map // cdp.BrowserContextID to target.ID
 }
 
 func newBrowser(parent context.Context, cfg config) (*browser, error) {
@@ -43,7 +49,39 @@ func newBrowser(parent context.Context, cfg config) (*browser, error) {
 		acancel()
 		return nil, err
 	}
-	return &browser{cfg: cfg, ctx: bctx, cancel: func() { bcancel(); acancel() }}, nil
+	b := &browser{cfg: cfg, ctx: bctx, cancel: func() { bcancel(); acancel() }}
+	if err := b.closePopups(); err != nil {
+		bcancel()
+		acancel()
+		return nil, err
+	}
+	return b, nil
+}
+
+// closePopups has the browser say when a window is opened anywhere in it, and closes one opened in a
+// web page's context that is not the page's own tab: a popup, however the page made it.
+func (b *browser) closePopups() error {
+	chromedp.ListenBrowser(b.ctx, func(ev any) {
+		e, ok := ev.(*target.EventTargetCreated)
+		if !ok || e.TargetInfo == nil || e.TargetInfo.Type != "page" {
+			return
+		}
+		own, ok := b.pages.Load(e.TargetInfo.BrowserContextID)
+		if !ok || own.(target.ID) == e.TargetInfo.TargetID {
+			return
+		}
+		slog.Warn("a web page opened a window; closed")
+		go func() {
+			ctx, cancel := context.WithTimeout(b.ctx, tabAnswer)
+			defer cancel()
+			_ = chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+				return target.CloseTarget(e.TargetInfo.TargetID).Do(asBrowser(ctx))
+			}))
+		}()
+	})
+	return chromedp.Run(b.ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		return target.SetDiscoverTargets(true).Do(asBrowser(ctx))
+	}))
 }
 
 func (b *browser) close() { b.cancel() }
@@ -161,6 +199,10 @@ func (b *browser) open(ctx context.Context, path string, w, h int, allowed map[s
 		}),
 		emulation.SetDeviceMetricsOverride(int64(w), int64(h), 1, false),
 		emulation.SetTouchEmulationEnabled(true).WithMaxTouchPoints(1),
+		// Every tab is a page somebody is looking at. Without this a tab is hidden whenever another
+		// is in front of it, and always after it has been parked (warm.go): a hidden page sends one
+		// frame and then none, so a screen that came back to its parked tab froze (#112).
+		emulation.SetFocusEmulationEnabled(true),
 		emulation.SetEmulatedMedia().WithFeatures([]*emulation.MediaFeature{{Name: "prefers-color-scheme", Value: "dark"}}),
 		chromedp.Navigate(b.cfg.ha+path),
 	)

@@ -13,6 +13,7 @@
 package setup
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"log/slog"
@@ -26,6 +27,7 @@ import (
 	"github.com/HuskerMinion/techo5/echod/internal/feature/web"
 	"github.com/HuskerMinion/techo5/echod/internal/hardware/buttons"
 	"github.com/HuskerMinion/techo5/echod/internal/lib/hook"
+	"github.com/HuskerMinion/techo5/echod/internal/lib/wifi"
 )
 
 func init() {
@@ -95,6 +97,9 @@ type Feature struct {
 	// Changed fires when the page opens or closes, or when a browser starts or stops waiting, so the
 	// screen can say what is going on.
 	Changed hook.Hook[struct{}]
+
+	// remote is Remote setup (remote.go).
+	remote remoteSetup
 }
 
 var (
@@ -115,6 +120,7 @@ func Get() *Feature {
 		// The press is the whole port's authorization, not only this page's: a screenshot is one
 		// thing to let the network have and driving the screen from it is another.
 		web.Guard(shared.letInRequest)
+		shared.wireRemote()
 	})
 	return shared
 }
@@ -138,12 +144,19 @@ func build() *Feature {
 			f.Close()
 		},
 	}
+	f.buildRemote()
 	return f
 }
 
 func (f *Feature) Name() string { return "setup page" }
 
-func (f *Feature) Entities() []esphome.Entity { return []esphome.Entity{f.sw} }
+func (f *Feature) Entities() []esphome.Entity {
+	// Remote setup is the tailnet's, and a device with no Tailscale has nothing to offer it over.
+	if !hasTailnet() {
+		return []esphome.Entity{f.sw}
+	}
+	return []esphome.Entity{f.sw, f.remote.sw, f.remote.btn, f.remote.asking}
+}
 
 // On is whether the page is being served at all.
 func (f *Feature) On() bool {
@@ -161,12 +174,23 @@ func (f *Feature) on(now time.Time) bool {
 func (f *Feature) Open() {
 	now := time.Now()
 	f.mu.Lock()
-	if !f.on(now) {
+	fresh := !f.on(now)
+	if fresh {
 		f.openedAt = now
+		// A page that ran out on its own is closed by Run's next look, up to a tick later: opened again
+		// before then, it is still a new page, and the browsers let into the old one are not in this one.
+		clear(f.live)
+		f.waiting, f.waitingEnd = "", time.Time{}
 		slog.Info("setup page open", "idle", idle, "at most", life)
 	}
 	f.openUntil = now.Add(idle)
 	f.mu.Unlock()
+	if fresh {
+		// A page opened anew is this house's, whatever it was the last time it was up (remote.go), and
+		// nothing the last one asked for is kept for it.
+		f.remoteOff()
+		discardTakes("the setup page closed")
+	}
 
 	f.sw.Set(true)
 	web.Wake()
@@ -186,6 +210,10 @@ func (f *Feature) Close() {
 	if was {
 		slog.Info("setup page closed")
 	}
+	// Takes of a word belong to the page that asked for them, and nothing outlives it.
+	discardTakes("the setup page closed")
+	f.remoteOff()
+	f.showAsking()
 	f.sw.Set(false)
 	web.Wake()
 	f.Changed.Emit(struct{}{})
@@ -217,8 +245,12 @@ func (f *Feature) Waiting() bool {
 // with no screen there is nothing else to tell the button so.
 //
 // It is true while a browser is waiting and for pressGrace after the press was taken, because the
-// listeners run in no fixed order and this may be asked either side of the page answering.
+// listeners run in no fixed order and this may be asked either side of the page answering. A recording
+// of takes asked for on the page waits for a press the same way, and says the same (feature/takes).
 func (f *Feature) TookPress() bool {
+	if takesTookPress() || firstRunTakesPress() {
+		return true
+	}
 	now := time.Now()
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -229,7 +261,7 @@ func (f *Feature) TookPress() bool {
 }
 
 // button is the action button: a hold opens the page on a device that has no other way to ask, and a
-// tap answers a browser that is waiting to be let in.
+// tap answers a browser that is waiting to be let in, or else starts the takes the page asked for.
 //
 // A longer hold on the Dot is Bluetooth pairing, and every one of those passes through this hold on
 // its way there. Opening the page for somebody who was reaching for pairing puts a device on the
@@ -259,7 +291,21 @@ func (f *Feature) button(e buttons.Event) {
 			f.Close()
 		}
 	case buttons.Tap:
-		f.press()
+		if f.press() {
+			return
+		}
+		if firstRunTakesPress() {
+			// First run still to do, with nothing connected: the press is first run's, as the ring's
+			// orange says (led.Splash), and nothing that would answer it otherwise does (TookPress). It
+			// opens the page the way a hold does, once the device is on a network: before that the page
+			// cannot be reached, and the press is Improv's, which hears every press itself while it is
+			// offering (feature/improv), to let the phone in.
+			if !f.On() {
+				go f.openWhenOnline()
+			}
+			return
+		}
+		takesPressed()
 	}
 }
 
@@ -270,11 +316,21 @@ func (f *Feature) press() bool { return f.pressFor("") }
 // pressFor is press for the browser asking (Asking) when the press began, or for whoever is asking
 // for "": a press that took a while, a PIN typed first, lets in only the browser it was made for.
 func (f *Feature) pressFor(asking string) bool {
+	ok := f.admit(asking, "a press on the device")
+	f.showAsking()
+	return ok
+}
+
+// admit lets in the browser asking, as pressFor says, and by says who did it, for the log.
+func (f *Feature) admit(asking, by string) bool {
 	now := time.Now()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if !f.on(now) || f.waiting == "" || now.After(f.waitingEnd) || (asking != "" && f.waiting != asking) {
 		return false
+	}
+	if by == byHA && !f.remote.on.Load() {
+		return false // Remote setup went off on the way here (remote.go)
 	}
 	if len(f.live) >= sessions {
 		// Forget the oldest rather than refuse: the newest press is the one somebody just made.
@@ -287,10 +343,11 @@ func (f *Feature) pressFor(asking string) bool {
 		delete(f.live, oldest)
 	}
 	f.live[f.waiting] = now
+	f.keepRemote(f.waiting)
 	f.waiting, f.waitingEnd = "", time.Time{}
 	f.took = now
 	f.unanswered = 0 // a press clears the run
-	slog.Info("setup page: a browser was let in by a press on the device")
+	slog.Info("setup page: a browser was let in", "by", by)
 	return true
 }
 
@@ -328,6 +385,7 @@ func (f *Feature) refuse() bool {
 	had := f.waiting != ""
 	f.waiting, f.waitingEnd = "", time.Time{}
 	f.mu.Unlock()
+	f.showAsking()
 	if had {
 		slog.Info("setup page: a browser was refused at the device")
 		f.Changed.Emit(struct{}{})
@@ -338,7 +396,11 @@ func (f *Feature) refuse() bool {
 // await starts a browser waiting to be let in and hands back the cookie it will hold if the press
 // comes. Only one browser waits at a time: a second is refused, so that whoever presses knows which
 // browser they are letting in. Asking over and over without a press stops being allowed for a while.
-func (f *Feature) await() (token string, ok bool) {
+func (f *Feature) await() (token string, ok bool) { return f.awaitFrom("", false) }
+
+// awaitFrom is await for a browser asking from an address, and away whether over the tailnet: noted
+// with the asking itself, for Home Assistant's let in (remote.go).
+func (f *Feature) awaitFrom(from string, away bool) (token string, ok bool) {
 	now := time.Now()
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -358,6 +420,7 @@ func (f *Feature) await() (token string, ok bool) {
 		return "", false
 	}
 	f.waiting, f.waitingEnd = newToken(), now.Add(pressWait)
+	f.remote.token, f.remote.from, f.remote.away = f.waiting, from, away
 	return f.waiting, true
 }
 
@@ -392,4 +455,22 @@ func newToken() string {
 		return ""
 	}
 	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+// online is whether the device has an address to be reached at (a variable for the tests).
+var online = func() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	return wifi.Current(ctx).Address != ""
+}
+
+// openWhenOnline opens the page for a press during first run if the device is on a network. Off the
+// button's goroutine: reading the address asks the supplicant.
+func (f *Feature) openWhenOnline() {
+	if !online() {
+		slog.Info("a press during first run, with no network: left to Improv")
+		return
+	}
+	slog.Info("setup page opened by a press during first run")
+	f.Open()
 }

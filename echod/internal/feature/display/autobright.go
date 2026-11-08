@@ -33,12 +33,13 @@ func (d *Display) settle(ctx context.Context) {
 // room: nothing else relights while it rises, so without this the panel stayed where the sunrise
 // started until the alarm. And once more as it ends, back to the room's level.
 func (d *Display) settleStep() {
-	rising := sunriseProgress(time.Now()) > 0
+	rising := d.wakeLight(time.Now()) > 0
 	d.mu.Lock()
 	rising = rising && d.on
 	ended := d.sunriseLit && !rising
 	d.sunriseLit = rising
-	due := d.autoOn && d.on && !d.settled
+	// Dim after idle fades down the same way, auto-brightness or not (idle_dim_show.go).
+	due := (d.autoOn || d.idleDimmed) && d.on && !d.settled
 	d.mu.Unlock()
 	switch {
 	case rising || ended:

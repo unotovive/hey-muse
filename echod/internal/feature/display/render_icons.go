@@ -16,6 +16,7 @@ import (
 var (
 	sunGold   = color.RGBA{0xf2, 0xb1, 0x3c, 0xff}
 	sunPale   = color.RGBA{0xf7, 0xd0, 0x7a, 0xff}
+	sunDeep   = color.RGBA{0x95, 0x5f, 0x0e, 0xff} // sunPale's words on a light theme's ground
 	cloudGray = color.RGBA{0xb8, 0xc0, 0xc8, 0xff}
 	cloudDark = color.RGBA{0x7c, 0x86, 0x90, 0xff}
 	rainBlue  = color.RGBA{0x6f, 0xa8, 0xdc, 0xff}
@@ -72,7 +73,7 @@ func (r *renderer) cloud(cx, y, w int, c color.Color) {
 	r.disc(cx-w/4, y-h/2, h/2, c)
 	r.disc(cx+w/6, y-h/2, h*2/3, c)
 	r.disc(cx-w/16, y-h*5/6, h*3/5, c)
-	draw.Draw(r.dst, image.Rect(cx-w/4, y-h/2, cx+w/6+h*2/3, y), image.NewUniform(c), image.Point{}, draw.Over)
+	washOver(r.dst, image.Rect(cx-w/4, y-h/2, cx+w/6+h*2/3, y), c)
 }
 
 func (r *renderer) sun(cx, cy, rad int) {
@@ -95,7 +96,7 @@ func (r *renderer) moon(cx, cy, rad int) {
 func (r *renderer) drops(cx, y, w int, c color.Color, n int) {
 	for i := 0; i < n; i++ {
 		x := cx - w/3 + i*(w*2/3)/max(n-1, 1)
-		r.stroke(x+4, y+4, x-2, y+w/5, max(w/16, 2), c)
+		r.stroke(x+r.s(4), y+r.s(4), x-r.s(2), y+w/5, max(w/16, r.s(2)), c)
 	}
 }
 

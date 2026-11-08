@@ -10,11 +10,16 @@ the release, since the kernel configuration and the device trees differ.
     python3 tools/install-show.py
     python3 tools/install-show.py --serial <serial> --name Kitchen --dry-run
     python3 tools/install-show.py --serial <serial> --name Kitchen --force
+    python3 tools/install-show.py --serial <serial> --for-someone-else
     python3 tools/install-show.py --lineage-zip lineage-18.1-...-cronos.zip --wifi MyNetwork
 
 From TWRP (--lineage-zip), a unit fresh from its unlock never has to start LineageOS: the installer
 formats userdata, installs the LineageOS zip from TWRP only for the drivers on its system partition, and
 goes on from there. Wi-Fi is then given with --wifi, or chosen on the Show's own screen afterward.
+
+--for-someone-else is for a Show you are giving away. It asks for no Wi-Fi network, name or key, writes none,
+and marks the Show to start its own setup when it is next powered on; the new owner's Home Assistant can then
+add it with nothing typed. It cannot be used with --name, --wifi, --wifi-passphrase-file or --key-file.
 
 Run with nothing, it finds the unit (asking which, when there are several), asks for a name, and asks
 once before anything is erased. Every question has a switch, for running it from a script.
@@ -44,22 +49,33 @@ before that name) and reused on a later run, so Home Assistant keeps the device.
 recovery; flash the LineageOS zip and the LineageOS boot image.
 """
 import argparse
+import glob
 import hashlib
 import os
 import re
+import subprocess
 import sys
 import zipfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from techo5lib import (CONSOLE_TECHO5, Adb, Console, Fastboot, Release, ask_name, ask_wifi,  # noqa: E402
-                       check_serial_access, confirm, console_hint, default_dir, fail, fetch_json, md5, need,
-                       new_api_key, note, pick_unit, run_main, step, valid_api_key, wait_for, wifi_conf,
+from techo5lib import (CONSOLE_TECHO5, Adb, Console, Fail, Fastboot, Release, ask_name, ask_wifi, check_gift,  # noqa: E402
+                       check_serial_access, collect_evidence, confirm, console_hint, default_dir, fail, fetch_json, list_consoles, md5,
+                       need, new_api_key, note, pick_unit, run_main, step, valid_api_key, wait_for, wifi_conf,
                        write_private)
 
 REPO = 'wobsoriano/hey-muse'
 # The LineageOS kernel commit TECHO5's kernel is rebuilt from: the vendor modules only load on it.
 # All three boards run this same commit, which is why one daemon and one installer serve them.
 KERNEL_RELEASE = '4.9.337-g8d928c5176cc'
+# The LineageOS release with that kernel, per board: the 2026-09-04 build. A later one is built from a
+# later commit, with another kernel configuration, and its vendor modules do not fit TECHO5's kernel.
+LINEAGE_RELEASE = {
+    'cronos': 'lineage-18.1-cronos-v0.4',
+    'checkers': 'lineage-18.1-checkers-v0.7',
+    'crown': 'lineage-18.1-crown-v0.5',
+}
+LINEAGE_DATE = '20260904'
+LINEAGE_ZIP = 'lineage-18.1-' + LINEAGE_DATE + '-UNOFFICIAL-%s.zip'
 WIFI_MODULE = 'vendor/lib/modules/mt76x8_wlan.ko'
 
 # The boards this installs on, as `getprop ro.product.device` reports them. They share the SoC, the
@@ -102,6 +118,13 @@ LOGO_KAERU = {
                   stock='6a717f0f8bd3502df2e2a811f1a90a2ec83e58f151874e11c2920a9a63dc4fa1',
                   logo='926bc8449b1a9e0ce894c0df1bc66f549c2b294247bc73da9e8998b5e9344f64'),
 }
+
+
+def lineage_zip_date(zip_path):
+    """The build date in a LineageOS zip's file name (lineage-18.1-YYYYMMDD-...), or None for a name
+    that carries none."""
+    m = re.search(r'(20\d{6})', os.path.basename(zip_path))
+    return m.group(1) if m else None
 
 
 def lineage_board(zip_path):
@@ -252,14 +275,23 @@ def install_lineage(adb, zip_path):
     note('LineageOS installed from TWRP (not started)')
 
 
-def check_lineage_driver(adb):
+def lineage_hint(board):
+    """Which LineageOS build TECHO5 needs on this board, and where to get it."""
+    tag = LINEAGE_RELEASE[board]
+    return ('TECHO5 needs LineageOS %s (%s), whose kernel its own is built from; a newer LineageOS is not '
+            'supported yet. Get it from https://github.com/amazon-oss/releases/releases/tag/%s and run '
+            'this again from TWRP with --lineage-zip %s, or install it in TWRP and start it once'
+            % (tag.rsplit('-', 1)[1], LINEAGE_ZIP % board, tag, LINEAGE_ZIP % board))
+
+
+def check_lineage_driver(adb, board):
     """The Wi-Fi driver on the LineageOS system partition is built for the kernel TECHO5's is rebuilt
     from, which is what the running-kernel check says on a unit that started LineageOS."""
     out = adb.sh('mkdir -p /tmp/t5sys && mount -o ro /dev/block/mmcblk0p12 /tmp/t5sys && '
                  'grep -a -o "vermagic=[^ ]*" /tmp/t5sys/system/%s | head -1; umount /tmp/t5sys' % WIFI_MODULE)
     if 'vermagic=%s' % KERNEL_RELEASE not in out:
-        fail('the LineageOS system this zip installed has a Wi-Fi driver for %s, not %s: use the LineageOS '
-             '18.1 build the getting started guide links' % (out.strip() or 'no kernel it names', KERNEL_RELEASE))
+        fail('the LineageOS system this zip installed has a Wi-Fi driver for %s, not %s. %s'
+             % (out.strip() or 'no kernel it names', KERNEL_RELEASE, lineage_hint(board)))
     note('Wi-Fi driver built for kernel %s' % KERNEL_RELEASE)
 
 
@@ -286,6 +318,19 @@ def boot_name(dev, tag):
     return 'techo5-boot-%s.img' % tag if dev == 'cronos' else 'techo5-boot-%s-%s.img' % (dev, tag)
 
 
+def list_releases():
+    """Every release GitHub lists, newest first. The list comes a page at a time, and there are far
+    more releases than one page holds, so it is read until a page comes back empty."""
+    releases = []
+    page = 1
+    while True:
+        got = fetch_json('https://api.github.com/repos/%s/releases?per_page=100&page=%d' % (REPO, page))
+        if not got:
+            return releases
+        releases += got
+        page += 1
+
+
 def boot_image(rel, work, dev):
     """The release's boot image for this generation, or, when it carries none (the boot image changes
     rarely, so most releases don't), the one from the newest earlier Show release that does."""
@@ -294,10 +339,14 @@ def boot_image(rel, work, dev):
         return rel.asset(name)
     want = show_version(rel.version)
     try:
-        releases = fetch_json('https://api.github.com/repos/%s/releases?per_page=100' % REPO)
+        releases = list_releases()
     except Exception as e:
-        fail('release %s has no boot image, and the list of earlier releases could not be read: %s'
-             % (rel.version, e))
+        code = getattr(e, 'code', None)
+        hint = (' GitHub allows an anonymous computer only 60 requests an hour, so wait a while and run '
+                'this again.') if code in (403, 429) else ''
+        fail('release %s has no boot image of its own, and the GitHub list of earlier releases could not '
+             'be read (%s).%s Run this again later, or pass the boot image with --boot.'
+             % (rel.version, e, hint))
     for r in releases:
         v = show_version(r['tag_name'])
         name = boot_name(dev, r['tag_name'])
@@ -321,6 +370,225 @@ def boot_image(rel, work, dev):
          % (rel.version, dev))
 
 
+# The unlock the Show 5 2nd gen install is tested on, amonet-cronos v2.0.1, as its bootloader names
+# itself to fastboot (getvar kaeru-version). Other builds of the unlock exist: one that prints
+# "[amonet] Injecting microloader..." while flashing rewrites the front of the boot image on its way in,
+# and then refuses it with "image is not a boot image" (#168). A build tag may follow the version: the
+# genuine v2.0.1 download reports 2.0.0-g7b11500 (#257).
+TESTED_KAERU = '2.0.0'
+
+
+# How long a fastboot continue sent to nudge a stopped boot may take: the unit answers at once if it
+# is still there.
+NUDGE_WAIT = 15
+
+
+def tested_kaeru(kaeru):
+    """Whether fastboot's kaeru-version is the tested unlock's, with or without a build tag."""
+    return kaeru == TESTED_KAERU or kaeru.startswith(TESTED_KAERU + '-')
+
+
+def getvar(out, name):
+    """A variable's value from what `fastboot getvar <name>` printed, or '' when it gave none."""
+    m = re.search(r'^(?:\(bootloader\)\s*)?%s:[ \t]*(\S.*?)\s*$' % re.escape(name), out, re.M)
+    return m.group(1) if m else ''
+
+
+# How long a getvar is given. A bootloader that does not know a variable can sit on the question
+# rather than refuse it, and Fastboot.run waits for good; the answer is only a check, so a wait this
+# long is taken as no answer and the install goes on.
+GETVAR_SECONDS = 10
+
+
+def fastboot_getvar(fastboot, name, seconds=GETVAR_SECONDS):
+    """fastboot getvar <name> on the unit, or '' when it gives no value or no answer within seconds."""
+    try:
+        r = subprocess.run(fastboot.base + ['-s', fastboot.serial, 'getvar', name],
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=seconds)
+    except subprocess.TimeoutExpired:
+        note('fastboot getvar %s gave no answer in %d s; taken as not reported' % (name, seconds))
+        return ''
+    return getvar(r.stdout.decode('utf-8', 'replace'), name)
+
+
+def unlock_problem(dev, kaeru, unlocked):
+    """Why this unit's unlock is not the one the install is tested on, or '' when nothing says so. kaeru
+    and unlocked are fastboot's kaeru-version and unlock_status, '' when it did not answer: a unit on the
+    tested unlock that does not name itself is let through, since nothing here says it is another one.
+    Only the Show 5 2nd gen is checked; the other boards' unlocks have no version on record."""
+    if dev != 'cronos':
+        return ''
+    if unlocked == 'false':
+        return 'fastboot says unlock_status: false, as the amonet-cronos 1.x unlock does'
+    if kaeru and not tested_kaeru(kaeru):
+        return 'fastboot reports kaeru-version %s, and amonet-cronos v2.0.1 reports %s' % (kaeru, TESTED_KAERU)
+    return ''
+
+
+def unlock_help(serial, refused=False):
+    """What to do about an unlock other than the tested one. refused when the bootloader has already
+    turned the boot image away, rather than this script stopping before the flash."""
+    written = ('The bootloader refused the image, so the boot partition should be as it was'
+               if refused else 'Nothing has been written to the boot partition')
+    return ('   An unlock other than amonet-cronos v2.0.1 can refuse TECHO5\'s boot image ("image is not a boot\n'
+            '   image", after "[amonet] Injecting microloader..."). Flash amonet-cronos-v2.0.1.zip in the unit\'s\n'
+            '   TWRP (docs/install.md, "Unlocked before v2.0.0?"), then run this again.\n'
+            '   %s. `fastboot -s %s continue`\n'
+            '   starts the unit again.' % (written, serial))
+
+
+# Fastboot's text when the bootloader is still locked: the unlock is a separate exploit, not
+# `fastboot flashing unlock`, so a unit that says this has no unlock, or one that did not take.
+LOCKED_TEXT = ('restricted on locked hw', 'locked hw', 'device is locked')
+
+
+def locked_bootloader(out):
+    """Whether fastboot's text says the bootloader is locked."""
+    low = (out or '').lower()
+    return any(t in low for t in LOCKED_TEXT)
+
+
+def locked_help(board):
+    """What to do about a locked bootloader: the unlock is not done, or did not take."""
+    return ("   The bootloader refused the write: this %s's unlock is not done, or did not take. The unlock is\n"
+            '   a separate exploit, not `fastboot flashing unlock`; "Unlock the bootloader first" in docs/install.md\n'
+            '   (%s) has the unlock thread for it. Unlock the unit, then run this again.\n'
+            '   Nothing has been written to the boot partition.' % (board, INSTALL_DOC + '#unlock-the-bootloader-first'))
+
+
+# The Show install doc, and its section that finishes a stopped install by hand.
+INSTALL_DOC = 'https://github.com/' + REPO + '/blob/main/docs/install.md'
+BY_HAND = INSTALL_DOC + '#if-the-install-stops-at-the-slot-store'
+
+
+def store_failed(console, backup, what, o, erased, way_back, seconds=180):
+    """A step of the slot store failed. erased says what the unit has lost by now: '' nothing (the
+    system partition is as LineageOS left it), 'maybe' (the step that erases it was running) or 'yes'.
+    A unit that restarted took its console with it (console.gone, read first: a run that reaches the
+    unit again clears it); that is said as such, with the reason saved from the unit when it comes back,
+    rather than after the whole wait as "None"."""
+    extra = ''
+    if console.gone:
+        what = 'the unit restarted, or its USB went away, while %s (%s).' % (what, console.gone)
+        extra = collect_evidence(console, backup, 'slot-store-restart.txt', seconds)
+    else:
+        what = '%s failed:\n%s' % (what, '   (no answer from the unit)' if o is None else o)
+    if not erased:
+        left = 'Nothing was erased yet: LineageOS is still on the unit. %s' % way_back
+    else:
+        left = ("%s The unit is in its rescue environment (the screen says RESCUE, or shows the test\n"
+                '   screen) and is not lost: finish the install by hand on its USB console, as "If the install\n'
+                '   stops at the slot store" in docs/install.md says (%s).'
+                % ("LineageOS's system partition may already be erased." if erased == 'maybe'
+                   else "LineageOS's system partition is erased.", BY_HAND))
+    fail('%s\n   %s%s' % (what, left, '\n   ' + extra if extra else ''))
+
+
+def first_boot(console, fastboot, nudged, seconds=300, every=5):
+    """Watches the first boot from slot a. True when the unit is probably up but the console is not
+    there to say so (it started slot a, and then the console went away, as it does once TECHO5 runs);
+    False when the console saw slot a with the daemon. Fails when the unit is in rescue, or was never
+    seen, at the end of the time."""
+    seen = {'slot': False, 'rescue': False, 'last': ''}
+
+    def slot_up():
+        o = console.run('echo slot=$(cat /run/techo5/slot 2>/dev/null)- daemon=$(pidof techo5)-', 4) or ''
+        seen['last'] = o
+        if re.search(r'slot=a- daemon=\d', o):
+            return True
+        if 'slot=a-' in o:
+            seen['slot'], seen['rescue'] = True, False
+        elif 'slot=-' in o:
+            seen['rescue'] = True
+        if not nudged[0] and fastboot.present():
+            # Bounded: the unit can leave fastboot between the two, and a continue to a unit that is
+            # gone waits for it forever (#257).
+            fastboot.run('continue', timeout=NUDGE_WAIT)
+            nudged[0] = True
+        return False
+    try:
+        wait_for('slot a with the daemon running', seconds, slot_up, every=every, hint=console.waiting_hint)
+    except Fail:
+        # The unit started a slot and was never seen back in rescue: it is most likely running, with a
+        # console this computer no longer sees. A unit seen in rescue, or never seen, is a real failure.
+        # Only when the console has gone quiet: one still answering slot a without the daemon at
+        # the end is a daemon that did not start.
+        if seen['slot'] and not seen['rescue'] and 'slot=' not in seen['last']:
+            note('the unit started slot a, and its console is gone since: it is most likely running TECHO5')
+            return True
+        raise
+    return False
+
+
+# What the screen shows once the rescue environment is up. The boot images releases carry so far (v1.2.10's
+# for the Show 5 1st gen and the Show 8, v0.7.16's for the Show 5 2nd gen) draw the test screen: color
+# bars, the word TECHO5 and a ticking clock. A boot image built from later sources says RESCUE instead.
+SCREEN_HINT = ("no console from the unit has appeared on USB yet. Keep the USB cable in. Once the rescue environment\n"
+               '   is up, the screen shows color bars with TECHO5 and a ticking clock (a boot image built from newer\n'
+               '   sources shows RESCUE instead).')
+
+
+def usb_without_port(ids, root='/sys/bus/usb/devices'):
+    """Whether, on Linux, a USB device with these ids is plugged in with no serial port (ttyACM) made
+    for it: the console is there, but the cdc_acm driver did not bind to it."""
+    for d in glob.glob(os.path.join(root, '*')):
+        try:
+            with open(os.path.join(d, 'idVendor')) as f:
+                v = f.read().strip()
+            with open(os.path.join(d, 'idProduct')) as f:
+                p = f.read().strip()
+        except OSError:
+            continue
+        if (v, p) == ids and not glob.glob(os.path.join(d, '*', 'tty', 'ttyACM*')):
+            return True
+    return False
+
+
+def unit_whereabouts(adb, fastboot, ids):
+    """Where the unit is, as far as this computer can tell, while its console does not answer: adb sees
+    it in TWRP or in Android, fastboot sees it in the bootloader, or (Linux) its console is on USB with
+    no serial port. '' when none of them sees it."""
+    state = adb.state()
+    if state == 'recovery':
+        return ("adb sees the unit in TWRP (recovery): it did not start TECHO5's boot image. The install can be\n"
+                '   run again from TWRP, with --lineage-zip.')
+    if state == 'device':
+        return ("adb sees the unit running Android (LineageOS): it did not start TECHO5's boot image. Running\n"
+                '   this installer again from there flashes it again.')
+    if fastboot.present():
+        return ('the unit is in fastboot (the bootloader), not starting. `fastboot -s %s continue` starts it;\n'
+                '   this keeps waiting.' % fastboot.serial)
+    if sys.platform.startswith('linux') and usb_without_port(ids):
+        return ('the unit\'s console is on USB (%s:%s), but Linux made no serial port (ttyACM) for it: the\n'
+                '   cdc_acm driver did not bind. Run `sudo modprobe cdc_acm`; if that does not help, try another\n'
+                '   USB port or cable. This keeps waiting.' % ids)
+    return ''
+
+
+def provision_command(gift, name, psk, pub, wifi):
+    """The shell line that writes the unit's own files over the USB console. A gift install leaves an empty
+    "firstrun" in the state directory (layout.StateDir, /data/misc/techo5) instead of a name and key, and
+    no Wi-Fi, so the Show starts its own setup when it is next powered on."""
+    if gift:
+        # Nothing of the giver's stays: no name or key from an earlier install, and a configuration with no
+        # network in it, which the first boot's import of LineageOS's saved networks leaves alone.
+        prov = ("mkdir -p /data/misc/techo5 /data/techo5-linux && "
+                "rm -f /data/misc/techo5/name /data/misc/techo5/psk /data/techo5-linux/wifi.conf && "
+                ": > /data/misc/techo5/firstrun && "
+                "(umask 077; printf '%s\\n' ctrl_interface=/run/wpa update_config=0 > /data/techo5-linux/wpa_supplicant.conf)")
+    else:
+        prov = ("mkdir -p /data/misc/techo5 && printf '%%s\\n' %s > /data/misc/techo5/name && "
+                "(umask 077; printf '%%s\\n' %s > /data/misc/techo5/psk)" % (quote(name), quote(psk)))
+    if pub:
+        prov += (" && mkdir -p -m 700 /data/misc/techo5/ssh && (umask 077; printf '%%s\\n' %s > /data/misc/techo5/ssh/authorized_keys)"
+                 " && { [ -e /data/misc/techo5/state.json ] || printf '{\"security\":{\"ssh\":true}}\\n' > /data/misc/techo5/state.json; }"
+                 % quote(pub))
+    if wifi:
+        prov += (" && mkdir -p /data/techo5-linux && (umask 077; printf '%s' %s %s > /data/techo5-linux/wpa_supplicant.conf)"
+                 % (WIFI_CONF_FORMAT, wifi[0], wifi[1]))
+    return prov
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--serial', help="the unit's adb serial (adb devices); found, or asked for, when missing")
@@ -335,13 +603,21 @@ def main():
     ap.add_argument('--wifi-passphrase-file', help='a file holding the --wifi passphrase, for running from a script')
     ap.add_argument('--amazon-logo', action='store_true',
                     help="from TWRP on a Show 5 2nd gen or a Show 8: keep Amazon's logo at boot rather than put TECHO5's in")
+    ap.add_argument('--for-someone-else', action='store_true',
+                    help='a gift install: no Wi-Fi, name or key is asked for or written; the Show starts its own setup when next powered on')
     ap.add_argument('--dry-run', action='store_true', help='download and check the release; write nothing')
     ap.add_argument('--force', action='store_true', help='do not ask before erasing LineageOS')
+    ap.add_argument('--any-unlock', action='store_true',
+                    help='on a Show 5 2nd gen: flash even when the unlock is not amonet-cronos v2.0.1 (untested)')
     ap.add_argument('--backups', default=default_dir('TECHO5_BACKUPS', 'backups'))
     ap.add_argument('--work', default=default_dir('TECHO5_WORK', 'build'))
     ap.add_argument('--adb', default='adb')
     ap.add_argument('--fastboot', default='fastboot')
     a = ap.parse_args()
+
+    check_gift(a, **{'--name': a.name, '--wifi': a.wifi, '--wifi-passphrase-file': a.wifi_passphrase_file,
+                     '--key-file': a.key_file, '--ssh-key': a.ssh_key})
+    gift = a.for_someone_else
 
     # ------------------------------------------------------------------------------------ 1. checks
     step('checks')
@@ -382,11 +658,16 @@ def main():
         zdev = lineage_board(a.lineage_zip)
         if zdev != dev:
             fail('%s is a LineageOS build for %s, and this unit is a %s' % (a.lineage_zip, zdev, dev))
+        # A later build's drivers do not fit TECHO5's kernel, which check_lineage_driver only finds out
+        # once it is installed; its name says so before anything is written.
+        zdate = lineage_zip_date(a.lineage_zip)
+        if zdate and zdate != LINEAGE_DATE:
+            fail('%s is the %s build of LineageOS. %s' % (a.lineage_zip, zdate, lineage_hint(dev)))
         note('%s in TWRP; LineageOS zip for %s' % (dev, zdev))
     else:
         kr = adb.sh('uname -r')
         if kr != KERNEL_RELEASE:
-            fail('%s runs kernel %s, not %s: install the LineageOS 18.1 build the getting started guide links' % (a.serial, kr, KERNEL_RELEASE))
+            fail('%s runs kernel %s, not %s. %s' % (a.serial, kr, KERNEL_RELEASE, lineage_hint(dev)))
         note('%s, LineageOS kernel %s' % (dev, kr))
     wifi = None
     if a.wifi:
@@ -397,8 +678,12 @@ def main():
         else:
             wifi = wifi_keys(ask_wifi(a.wifi))
         note("Wi-Fi: '%s' (only its key goes to the unit)" % a.wifi)
-    a.name = ask_name(a.name, BOARDS[dev])
-    note("name in Home Assistant: '%s'" % a.name)
+    if gift:
+        note('gift install: no name, Wi-Fi network or Home Assistant key is asked for or written')
+    else:
+        a.name = ask_name(a.name, BOARDS[dev])
+        note("name in Home Assistant: '%s'" % a.name)
+    as_name = "as '%s'" % a.name if a.name else 'as a gift'
     if not a.dry_run:
         check_serial_access()
 
@@ -432,7 +717,7 @@ def main():
             os.replace(los_boot + '.partial', los_boot)
             note('LineageOS boot image: %s' % los_boot)
             saved = adb.sh('grep -c SSID /data/misc/apexdata/com.android.wifi/WifiConfigStore.xml 2>/dev/null')
-            if saved in ('', '0') and not wifi:
+            if saved in ('', '0') and not wifi and not gift:
                 fail('LineageOS has no saved Wi-Fi network: join one first (TECHO5 uses it), or give one with --wifi')
             note('a saved Wi-Fi network' if saved not in ('', '0') else 'no saved Wi-Fi network; --wifi is used')
         else:
@@ -462,13 +747,13 @@ def main():
     if twrp:
         # From TWRP the first thing written is userdata, so the one question comes before it.
         confirm(a.force, [
-            "About to install TECHO5 %s on %s (%s) as '%s', from TWRP." % (version, a.serial, BOARDS[dev], a.name),
+            "About to install TECHO5 %s on %s (%s) %s, from TWRP." % (version, a.serial, BOARDS[dev], as_name),
             "This formats userdata (Fire OS's data), installs LineageOS for its drivers without starting it,",
             "flashes TECHO5's boot image, then erases the system partition (mmcblk0p12) to make the slot store.",
         ])
         step('LineageOS, for its drivers')
         install_lineage(adb, a.lineage_zip)
-        check_lineage_driver(adb)
+        check_lineage_driver(adb, dev)
         if not os.path.exists(los_boot):
             # Through a .partial kept only when whole, as on the LineageOS path: this is the image the way
             # back flashes, and a short one kept for good would be skipped on every later run.
@@ -494,18 +779,23 @@ def main():
     remote = ('/data/media/0/Download/' if twrp else '/sdcard/Download/') + name
     if twrp:
         adb.sh('mkdir -p /data/media/0/Download')
+    note('pushing %s (%d MB) to the unit over USB; this is silent and usually takes a minute or two'
+         % (name, os.path.getsize(rootfs) >> 20))
     adb.push(rootfs, remote, ready=(lambda: ' /data ' in adb.sh('mount')) if twrp else None)
     if adb.sh('md5sum ' + remote).split(' ')[0] != md5(rootfs):
         fail('md5 mismatch after pushing ' + name)
     note('%s ok' % remote)
-    os.makedirs(os.path.dirname(key_file) or '.', exist_ok=True)
-    if os.path.exists(key_file):
+    psk = None
+    if gift:
+        pass
+    elif os.path.exists(key_file):
         with open(key_file) as f:
             psk = f.read().strip()
         if not valid_api_key(psk):
             fail('the key in %s is not 32 bytes of base64' % key_file)
         note('Home Assistant key: the existing one in %s' % key_file)
     else:
+        os.makedirs(os.path.dirname(key_file) or '.', exist_ok=True)
         psk = new_api_key()
         write_private(key_file, psk)
         note('Home Assistant key: new, in %s' % key_file)
@@ -515,15 +805,32 @@ def main():
     # a LineageOS unit, so this is the last moment a "no" leaves it as it was.
     if not twrp:
         confirm(a.force, [
-            "About to install TECHO5 %s on %s (%s) as '%s'." % (version, a.serial, BOARDS[dev], a.name),
+            "About to install TECHO5 %s on %s (%s) %s." % (version, a.serial, BOARDS[dev], as_name),
             "This flashes TECHO5's boot image, then erases LineageOS's system partition (mmcblk0p12) to",
             'make the slot store. The way back is in docs/install.md.',
         ])
     step('flash the boot image')
     adb.reboot('bootloader')
     wait_for('fastboot', 90, fastboot.present, 3)
+    if dev == 'cronos':
+        kaeru = fastboot_getvar(fastboot, 'kaeru-version')
+        unlocked = fastboot_getvar(fastboot, 'unlock_status')
+        why = unlock_problem(dev, kaeru, unlocked)
+        if why and not a.any_unlock:
+            fail("this unit's unlock is not the one TECHO5 is tested on: %s.\n%s\n"
+                 '   To flash anyway, run this again with --any-unlock.' % (why, unlock_help(a.serial)))
+        if why:
+            note('--any-unlock: flashing although %s' % why)
+        elif kaeru:
+            note('bootloader: kaeru %s, unlock_status %s' % (kaeru, unlocked or 'not reported'))
+        else:
+            note('fastboot did not report kaeru-version (amonet-cronos v2.0.1 reports %s); flashing anyway' % TESTED_KAERU)
     code, out = fastboot.run('flash', 'boot', boot)
     if code != 0:
+        if dev == 'cronos' and ('Injecting microloader' in out or 'not a boot image' in out):
+            fail('fastboot flash boot failed: %s\n%s' % (out, unlock_help(a.serial, refused=True)))
+        if locked_bootloader(out):
+            fail('fastboot flash boot failed: %s\n%s' % (out, locked_help(BOARDS[dev])))
         fail('fastboot flash boot failed: ' + out)
     fastboot.run('continue')
     note('booting the rescue environment (no slot store yet)')
@@ -534,10 +841,23 @@ def main():
             return True
         # A leftover bootloader request can stop the boot at "hacked fastboot" once; continue it.
         if not nudged[0] and fastboot.present():
-            fastboot.run('continue')
+            # Bounded: the unit can leave fastboot between the two, and a continue to a unit that is
+            # gone waits for it forever (#257).
+            fastboot.run('continue', timeout=NUDGE_WAIT)
             nudged[0] = True
         return False
-    wait_for('the rescue console on USB', 300, rescue_up, hint=console.waiting_hint)
+
+    def rescue_hint():
+        # A console that is there but cannot be opened says so first. Otherwise where else the unit is:
+        # a unit that went to TWRP or LineageOS, or sits in fastboot, looks the same as a slow console
+        # from the console's side alone.
+        if console.blocked:
+            return console.waiting_hint()
+        where = unit_whereabouts(adb, fastboot, CONSOLE_TECHO5)
+        if where or list_consoles(CONSOLE_TECHO5):
+            return where
+        return SCREEN_HINT
+    wait_for('the rescue console on USB', 300, rescue_up, hint=rescue_hint)
     note('rescue console on %s' % console.port)
 
     # ------------------------------------------------------------------------------------ 6. store
@@ -557,64 +877,77 @@ def main():
              % (console.run('STORE=/store slotctl status', 30) or '   (slotctl status did not answer)',
                 los_boot))
     tar = '/data/media/0/Download/' + name
+    # Until mkstore runs, a step that stops leaves LineageOS's system partition as it was. From there
+    # on it is erased, and the unit sits in its rescue environment to be finished by hand. A unit that
+    # restarts mid-step takes its console with it; store_failed says so and saves why.
+    way_back = ('The way back is in docs/install.md ("To go back to LineageOS")%s, or run this again.'
+                % (': fastboot flash boot %s' % los_boot if os.path.exists(los_boot) else ''))
+
+    def store_step(what, o, erased):
+        store_failed(console, backup, what, o, erased, way_back)
+
     # The vendor tree is this unit's own, from LineageOS: releases don't carry it. Kept on userdata
     # before the system partition is erased, then in the store.
+    note("saving this unit's vendor tree (Wi-Fi and Bluetooth drivers, firmware); about a minute")
     o = console.run('mkdir -p /data/techo5-linux && tar -cf /data/techo5-linux/vendor.tar -C /android/system vendor && '
                     'tar -tf /data/techo5-linux/vendor.tar %s >/dev/null && echo VENDOR-SAVED' % WIFI_MODULE, 180)
     if 'VENDOR-SAVED' not in (o or ''):
-        fail("saving LineageOS's vendor tree failed (nothing was erased):\n%s" % o)
+        store_step("saving LineageOS's vendor tree", o, '')
+    note("making the slot store: this erases LineageOS's system partition; it takes a few minutes at most")
     o = console.run('umount /android 2>/dev/null; slotctl mkstore /dev/mmcblk0p12 --i-know-this-erases-it >/tmp/mkstore.log 2>&1 '
                     '&& echo MKSTORE-OK; tail -3 /tmp/mkstore.log', 300)
     if 'MKSTORE-OK' not in (o or ''):
-        fail('mkstore failed:\n%s' % o)
+        store_step('making the slot store', o, 'maybe')
     o = console.run('tar -xf /data/techo5-linux/vendor.tar -C /store && [ -e /store/%s ] && echo VENDOR-OK' % WIFI_MODULE, 180)
     if 'VENDOR-OK' not in (o or ''):
-        fail('putting the vendor tree into the store failed (it is kept in /data/techo5-linux/vendor.tar):\n%s' % o)
+        store_step('putting the vendor tree into the store (it is kept in /data/techo5-linux/vendor.tar)', o, 'yes')
+    note('unpacking the release into slot a; this is silent and takes a few minutes')
     o = console.run('STORE=/store slotctl install %s >/tmp/install.log 2>&1 && echo INSTALL-OK; tail -2 /tmp/install.log; '
                     '[ -e /store/slots/a/%s ] || { mkdir -p /store/slots/a/vendor && cp -a /store/vendor/. /store/slots/a/vendor/; }; '
                     '[ -e /store/slots/a/%s ] && rm -f /data/techo5-linux/vendor.tar && echo SLOT-VENDOR-OK; STORE=/store slotctl status'
                     % (tar, WIFI_MODULE, WIFI_MODULE), 900)
     if 'INSTALL-OK' not in (o or ''):
-        fail('slot install failed:\n%s' % o)
+        store_step('installing the release into slot a', o, 'yes')
     if 'SLOT-VENDOR-OK' not in o:
-        fail('the vendor tree did not reach slot a:\n%s' % o)
+        store_step('copying the vendor tree into slot a', o, 'yes')
     for line in o.split('\n'):
         if line.startswith('slot a'):
             note(line)
-    prov = ("mkdir -p /data/misc/techo5 && printf '%%s\\n' %s > /data/misc/techo5/name && "
-            "(umask 077; printf '%%s\\n' %s > /data/misc/techo5/psk)" % (quote(a.name), quote(psk)))
-    if pub:
-        prov += (" && mkdir -p -m 700 /data/misc/techo5/ssh && (umask 077; printf '%%s\\n' %s > /data/misc/techo5/ssh/authorized_keys)"
-                 " && { [ -e /data/misc/techo5/state.json ] || printf '{\"security\":{\"ssh\":true}}\\n' > /data/misc/techo5/state.json; }"
-                 % quote(pub))
-    if wifi:
-        prov += (" && mkdir -p /data/techo5-linux && (umask 077; printf '%s' %s %s > /data/techo5-linux/wpa_supplicant.conf)"
-                 % (WIFI_CONF_FORMAT, wifi[0], wifi[1]))
+    prov = provision_command(gift, a.name, psk, pub, wifi)
     o = console.run(prov + ' && sync && echo PROV-OK', 15)
     if 'PROV-OK' not in (o or ''):
-        fail('provisioning failed:\n%s' % o)
-    note("name '%s' and Home Assistant key%s%s written" % (a.name, ', SSH key' if pub else '', ', Wi-Fi' if wifi else ''))
+        store_step("writing the unit's name and Home Assistant key", o, 'yes')
+    if gift:
+        note('first-run marker%s written; the name, key and any saved network are cleared' % (' and SSH key' if pub else ''))
+    else:
+        note("name '%s' and Home Assistant key%s%s written" % (a.name, ', SSH key' if pub else '', ', Wi-Fi' if wifi else ''))
     console.run('sync; (sleep 2; /bin/busybox.static reboot -f) >/dev/null 2>&1 &', 3)
 
     # ------------------------------------------------------------------------------------ 7. watch
     step('first boot')
     nudged[0] = False
 
-    def slot_up():
-        if re.search(r'slot=a- daemon=\d', console.run('echo slot=$(cat /run/techo5/slot 2>/dev/null)- daemon=$(pidof techo5)-', 4) or ''):
-            return True
-        if not nudged[0] and fastboot.present():
-            fastboot.run('continue')
-            nudged[0] = True
-        return False
-    wait_for('slot a with the daemon running', 300, slot_up, hint=console.waiting_hint)
+    probably_up = first_boot(console, fastboot, nudged)
     o = console.run('ip -4 addr show wlan0 | sed -n "s/.*inet \\([0-9.]*\\).*/\\1/p"; cat /etc/techo5-release', 8) or ''
     for line in o.split('\n'):
         note(line)
 
-    print("\nDone. '%s' runs TECHO5 %s from slot a; the slot commits itself after five healthy minutes." % (a.name, version))
-    print('Home Assistant finds it as an ESPHome device. When it asks for the encryption key, paste:\n\n    %s\n\n(kept in %s)' % (psk, key_file))
-    if twrp and not wifi:
+    if probably_up:
+        print("\nProbably done. The unit started slot a, and then its console went away, as it does once TECHO5 is up.")
+        if not gift:
+            print("Check Home Assistant (it should list '%s' as a discovered ESPHome device) or the unit's setup page" % a.name)
+        print('before looking for a fault. If its screen says RESCUE instead, see "If the install stops at the slot')
+        print('store" in docs/install.md: ' + BY_HAND)
+    elif gift:
+        print("\nDone. TECHO5 %s runs from slot a; the slot commits itself after five healthy minutes." % version)
+    else:
+        print("\nDone. '%s' runs TECHO5 %s from slot a; the slot commits itself after five healthy minutes." % (a.name, version))
+    if gift:
+        print("\nThe Show's screen is now showing its own setup. It can be unplugged and given away as it is.")
+        print("Its owner's Home Assistant can add it with nothing typed.")
+    else:
+        print('Home Assistant finds it as an ESPHome device. When it asks for the encryption key, paste:\n\n    %s\n\n(kept in %s)' % (psk, key_file))
+    if twrp and not wifi and not gift:
         print('It has no Wi-Fi yet: on the Show, swipe down for Settings, then Connections, then Wi-Fi.')
     print("Later versions arrive through Home Assistant's update card.")
 

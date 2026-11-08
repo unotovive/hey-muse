@@ -6,6 +6,8 @@ import (
 	"context"
 	"crypto/tls"
 	"log/slog"
+	"math"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -20,10 +22,12 @@ import (
 	"github.com/HuskerMinion/techo5/echod/internal/config"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/bluetooth"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/wakeword"
+	"github.com/HuskerMinion/techo5/echod/internal/hardware/cpuboost"
 	"github.com/HuskerMinion/techo5/echod/internal/hardware/metrics"
 	"github.com/HuskerMinion/techo5/echod/internal/hardware/mic"
 	"github.com/HuskerMinion/techo5/echod/internal/hardware/speaker"
 	"github.com/HuskerMinion/techo5/echod/internal/layout"
+	"github.com/HuskerMinion/techo5/echod/internal/lib/bootreason"
 	"github.com/HuskerMinion/techo5/echod/internal/lib/wake"
 	"github.com/HuskerMinion/techo5/echod/internal/update"
 )
@@ -36,10 +40,9 @@ func init() {
 	component.Register(component.Network, Get(), component.Order(90))
 }
 
-// The thermal zones worth showing, by the name the kernel gives them. The rest are board sensors that
-// answer no question anybody asks.
+// The radio's thermal zone, by the name the kernel gives it; the CPU's goes by several names and
+// metrics.CPUTemperature picks it out. The rest are board sensors that answer no question anybody asks.
 const (
-	cpuZone   = "mtktscpu"
 	radioZone = "mtktswmt"
 )
 
@@ -62,11 +65,20 @@ type Diag struct {
 	cores       *esphome.Sensor
 	coresOnline *esphome.Sensor
 	load        *esphome.Sensor
-	memory      *esphome.Sensor
-	lux         *esphome.Sensor
-	lensCover   *esphome.BinarySensor
-	roomLevel   *esphome.Sensor
-	roomFloor   *esphome.Sensor
+	// bootReason is why the device last started (lib/bootreason), there only on an image whose boot
+	// works it out.
+	bootReason *esphome.TextSensor
+	// cpu is CPU usage: the share of the online cores' time spent busy since the last reading, which
+	// cpuBusy and cpuTotal hold. The load average counts threads asleep in the vendor drivers and
+	// reads 3 to 8 on an idle speaker; this is what says how hard the processor is working.
+	cpu               *esphome.Sensor
+	cpuBusy, cpuTotal uint64
+	memory            *esphome.Sensor
+	booted            *esphome.TextSensor
+	lux               *esphome.Sensor
+	lensCover         *esphome.BinarySensor
+	roomLevel         *esphome.Sensor
+	roomFloor         *esphome.Sensor
 
 	luxPath string
 
@@ -82,6 +94,11 @@ type Diag struct {
 
 	interval *esphome.Number
 	minCores *esphome.Number
+
+	// touchBoost is the Touch boost switch (hardware/cpuboost), where this device has one.
+	touchBoost *esphome.Switch
+	// fastCores is Touch boost: fast cores, which matters only while the boost itself is on.
+	fastCores *esphome.Switch
 
 	// wake restarts the collector's wait when the interval changes, so a shorter one takes effect now
 	// rather than after the wait already running. Buffered: a change while nothing is waiting is not
@@ -122,14 +139,40 @@ func (d *Diag) Name() string { return "diagnostics" }
 func (d *Diag) Entities() []esphome.Entity {
 	out := []esphome.Entity{
 		d.cached, d.free, d.purge, d.restart,
-		d.temperature, d.radioTemp, d.cores, d.coresOnline, d.load, d.memory, d.lux,
+		d.temperature, d.cores, d.coresOnline, d.load, d.memory, d.booted,
 		d.roomLevel, d.roomFloor,
-		d.tls, d.ip, d.color, d.signal, d.rxRate, d.txRate, d.ads,
-		d.testPlayback, d.interval, d.minCores,
+		d.tls, d.ip, d.color, d.signal, d.rxRate, d.txRate,
+		d.testPlayback, d.interval,
+	}
+	// Only where the board has them to read (board_*.go).
+	if radioHere() {
+		out = append(out, d.radioTemp)
+	}
+	if luxHere() {
+		out = append(out, d.lux)
+	}
+	if _, ok := bootreason.Last(); ok {
+		out = append(out, d.bootReason)
+	}
+	// An app on a tablet may not read /proc/stat; a sensor that could never have a value is left out.
+	if _, _, ok := (metrics.Reader{}).CPUTime(); ok {
+		out = append(out, d.cpu)
+	}
+	// Holding cores online is the hotplug governor's, which an app on a tablet may not touch (coresHere).
+	if coresHere {
+		out = append(out, d.minCores)
+	}
+	// What the BLE radio hears, where the daemon has the radio (bluetooth.Here).
+	if bluetooth.Here {
+		out = append(out, d.ads)
+	}
+	if d.touchBoost != nil {
+		out = append(out, d.touchBoost, d.fastCores)
 	}
 	// adbd is Android's. On the Linux image there is none to reach, and the saved setting is read by
-	// the Android daemon the unit falls back to, where it would open root adb to the network.
-	if layout.OnAndroid() {
+	// the Android daemon the unit falls back to, where it would open root adb to the network. A panel
+	// has no firewall of its own to open it in (adbHere).
+	if layout.OnAndroid() && adbHere {
 		out = append(out, d.adb)
 	}
 	if d.lensCover != nil {
@@ -170,6 +213,40 @@ func (d *Diag) collector() {
 		},
 		Min: 1, Max: float64(setup.Present()), Step: 1,
 		Mode: esphome.NumberBox,
+	}
+
+	// The clocks and cores held up while the screen is touched are the 2nd gen Show 8's own (cpuboost).
+	if layout.AthenaMainline() {
+		d.touchBoost = &esphome.Switch{
+			Base: esphome.Base{
+				ObjectID: "touch_boost",
+				Name:     "Touch boost",
+				Icon:     "mdi:gesture-swipe",
+				Category: esphome.CategoryConfig,
+			},
+		}
+		d.touchBoost.OnCommand = func(on bool) {
+			cpuboost.SetEnabled(on)
+			d.touchBoost.Set(on)
+			if err := config.Set().Diag().TouchBoostOff(!on); err != nil {
+				slog.Error("saving a setting failed", "setting", d.touchBoost.ObjectID, "err", err)
+			}
+		}
+		d.fastCores = &esphome.Switch{
+			Base: esphome.Base{
+				ObjectID: "touch_boost_fast_cores",
+				Name:     "Touch boost: fast cores (experimental)",
+				Icon:     "mdi:speedometer",
+				Category: esphome.CategoryConfig,
+			},
+		}
+		d.fastCores.OnCommand = func(on bool) {
+			cpuboost.SetFastCores(on)
+			d.fastCores.Set(on)
+			if err := config.Set().Diag().TouchBoostSlowCores(!on); err != nil {
+				slog.Error("saving a setting failed", "setting", d.fastCores.ObjectID, "err", err)
+			}
+		}
 	}
 
 	d.minCores.OnCommand = func(v float32) {
@@ -356,11 +433,22 @@ func (d *Diag) reachable(on bool) error {
 }
 
 func (d *Diag) address() {
-	var ips []string
-	for _, ip := range metrics.Addresses() {
-		ips = append(ips, ip.String())
+	d.ip.Set(addressList(metrics.Addresses()))
+}
+
+// addressList is the addresses for the IP address sensor, the IPv4 ones first: Home Assistant keeps
+// only a state's first 255 characters, and two or three IPv6 addresses filled them before a VPN's
+// address got in.
+func addressList(addrs []net.IP) string {
+	var v4, v6 []string
+	for _, ip := range addrs {
+		if ip.To4() != nil {
+			v4 = append(v4, ip.String())
+		} else {
+			v6 = append(v6, ip.String())
+		}
 	}
-	d.ip.Set(strings.Join(ips, ", "))
+	return strings.Join(append(v4, v6...), ", ")
 }
 
 // identity is what the device is rather than what it is doing. The shell color comes off the factory
@@ -533,6 +621,14 @@ func (d *Diag) hardware() {
 		StateClass: esphome.StateClassMeasurement,
 		Decimals:   2,
 	}
+	d.cpu = &esphome.Sensor{
+		Base: esphome.Base{
+			ObjectID: "cpu_usage", Name: "CPU usage", Icon: "mdi:cpu-64-bit",
+			Category: esphome.CategoryDiagnostic,
+		},
+		Unit:       "%",
+		StateClass: esphome.StateClassMeasurement,
+	}
 	d.memory = &esphome.Sensor{
 		Base: esphome.Base{
 			ObjectID: "memory_available", Name: "Memory available", Icon: "mdi:memory",
@@ -541,6 +637,28 @@ func (d *Diag) hardware() {
 		Unit:        "kB",
 		DeviceClass: "data_size",
 		StateClass:  esphome.StateClassMeasurement,
+	}
+
+	// When the device started, as a time rather than a count of seconds: Home Assistant shows a
+	// timestamp as "3 hours ago" and keeps that current itself, where an uptime in seconds would be a
+	// new state on every sample and fill the recorder with them. A text sensor because a sensor's
+	// state is a float32, which holds a date only to the nearest two minutes.
+	d.bootReason = &esphome.TextSensor{
+		Base: esphome.Base{
+			ObjectID: "last_boot_reason", Name: "Last boot reason", Icon: "mdi:restart-alert",
+			Category: esphome.CategoryDiagnostic,
+		},
+	}
+	if r, ok := bootreason.Last(); ok {
+		d.bootReason.Set(r)
+		slog.Info("last boot", "reason", r)
+	}
+	d.booted = &esphome.TextSensor{
+		Base: esphome.Base{
+			ObjectID: "last_boot", Name: "Last boot", Icon: "mdi:restart",
+			Category: esphome.CategoryDiagnostic,
+		},
+		DeviceClass: "timestamp",
 	}
 
 	// Where the room's brightness is read from. A file under iio or an als_lux is preferred when the
@@ -626,14 +744,14 @@ func (d *Diag) Restore(c config.Config) {
 
 	// The chain is empty after a reboot but not after an echod restart, so the rule is put back or
 	// taken away rather than either being assumed.
-	if !layout.OnAndroid() {
+	if !layout.OnAndroid() || !adbHere {
 		// Off the Linux image the switch is not offered; one saved on before is cleared, so the Fire OS
-		// fallback does not open adb to the network from this file.
+		// fallback does not open adb to the network from this file. Nor on a panel.
 		if c.Diag.RemoteADB {
 			if err := config.Set().Diag().RemoteADB(false); err != nil {
 				slog.Error("clearing remote adb failed", "err", err)
 			} else {
-				slog.Warn("remote adb was saved on; cleared, since this is not Android")
+				slog.Warn("remote adb was saved on; cleared, since this device does not offer it")
 			}
 		}
 	} else if err := d.reachable(c.Diag.RemoteADB); err == nil {
@@ -644,6 +762,18 @@ func (d *Diag) Restore(c config.Config) {
 	d.tls.Set(c.Diag.InsecureTLS)
 	slog.Info("restored", "what", d.tls.ObjectID, "using", c.Diag.InsecureTLS)
 
+	if d.touchBoost != nil {
+		cpuboost.SetEnabled(!c.Diag.TouchBoostOff)
+		d.touchBoost.Set(!c.Diag.TouchBoostOff)
+		slog.Info("restored", "what", d.touchBoost.ObjectID, "using", !c.Diag.TouchBoostOff)
+		cpuboost.SetFastCores(!c.Diag.TouchBoostSlowCores)
+		d.fastCores.Set(!c.Diag.TouchBoostSlowCores)
+		slog.Info("restored", "what", d.fastCores.ObjectID, "using", !c.Diag.TouchBoostSlowCores)
+	}
+
+	if !coresHere {
+		return
+	}
 	if err := setup.MinCores(c.Diag.MinCores); err != nil {
 		slog.Error("holding cores online failed", "cores", c.Diag.MinCores, "err", err)
 	} else {
@@ -704,7 +834,7 @@ func (d *Diag) board() {
 	r := metrics.Reader{}
 
 	temps := r.Temperatures()
-	set(d.temperature, reading(temps, cpuZone))
+	set(d.temperature, metrics.CPUTemperature(temps))
 	set(d.radioTemp, reading(temps, radioZone))
 
 	present, online := r.Cores()
@@ -713,11 +843,52 @@ func (d *Diag) board() {
 
 	one, _ := r.Load()
 	set(d.load, one)
+	d.cpuUsage(r)
 
 	available, _ := r.Memory()
 	set(d.memory, available)
 
+	d.boot(r)
+
 	set(d.lux, roomLux(r, d.luxPath))
+}
+
+// cpuUsage publishes how busy the cores were since the last reading. The first reading only sets the
+// mark.
+func (d *Diag) cpuUsage(r metrics.Reader) {
+	busy, total, ok := r.CPUTime()
+	if !ok {
+		return
+	}
+	if d.cpuTotal > 0 && total > d.cpuTotal && busy >= d.cpuBusy {
+		d.cpu.Set(float32(math.Round(100 * float64(busy-d.cpuBusy) / float64(total-d.cpuTotal))))
+	}
+	d.cpuBusy, d.cpuTotal = busy, total
+}
+
+// boot publishes when the device started. Not before the clock is set: until NTP has run the kernel
+// works the boot time out from an RTC that can be years out, and Home Assistant would show that. The
+// kernel's figure moves by a second now and then as the clock is disciplined, which is not worth a
+// new state, so it is published when it has moved by more than a minute.
+func (d *Diag) boot(r metrics.Reader) {
+	at, ok := r.BootTime()
+	if !ok || !clockSet(time.Now()) {
+		return
+	}
+	if was, err := time.Parse(time.RFC3339, d.booted.Get()); err == nil && absDuration(at.Sub(was)) <= time.Minute {
+		return
+	}
+	d.booted.Set(at.UTC().Format(time.RFC3339))
+}
+
+// clockSet reports whether the wall clock can be believed; alarm keeps the same test.
+func clockSet(now time.Time) bool { return now.Year() >= 2025 }
+
+func absDuration(d time.Duration) time.Duration {
+	if d < 0 {
+		return -d
+	}
+	return d
 }
 
 // reading picks one thermal zone out of what was found.
@@ -732,7 +903,8 @@ func set(s *esphome.Sensor, r metrics.Reading) {
 	}
 }
 
-// inUse is what the slots are set to, which is what a purge has to leave alone.
+// inUse is what the slots are set to, the hang-up word and the command words, which is what a purge has
+// to leave alone.
 func inUse() []string {
 	saved := config.Get().Wake
 
@@ -740,6 +912,14 @@ func inUse() []string {
 	for slot := range wakeword.Slots {
 		if id := saved.Slot(slot).ID; id != "" {
 			ids = append(ids, id)
+		}
+	}
+	if id := saved.Hangup.ModelID(); id != "" {
+		ids = append(ids, id)
+	}
+	for _, w := range saved.CommandWords() {
+		if w.ID != "" {
+			ids = append(ids, w.ID)
 		}
 	}
 	return ids

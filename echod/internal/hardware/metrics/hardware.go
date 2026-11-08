@@ -6,9 +6,16 @@
 package metrics
 
 import (
+	"cmp"
+	"math"
 	"os"
+	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
+	"time"
+
+	"github.com/HuskerMinion/techo5/echod/internal/layout"
 )
 
 // Paths are relative to a root so a test can point them at a directory of fixtures rather than at the
@@ -28,14 +35,22 @@ func known(v float64) Reading { return Reading{Value: v, Known: true} }
 // Temperatures are the thermal zones by the name the kernel gives them, in degrees. On a biscuit that
 // is mtktscpu for the CPU and mtktswmt for the wifi and Bluetooth combo chip, plus board sensors.
 //
+// Every zone is looked at, not a fixed count: the 2nd gen Show 5 has sixteen and puts the CPU at
+// twelve, and nothing says another board stops there. A zone that names itself and reports no
+// temperature, as the virtual ones on the Show 5 do, is left out. Zones are taken in the kernel's
+// order, thermal_zone2 before thermal_zone12, and where two share a name the first is the one kept.
+//
 // The kernel reports millidegrees.
 func (r Reader) Temperatures() map[string]float64 {
 	out := map[string]float64{}
-	for i := range 16 {
-		zone := r.path("sys/class/thermal/thermal_zone" + strconv.Itoa(i))
-
+	zones, _ := filepath.Glob(r.path("sys/class/thermal/thermal_zone*"))
+	slices.SortFunc(zones, func(a, b string) int { return cmp.Compare(zoneNumber(a), zoneNumber(b)) })
+	for _, zone := range zones {
 		name, err := text(zone + "/type")
 		if err != nil {
+			continue
+		}
+		if _, seen := out[name]; seen {
 			continue
 		}
 		milli, err := number(zone + "/temp")
@@ -44,7 +59,119 @@ func (r Reader) Temperatures() map[string]float64 {
 		}
 		out[name] = milli / 1000
 	}
+	if _, exists := out["mtktscpu"]; !exists {
+		if temp, ok := out["cpu-thermal"]; ok {
+			out["mtktscpu"] = temp
+		}
+	}
+	if _, exists := out["mtktswmt"]; !exists {
+		if raw, err := text(r.path("proc/net/wlan/get_temperature")); err == nil {
+			if key, value, ok := strings.Cut(raw, "="); ok && strings.TrimSpace(key) == "Temperature" {
+				if temp, err := strconv.ParseFloat(strings.TrimSpace(value), 64); err == nil && temp >= -40 && temp <= 150 {
+					out["mtktswmt"] = temp
+				}
+			}
+		}
+	}
+	if _, exists := out["mtktswmt"]; !exists {
+		if temp, ok := r.mt76Temperature(); ok {
+			out["mtktswmt"] = temp
+		}
+	}
 	return out
+}
+
+// mt76Temperature is the radio's temperature on a mainline kernel's mt76 driver: the 2nd gen Show 8's
+// MT7663 reports it through a hwmon device named mt7615_phy0, where the kernel's driver offers it, in
+// millidegrees. Zero is the firmware not answering, not a reading: a
+// radio that is on is never that cold.
+func (r Reader) mt76Temperature() (float64, bool) {
+	devices, _ := filepath.Glob(r.path("sys/class/hwmon/hwmon*"))
+	for _, dev := range devices {
+		name, err := text(dev + "/name")
+		if err != nil || !strings.HasPrefix(name, "mt7615_phy") {
+			continue
+		}
+		milli, err := number(dev + "/temp1_input")
+		if temp := milli / 1000; err == nil && temp > 0 && temp <= 150 {
+			return temp, true
+		}
+	}
+	return 0, false
+}
+
+// zoneNumber is the n of a thermal_zoneN path, or one past any zone for a name that has none.
+func zoneNumber(path string) int {
+	n, err := strconv.Atoi(strings.TrimPrefix(filepath.Base(path), "thermal_zone"))
+	if err != nil {
+		return math.MaxInt
+	}
+	return n
+}
+
+// cpuZones are the names the CPU's zone goes by, best first. Amazon's MediaTek kernels call it
+// mtktscpu, as the Dot's 3.18 and the Show 5's 4.9 do; a mainline kernel names it after its device
+// tree node, cpu-thermal on the MT8183, and some older trees spell that with an underscore.
+var cpuZones = []string{"mtktscpu", "cpu-thermal", "cpu_thermal", "soc-thermal", "soc_thermal"}
+
+// CPUTemperature picks the CPU out of what Temperatures found. Unknown on a kernel with no thermal
+// driver at all. The mainline Show 8's kernel has its driver built in, and the zone is cpu-thermal.
+func CPUTemperature(temps map[string]float64) Reading {
+	for _, zone := range cpuZones {
+		if v, ok := temps[zone]; ok {
+			return known(v)
+		}
+	}
+	return Reading{}
+}
+
+// BootTime is when the machine started, from the kernel's btime in /proc/stat. The kernel works it
+// out from the wall clock on every read, so it moves when the clock is set and is right once NTP
+// has run.
+func (r Reader) BootTime() (time.Time, bool) {
+	body, err := os.ReadFile(r.path("proc/stat"))
+	if err != nil {
+		return time.Time{}, false
+	}
+	for line := range strings.SplitSeq(string(body), "\n") {
+		value, ok := strings.CutPrefix(line, "btime ")
+		if !ok {
+			continue
+		}
+		secs, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+		if err != nil || secs <= 0 {
+			return time.Time{}, false
+		}
+		return time.Unix(secs, 0), true
+	}
+	return time.Time{}, false
+}
+
+// CPUTime is the time the online cores have spent busy, and in all, since boot, in clock ticks, from
+// /proc/stat's first line: two readings apart say how busy they were between them. Idle and waiting
+// for I/O are not busy, so threads asleep in a driver, which push the load average up, are not.
+func (r Reader) CPUTime() (busy, total uint64, ok bool) {
+	body, err := os.ReadFile(r.path("proc/stat"))
+	if err != nil {
+		return 0, 0, false
+	}
+	line, _, _ := strings.Cut(string(body), "\n")
+	fields := strings.Fields(line)
+	if len(fields) < 5 || fields[0] != "cpu" {
+		return 0, 0, false
+	}
+	var idle uint64
+	for i, f := range fields[1:] {
+		v, err := strconv.ParseUint(f, 10, 64)
+		if err != nil {
+			return 0, 0, false
+		}
+		total += v
+		if i == 3 || i == 4 { // idle, iowait
+			idle += v
+		}
+	}
+	return total - idle, total, true
 }
 
 // Cores is how many the kernel could use and how many are online. They differ: this kernel hotplugs
@@ -100,7 +227,7 @@ func (r Reader) Wifi() (signal, rx, tx Reading) {
 	if body, err := os.ReadFile(r.path("proc/net/wireless")); err == nil {
 		for line := range strings.SplitSeq(string(body), "\n") {
 			name, rest, ok := strings.Cut(line, ":")
-			if !ok || strings.TrimSpace(name) != wifiInterface {
+			if !ok || strings.TrimSpace(name) != r.wifiInterface() {
 				continue
 			}
 			if fields := strings.Fields(rest); len(fields) >= 3 {
@@ -121,7 +248,7 @@ func (r Reader) Wifi() (signal, rx, tx Reading) {
 
 	for line := range strings.SplitSeq(string(body), "\n") {
 		name, rest, ok := strings.Cut(line, ":")
-		if !ok || strings.TrimSpace(name) != wifiInterface {
+		if !ok || strings.TrimSpace(name) != r.wifiInterface() {
 			continue
 		}
 		if fields := strings.Fields(rest); len(fields) >= 9 {
@@ -131,8 +258,14 @@ func (r Reader) Wifi() (signal, rx, tx Reading) {
 	return signal, rx, tx
 }
 
-// wifiInterface is the only one on this board.
-const wifiInterface = "wlan0"
+// wifiInterface is the only one on this board: wlan0 on every Echo, mlan0 on the Surface RT
+// (layout.WifiInterface). A Reader with a Root of fixtures reads wlan0's.
+func (r Reader) wifiInterface() string {
+	if r.Root != "" {
+		return "wlan0"
+	}
+	return layout.WifiInterface()
+}
 
 // count reads a cpu list like "0-3" or "0-1,3" and reports how many it names.
 func (r Reader) count(path string) Reading {

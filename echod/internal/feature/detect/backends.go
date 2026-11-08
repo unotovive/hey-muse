@@ -8,6 +8,7 @@ import (
 	"github.com/zserge/microwakeword"
 	"github.com/zserge/microwakeword/audiofrontend"
 
+	"github.com/HuskerMinion/techo5/echod/internal/lib/mwwfront"
 	"github.com/HuskerMinion/techo5/echod/internal/lib/oww"
 	"github.com/HuskerMinion/techo5/echod/internal/lib/wake"
 )
@@ -31,6 +32,10 @@ type backend interface {
 	// the scores it returns then are meaningless.
 	feed(frame []int16) (map[string]float64, bool)
 
+	// failed is the wake words that fell over in feed and were unloaded because of it since the last
+	// call, so the engine can take them out of their slots.
+	failed() []string
+
 	close()
 }
 
@@ -43,59 +48,103 @@ func newBackend(k wake.Kind) (backend, error) {
 		}
 		return &owwBackend{front: front, scores: map[string]float64{}}, nil
 	}
-	return newMicroBackend(), nil
+	return newMicroBackend(ExactFrontEnd), nil
 }
+
+// exactFor is whether a model runs on the exact front end. A model sent from the setup page always
+// does: it was trained on the reference's features, which the approximate front end only roughly
+// makes, and a model of one's own has no tuned sensitivity on the approximate one to keep. Some score
+// next to nothing on it while the exact one wakes them at full score (#352). The image's and Home
+// Assistant's words follow ExactFrontEnd, so their sensitivity settings keep meaning what they did.
+func exactFor(m wake.Model, exact bool) bool { return exact || m.Uploaded }
+
+// frontKey is one feature front end: its step in ms, and whether it is the exact one.
+type frontKey struct {
+	step  int
+	exact bool
+}
+
+// ExactFrontEnd picks microWakeWord's feature front end. False, the default, is
+// github.com/zserge/microwakeword's: a float approximation of TensorFlow Lite Micro's front end, which
+// is what has always run. True is mwwfront, the reference's own integer arithmetic, bit for bit the
+// features the models were trained on. They score differently enough that the sensitivity settings
+// mean different things on each, so it is a switch for now: TECHO5_WAKE_FRONTEND=exact in the daemon's
+// environment, read when it starts. A backend keeps the one it was made with.
+var ExactFrontEnd = os.Getenv("TECHO5_WAKE_FRONTEND") == "exact"
 
 // microBackend is microWakeWord. Each wake word is its own streaming model, but they all read the same
 // features of the same audio, so the feature front end runs once per step size and every model is fed
 // what it made: another wake word, or the stop word, costs its inference and not a second front end.
+// A model of one's own on the exact front end next to the image's on the approximate one is the
+// exception: those are two front ends (exactFor).
 type microBackend struct {
-	dets   map[string]*microwakeword.Detector
-	step   map[string]int // each model's feature step, in ms
-	fronts map[int]*microFront
+	dets   map[string]microDetector
+	step   map[string]frontKey // each model's front end
+	fronts map[frontKey]*microFront
 	scores map[string]float64
+	gone   []string // dropped by feed, for failed
+	exact  bool     // mwwfront rather than zserge's audiofrontend for every model; see ExactFrontEnd
+}
+
+// microDetector is what the backend asks of a loaded model: microwakeword.Detector, or a stand-in in
+// a test.
+type microDetector interface {
+	ProcessFeatures(frames [][]int8) bool
+	SlidingAverage() float64
+}
+
+// featureFront is a microWakeWord feature front end: one window of audio in, a frame of 40 features
+// out. Both kinds keep state between windows (noise estimates), so each is fed every window in order.
+type featureFront interface {
+	ProcessFrame(window []int16) []uint16
 }
 
 // microFront is one feature front end and the audio it has not read yet.
 type microFront struct {
-	fe           *audiofrontend.Frontend
+	fe           featureFront
 	buf          []int16
 	window, step int // in samples
 }
 
-func newMicroBackend() *microBackend {
+func newMicroBackend(exact bool) *microBackend {
 	return &microBackend{
-		dets:   map[string]*microwakeword.Detector{},
-		step:   map[string]int{},
-		fronts: map[int]*microFront{},
+		dets:   map[string]microDetector{},
+		step:   map[string]frontKey{},
+		fronts: map[frontKey]*microFront{},
 		scores: map[string]float64{},
+		exact:  exact,
 	}
 }
 
 // front is the front end for a feature step, made the first time a model wants it. A step of zero is
 // the library's default, 20 ms.
-func (b *microBackend) front(stepMs int) *microFront {
-	if f, ok := b.fronts[stepMs]; ok {
+func (b *microBackend) front(k frontKey) *microFront {
+	if f, ok := b.fronts[k]; ok {
 		return f
 	}
-	cfg := audiofrontend.DefaultConfig(stepMs)
-	f := &microFront{
-		fe:     audiofrontend.New(cfg),
-		window: cfg.SampleRate * cfg.WindowSizeMs / 1000,
-		step:   cfg.SampleRate * cfg.StepSizeMs / 1000,
+	stepMs := k.step
+	var f *microFront
+	if k.exact {
+		fe := mwwfront.New(stepMs)
+		f = &microFront{fe: fe, window: fe.WindowSamples(), step: fe.StepSamples()}
+	} else {
+		cfg := audiofrontend.DefaultConfig(stepMs)
+		f = &microFront{
+			fe:     audiofrontend.New(cfg),
+			window: cfg.SampleRate * cfg.WindowSizeMs / 1000,
+			step:   cfg.SampleRate * cfg.StepSizeMs / 1000,
+		}
 	}
-	b.fronts[stepMs] = f
+	b.fronts[k] = f
 	return f
 }
 
 // features quantizes a front end's output exactly as the detector does its own (ProcessAudio in
-// microwakeword.go), so a model fed here scores what it would have scored alone.
+// microwakeword.go), so a model fed here scores what it would have scored alone. mwwfront.Quantize is
+// the same arithmetic, ESPHome's.
 func features(raw []uint16) []int8 {
-	frame := make([]int8, 40)
-	for i, v := range raw {
-		val := (int32(v)*256+333)/666 - 128
-		frame[i] = int8(max(-128, min(127, val)))
-	}
+	frame := make([]int8, mwwfront.Channels)
+	mwwfront.Quantize(raw, frame)
 	return frame
 }
 
@@ -116,20 +165,38 @@ func (b *microBackend) load(m wake.Model) (err error) {
 			err = fmt.Errorf("wake: loading %s: damaged model: %v", m.Path, r)
 		}
 	}()
+	// The engine sizes and indexes everything by what the file says, and an allocation a file talked
+	// it into is fatal, not a panic the guard above can catch. So every model, the image's, Home
+	// Assistant's or the setup page's, is held to the setup page's checks before the engine reads it.
+	if err := wake.CheckMicro(m.Path); err != nil {
+		return fmt.Errorf("wake: loading %s: %w", m.Path, err)
+	}
 	det, err := microwakeword.NewDetector(cfg)
 	if err != nil {
 		return fmt.Errorf("wake: loading %s: %w", m.Path, err)
 	}
-	step := cfg.FeaturesStepMs
-	if step == 0 {
-		step = 20 // what NewDetector takes zero to mean
-	}
+	key := frontKey{mwwfront.StepMs(cfg.FeaturesStepMs), exactFor(m, b.exact)}
 	if _, ok := b.dets[m.ID]; ok {
 		b.unload(m.ID) // a reload may change the step
 	}
-	b.dets[m.ID], b.step[m.ID] = det, step
-	b.front(step)
+	b.dets[m.ID], b.step[m.ID] = det, key
+	b.front(key)
 	return nil
+}
+
+// run hands one frame of features to one model, and reports false if the model panicked on it. A model
+// that loaded can still fall over on real audio, and the panic would otherwise take the wake service
+// down with every other word in it, and again each time it came back with the same model. That model
+// is dropped instead, said once in the log, and the slot it was in stays deaf until it is chosen again.
+func (b *microBackend) run(id string, det microDetector, feat [][]int8) (ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("wake word dropped: its model failed on live audio", "id", id, "err", r)
+			ok = false
+		}
+	}()
+	det.ProcessFeatures(feat)
+	return true
 }
 
 func (b *microBackend) unload(id string) {
@@ -148,13 +215,14 @@ func (b *microBackend) unload(id string) {
 // feed runs each front end over the frame once and hands every frame of features it makes to each
 // model on that step. The cutoff is neverFires, so a detector never stops partway through a frame.
 func (b *microBackend) feed(frame []int16) (map[string]float64, bool) {
-	for stepMs, f := range b.fronts {
+	for key, f := range b.fronts {
 		f.buf = append(f.buf, frame...)
 		for len(f.buf) >= f.window {
 			feat := [][]int8{features(f.fe.ProcessFrame(f.buf[:f.window]))}
 			for id, det := range b.dets {
-				if b.step[id] == stepMs {
-					det.ProcessFeatures(feat)
+				if b.step[id] == key && !b.run(id, det, feat) {
+					b.unload(id)
+					b.gone = append(b.gone, id)
 				}
 			}
 			f.buf = f.buf[f.step:]
@@ -164,6 +232,12 @@ func (b *microBackend) feed(frame []int16) (map[string]float64, bool) {
 		b.scores[id] = det.SlidingAverage()
 	}
 	return b.scores, true
+}
+
+func (b *microBackend) failed() []string {
+	gone := b.gone
+	b.gone = nil
+	return gone
 }
 
 func (b *microBackend) close() {
@@ -219,5 +293,7 @@ func (b *owwBackend) feed(frame []int16) (map[string]float64, bool) {
 	}
 	return b.scores, true
 }
+
+func (b *owwBackend) failed() []string { return nil }
 
 func (b *owwBackend) close() {}

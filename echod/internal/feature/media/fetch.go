@@ -72,21 +72,27 @@ func Fetch(ctx context.Context, url string) ([]int16, error) {
 	if len(body) > mostAudio {
 		return nil, fmt.Errorf("%s: more than %d bytes of audio for one announcement", url, mostAudio)
 	}
+	return decode(body, resp.Header.Get("Content-Type"), url)
+}
+
+// decode is a whole body as mono speech at speaker.VoiceRate. url is only for the errors and the log.
+func decode(body []byte, contentType, url string) ([]int16, error) {
 	var (
 		samples []int16
 		f       wavFormat
+		err     error
 	)
 	switch {
 	case len(body) >= 12 && string(body[0:4]) == "RIFF":
 		samples, f, err = monoPCM(body)
-	case isMP3(body, resp.Header.Get("Content-Type")):
+	case isMP3(body, contentType):
 		samples, f, err = monoMP3(body)
 	default:
 		head := body
 		if len(head) > 4 {
 			head = head[:4]
 		}
-		err = fmt.Errorf("unrecognised audio: %d bytes, content-type %q, starts %q", len(body), resp.Header.Get("Content-Type"), string(head))
+		err = fmt.Errorf("unrecognised audio: %d bytes, content-type %q, starts %q", len(body), contentType, string(head))
 	}
 	if err != nil {
 		return nil, fmt.Errorf("%w (from %s)", err, url)
@@ -151,23 +157,28 @@ func SpeechGain(sumSquares float64, n int) float64 {
 // remaining headroom is approached asymptotically, so a loud syllable compresses rather than cracks.
 func Scale(in []int16, gain float64) []int16 {
 	out := make([]int16, len(in))
-	const knee = speechKnee * 32767
-	const headroom = 32767 - knee
 	for i, s := range in {
-		v := float64(s) * gain
-		a := math.Abs(v)
-		if a > knee {
-			over := a - knee
-			a = knee + headroom*over/(over+headroom)
-			if v < 0 {
-				v = -a
-			} else {
-				v = a
-			}
-		}
-		out[i] = int16(v)
+		out[i] = softLimit(float64(s) * gain)
 	}
 	return out
+}
+
+// softLimit is a sample at any level brought within full scale: linear to speechKnee, then the
+// remaining headroom approached asymptotically.
+func softLimit(v float64) int16 {
+	const knee = speechKnee * 32767
+	const headroom = 32767 - knee
+	a := math.Abs(v)
+	if a > knee {
+		over := a - knee
+		a = knee + headroom*over/(over+headroom)
+		if v < 0 {
+			v = -a
+		} else {
+			v = a
+		}
+	}
+	return int16(v)
 }
 
 // isMP3 recognizes what Home Assistant's tts_proxy serves when it does not convert: an MP3, with

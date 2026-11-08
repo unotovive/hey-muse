@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"math"
 	"os"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -16,8 +17,12 @@ import (
 
 	"github.com/HuskerMinion/techo5/echod/internal/component"
 	"github.com/HuskerMinion/techo5/echod/internal/config"
+	"github.com/HuskerMinion/techo5/echod/internal/layout"
 	"github.com/HuskerMinion/techo5/echod/internal/lib/alsa"
 	"github.com/HuskerMinion/techo5/echod/internal/lib/asp"
+	"github.com/HuskerMinion/techo5/echod/internal/lib/audio"
+	"github.com/HuskerMinion/techo5/echod/internal/lib/beat"
+	"github.com/HuskerMinion/techo5/echod/internal/lib/echoref"
 	"github.com/HuskerMinion/techo5/echod/internal/lib/hook"
 	"github.com/HuskerMinion/techo5/echod/internal/lib/safe"
 	"github.com/HuskerMinion/techo5/echod/internal/lib/spectrum"
@@ -39,6 +44,20 @@ const (
 	// codecSettle is how long the codec sits powered and idle before the amplifier is enabled,
 	// measured from the vendor HAL doing the same thing on a route change.
 	codecSettle = 1100 * time.Millisecond
+
+	// muteSettle is how long an amplifier with a mute of its own (MuteSwitch) sits switched on before
+	// the mute is let go, so the switch's own step is behind the mute and not heard.
+	muteSettle = 75 * time.Millisecond
+
+	// unmuteAfter is how many periods the stream writes before an amplifier mute is let go: one more
+	// than the ring holds, so the write that returns has had to wait for the card to take a period,
+	// and the card is playing, not only filled.
+	unmuteAfter = periods + 1
+
+	// upsampleTaps is the length of each phase of the filter that takes a period up to the card's rate, where
+	// the card runs faster than Rate: 96 taps at 96 kHz, flat to 21 kHz and about 74 dB down on the
+	// images from 27 kHz. 1 ms of delay.
+	upsampleTaps = 48
 )
 
 // VoiceRate is the rate Home Assistant's pipeline works at, and VoiceUpsample how many playback
@@ -48,10 +67,9 @@ const (
 	VoiceUpsample = Rate / VoiceRate
 )
 
-const (
-	Card           = 0
-	PlaybackDevice = 23
-)
+// Card is the sound card, found by its id on a board that names one (layout.SoundCard), card 0
+// otherwise; PlaybackDevice, the PCM on it, is the board's own (paths_*.go).
+var Card = alsa.CardByID(layout.SoundCard())
 
 // OutputMode selects automatic routing, the speaker, headphones when plugged in, or both at once.
 type OutputMode int32
@@ -74,20 +92,39 @@ type Player struct {
 	// The hardware, taken by Start and let go by Close. Nil in between: the handle outlives the
 	// device so that a restart can take it again without everything holding a Player being rebuilt.
 	devMu sync.Mutex
-	pb    *alsa.Playback
+	pb    playback
 	mixer *alsa.Mixer
+	// pbFormat is what pb was opened in (formatFor), which Run starts from: the output can change
+	// between the open and the first period, and the format it had at the open is what the card holds.
+	pbFormat cardFormat
 
 	// hold is DRAMHold, kept open for as long as pb is: see paths_cronos.go.
-	hold *os.File
+	hold     *os.File
+	mainline bool
 
 	// Jack changed: a headphone was physically plugged in or pulled out.
 	OnJack hook.Hook[Output]
 
 	// sink, when set, is where the audio goes instead of the codec: see sink.go.
 	sink atomic.Pointer[sinkState]
+	// OnSinkSound is sound beginning to go to the sink after it was quiet (SinkSounding). It is emitted
+	// from the write loop, so a listener must not block.
+	OnSinkSound hook.Hook[struct{}]
 
 	volume atomic.Uint32 // linear gain, derived from step and the current output's curve
 	step   atomic.Int32
+
+	// voiceOff and callOff are how far the queue lane's replies and a call's audio sit from the media
+	// volume, in steps (SetLaneOffsets); ceiling is the most they are raised to through quiet hours,
+	// 0 for no limit (SetLaneCeiling). role says what the queue lane carries now (SetRole). See lanes.
+	voiceOff, callOff, ceiling atomic.Int32
+	role                       atomic.Int32
+	// held is how many more periods a lane that sounds louder than the media volume still counts, so
+	// the output level does not jump in the gaps of one reply (fill only).
+	held [2]int
+	// gainMu serializes amplifier writes and the saved gain reapplied when the stream starts.
+	gainMu sync.Mutex
+	gainDB int
 
 	pathMu sync.Mutex
 	out    Output
@@ -106,17 +143,29 @@ type Player struct {
 	resampling config.Resampling
 	splices    atomic.Uint64
 
-	// tuning is the vendor's driver tuning, loaded once, and chain is it applied to this stream. Both
-	// are nil on a device whose tuning we could not read, which plays untuned rather than not at all.
-	// on gates it; the chain is only ever touched by the write loop.
+	// Each internal speaker driver needs its own filter and limiter history. The vendor tuning
+	// is shared and immutable; only the write loop touches either processing chain.
+	// Mono uses the first lane; athena, which can play stereo, has a second lane and chain for its
+	// other driver, so stereo turns on and off while playing (SetStereo).
 	tuning *asp.Tuning
-	chain  *asp.Chain
+	// canStereo is a board with two internal drivers that can play stereo: athena. stereo is whether
+	// it does, which starts mono unless speaker.stereo is saved.
+	canStereo bool
+	stereo    atomic.Bool
+	// On athena the first playback PCM slot feeds the physical right speaker.
+	// Reverse logical L/R on internal speakers, never on the headphone-only path.
+	swapLR bool
+	chains []*asp.Chain
+	lanes  [][]float32
 	// first is the volume curve to apply in front of the tuning, where this tuning has one
 	// (firstCurves); nil turns down what the tuning produced instead.
 	first *[VolumeSteps + 1]float64
-	on    atomic.Bool
-	stale atomic.Bool
-	mono  []float32
+	// lifted is first with Louder top volume's lift (louder_top.go), where this tuning has one, and
+	// louderTop whether the switch is on.
+	lifted    *[VolumeSteps + 1]float64
+	louderTop atomic.Bool
+	on        atomic.Bool
+	stale     atomic.Bool
 
 	// tone is the listener's own shelves, waiting to be picked up: the chain belongs to the write
 	// loop, so a setting changed from anywhere else is left here and applied there. applied is what
@@ -124,8 +173,25 @@ type Player struct {
 	tone    atomic.Value // asp.Tone
 	applied asp.Tone
 
+	// speaking is how many claims for words are playing (Driver.ClaimSpeech), and clearer the Clearer
+	// speech switch: with both, the write loop adds the speech shelf to the listener's own.
+	speaking atomic.Int32
+	clearer  atomic.Bool
+
 	// fed is whether the last block had anything in it, and belongs to the write loop alone.
 	fed bool
+
+	// playing is whether the card is taking the stream's periods (unmuteAfter), which is when an
+	// amplifier mute (MuteSwitch) may be let go.
+	playing atomic.Bool
+
+	// gate is the amplifier switched off while idle (idleGate), nil on every board that keeps it as it
+	// is; idle decides when, and claimed is a claim holding the speaker (Hold). See idle.go.
+	gate    *ampGate
+	idle    idleAmp
+	claimed atomic.Bool
+	// wakeFails is the gated amplifier's wakes that failed in a row (ampWake).
+	wakeFails atomic.Int32
 
 	// underruns is the card running out while we were away. Write blocks against the whole ring, so
 	// each one means the loop was starved for as long as the ring is deep.
@@ -136,11 +202,19 @@ type Player struct {
 
 	mu      sync.Mutex
 	pending []int16 // interleaved stereo waiting to go out
+	// overlay is how many samples at the front of pending carry a sound mixed in by Overlay (a chime, a
+	// beep), so whatever else is queued there knows not to drain it away (Overlaying).
+	overlay int
 
 	// bed is a track's audio, queued apart from pending so an answer or an announcement can sound
 	// over it rather than after it: the two are summed as they go out, as a Source is. Same stereo,
 	// same media volume; a track ducks its own samples before they are queued.
 	bed []int16
+
+	// under is a call's far end played under whatever took the speaker from it (a turn's reply, an
+	// announcement), a lane of its own beside bed: bed is a track's, which keeps what is left in it as the
+	// track's own audio and resumes paused music into it. Summed as bed is, at the media volume.
+	under []int16
 
 	// bell is a ring's chime, queued apart from everything else because it goes out at a level of
 	// its own: bellStep rather than the media volume. ringing holds that level for the whole of a
@@ -153,10 +227,29 @@ type Player struct {
 	// written counts frames handed to the card, which is what a Source places audio against.
 	written atomic.Uint64
 
+	// ring is the card's last word on what it holds, published as one value with the write count it
+	// belongs to, so a reader never pairs a count with a delay read at another write. Nil until the
+	// card has said (no device yet, or a driver that will not answer): see Latency and Position.
+	ring atomic.Pointer[ringReading]
+
 	srcMu  sync.Mutex
 	src    Source
 	srcBuf []int16
+	// srcQuiet counts the periods in a row the Source has placed nothing but silence, for Sounding: a
+	// Source can stay attached with nothing to play, as Sendspin's does while Music Assistant has it
+	// paused. Written only by the write loop, and put back to 0 by Attach.
+	srcQuiet atomic.Int32
+
+	// music follows the level and beat of the music for the ring (MusicTap). It only listens while a
+	// ring effect wants it, and only to the lanes music comes through: a track's bed and an attached
+	// Source, never the queue that replies, chimes and alarms use.
+	music   beat.Analyzer
+	musicOn atomic.Bool
 }
+
+// srcQuietAfter is how many silent periods before an attached Source is no longer Sounding: about two
+// seconds, as for a sink (sinkQuietAfter), so the gap between two tracks is still the music playing.
+const srcQuietAfter = 2 * Rate / period
 
 // Source is asked for the frames the card is about to play, addressed by absolute output frame index.
 // A room playing along with the house needs that: where audio lands has to follow from when the server
@@ -172,18 +265,92 @@ func (p *Player) Attach(s Source) {
 	p.srcMu.Lock()
 	defer p.srcMu.Unlock()
 	p.src = s
+	p.srcQuiet.Store(0)
+}
+
+// Detach clears the Source only if it is still s. An output letting go must not take another's place
+// with it: Snapcast's stream going quiet while Sendspin plays would otherwise leave Sendspin silent.
+func (p *Player) Detach(s Source) {
+	p.srcMu.Lock()
+	defer p.srcMu.Unlock()
+	if p.src != s {
+		return
+	}
+	p.src = nil
+	p.srcQuiet.Store(0)
 }
 
 // Written is the output frame index of the next frame to be handed to the card.
 func (p *Player) Written() uint64 { return p.written.Load() }
+
+// ringReading is one answer from the card: just after the write that brought the count to written,
+// it still had frames to play, as of at.
+type ringReading struct {
+	written uint64
+	frames  int64
+	at      time.Time
+}
+
+// OutputExtra is what the path adds after the ring: the tuning's limiter looks 2 ms ahead (lib/asp
+// mbcl.go), and the AFE's FIFO and the codec's DAC filters about another. Estimated from the parts,
+// not measured; a room that still sits a few milliseconds off another is where to look first.
+const OutputExtra = 3 * time.Millisecond
+
+// DefaultLatency is Latency when the card will not say: a full ring, which is what the write loop
+// keeps it at, and the path after it.
+const DefaultLatency = time.Duration(period*periods)*time.Second/Rate + OutputExtra
+
+// Latency is how long a frame rendered now waits before it is heard: the frames the card still had
+// in its ring after the last write, less what it has played since it said so, and the path after the
+// ring. This is the output latency a synchronized stream has to lead by. It is not HardwareTail,
+// which is a margin for deciding the room has gone quiet and is deliberately generous.
+//
+// The reading is taken in the write loop and used from the network goroutine, up to a period later
+// (16 ms on a Show 5 or a Spot, 21 on a Dot), so the time since it was taken comes off: without that,
+// the anchor sat up to a period early.
+//
+// A full ring is 3072 frames (64 ms) on a Show 5 or a Spot and 4096 (about 85 ms) on a Dot, and just
+// after a write the card holds close to all of it. Measured on a 1st gen Show 5 (2026-10-02, idle loop feeding
+// silence), at arbitrary moments it held 2528 to 2880 frames, 53 to 60 ms.
+//
+// A sink (Bluetooth) is not counted: the codec keeps its pace on silence while the sink plays the
+// audio with a delay of its own that nothing here knows.
+func (p *Player) Latency() time.Duration {
+	_, l := p.Position()
+	return l
+}
+
+// Position is the index of the next frame to go to the card and how long, from now, until it is
+// heard: both from the same reading, so the frame and its latency always belong together.
+func (p *Player) Position() (written uint64, latency time.Duration) {
+	r := p.ring.Load()
+	if r == nil {
+		return p.written.Load(), DefaultLatency
+	}
+	left := time.Duration(r.frames)*time.Second/Rate - time.Since(r.at)
+	return r.written, max(left, 0) + OutputExtra
+}
+
+// stereoInternalSpeakers permits stereo only on athena after explicit opt-in.
+// Every board uses two-channel PCM, so channel count alone cannot decide.
+func stereoInternalSpeakers(board string, enabled bool) bool {
+	return board == "athena" && enabled
+}
 
 // New makes the speaker without taking the hardware, so callers can hold it before there is anything
 // to play through. Audio queued before Start waits; Volume and the rest work throughout.
 func New() *Player {
 	detected := DetectOutput()
 	p := &Player{
-		out:  detected,
-		jack: detected,
+		out:       detected,
+		jack:      detected,
+		canStereo: stereoInternalSpeakers(layout.Board, true),
+		swapLR:    layout.Board == "athena",
+		gate:      idleGate,
+	}
+	p.stereo.Store(stereoInternalSpeakers(layout.Board, config.Get().Speaker.Stereo))
+	if p.canStereo {
+		slog.Info("speaker stereo", "on", p.stereo.Load())
 	}
 	p.outNow.Store(detected)
 	p.voice, p.resampling = NewResampler(config.ResampleSinc)
@@ -191,21 +358,39 @@ func New() *Player {
 	p.on.Store(config.DefaultASP)
 
 	if !DriverTuning {
+		slog.Info("this board plays without the driver tuning for now", "board", layout.Board)
 		return p
 	}
-	t, err := asp.Load(asp.VendorDir)
+	load := asp.Load
+	if tuningSet != nil {
+		load = func(dir string) (*asp.Tuning, error) { return asp.LoadSet(dir, *tuningSet) }
+	}
+	t, err := load(asp.VendorDir)
 	if err != nil {
 		slog.Error("the driver tuning is not available, playing untuned", "err", err)
 		return p
 	}
-	c, err := t.Chain(period)
-	if err != nil {
-		slog.Error("the driver tuning will not run, playing untuned", "err", err)
-		return p
+	lanes := 1
+	if p.canStereo {
+		lanes = Channels
 	}
-	p.tuning, p.chain, p.mono = t, c, make([]float32, period)
+	for range lanes {
+		c, err := t.Chain(period)
+		if err != nil {
+			slog.Error("the driver tuning will not run, playing untuned", "err", err)
+			p.chains, p.lanes = nil, nil
+			return p
+		}
+		p.chains = append(p.chains, c)
+		p.lanes = append(p.lanes, make([]float32, period))
+	}
+	p.tuning = t
 	if curve, ok := firstCurves[t.Name()]; ok {
 		p.first = &curve
+		if db, ok := topLifts[t.Name()]; ok {
+			l := liftTop(curve, db)
+			p.lifted = &l
+		}
 	}
 	return p
 }
@@ -220,7 +405,8 @@ func init() {
 	// one to Android is what a restart takes back, which is why the handle outlives the service.
 	//
 	// The speaker also feeds silence while idle, because the amplifier hisses when nothing drives the
-	// DAC and toggling it pops.
+	// DAC and toggling it pops. Where the amplifier can be put to sleep without a pop (idleGate, the
+	// 1st gen Show 5), it is, and the silence goes on under it: see idle.go.
 	component.Register(component.Hardware, Get(), component.Order(6),
 		component.Supervise(service.Restart(time.Second, 30*time.Second)))
 }
@@ -236,45 +422,21 @@ func (p *Player) Name() string { return "speaker" }
 // open takes the playback stream and the mixer. Mixer writes happen in Run: the first one enumerates
 // the card, which takes over a second.
 func (p *Player) open() error {
-	m, err := alsa.OpenMixer(Card)
+	f := formatFor(p.Output())
+	pb, m, hold, mainline, err := openDevice(f)
 	if err != nil {
-		return fmt.Errorf("speaker: opening mixer: %w", err)
-	}
-
-	// Before the playback device, so its driver sees the AFE in use and takes the DRAM ring.
-	var hold *os.File
-	if DRAMHold != "" {
-		hold, err = os.OpenFile(DRAMHold, os.O_RDWR|syscall.O_NONBLOCK, 0)
-		if err != nil {
-			_ = m.Close()
-			return fmt.Errorf("speaker: holding %s: %w", DRAMHold, err)
-		}
-	}
-
-	pb, err := alsa.OpenPlayback(Card, PlaybackDevice, alsa.Config{
-		Channels:   Channels,
-		Rate:       Rate,
-		Format:     alsa.FormatS16_LE,
-		Bits:       Bits,
-		PeriodSize: period,
-		Periods:    periods,
-	})
-	if err != nil {
-		_ = m.Close()
-		if hold != nil {
-			_ = hold.Close()
-		}
-		return fmt.Errorf("speaker: opening playback: %w", err)
+		return err
 	}
 
 	p.devMu.Lock()
-	p.pb, p.mixer, p.hold = pb, m, hold
+	p.pb, p.mixer, p.hold, p.pbFormat = pb, m, hold, f
+	p.mainline = mainline
 	p.devMu.Unlock()
 	return nil
 }
 
 // device is the hardware, or nils when it is not held.
-func (p *Player) device() (*alsa.Playback, *alsa.Mixer) {
+func (p *Player) device() (playback, *alsa.Mixer) {
 	p.devMu.Lock()
 	defer p.devMu.Unlock()
 	return p.pb, p.mixer
@@ -294,13 +456,37 @@ func (p *Player) route() {
 	if p.out == OutputSpeaker {
 		p.apply(headphoneOff)
 	}
-	p.apply(pathSequence[p.out])
+	p.apply(p.path(p.out))
+}
+
+// path is out's sequence, with the Speaker gain in it where the board writes that with the path
+// (gainOnPath). Every place that writes a path takes it from here, so a gain chosen once holds through
+// a start, a route change, the jack coming and going, and a path written again (Reopen). Called with
+// pathMu held, which is what guards gainDB where gainOnPath is set (setPathGain).
+func (p *Player) path(out Output) []kctl {
+	if !gainOnPath {
+		return pathSequence[out]
+	}
+	return withSpeakerGain(pathSequence[out], out, p.gainDB)
 }
 
 // amp switches the speaker amplifier, where the device has a switch that is safe to touch: see
-// AmpSwitch in paths_dot.go and paths_cronos.go.
+// AmpSwitch in paths_dot.go and paths_cronos.go. Turning it on also lets go of the amplifier's mute
+// (MuteSwitch) once the stream is playing; before then Run lets go of it itself.
+//
+// A board with an idle gate (idleGate) switches that instead, in its own pop-free order, and on any
+// output: switching on there is also waking it from an idle sleep, which a path written again (a
+// start, a change of output, Reopen) is the moment for.
 func (p *Player) amp(on bool) {
-	if AmpSwitch == "" {
+	if p.gate != nil {
+		if on {
+			p.ampWake()
+		} else {
+			p.ampSleep()
+		}
+		return
+	}
+	if AmpSwitch == "" && MuteSwitch == "" {
 		return
 	}
 
@@ -310,11 +496,66 @@ func (p *Player) amp(on bool) {
 	if p.out != OutputSpeaker {
 		return
 	}
-	value := "Off"
-	if on {
-		value = "On"
+	if !on {
+		p.apply(ampOff())
+		return
 	}
-	p.apply([]kctl{{name: AmpSwitch, value: value}})
+	on1, release := ampOn(p.playing.Load())
+	p.apply(on1)
+	if len(release) > 0 {
+		time.Sleep(muteSettle)
+		p.apply(release)
+	}
+}
+
+// unmute lets go of the amplifier's mute once the stream has started, where the speaker is the output
+// and its path is in place.
+func (p *Player) unmute() {
+	if MuteSwitch == "" {
+		return
+	}
+	p.pathMu.Lock()
+	defer p.pathMu.Unlock()
+	if p.out != OutputSpeaker || p.draining {
+		return
+	}
+	p.apply([]kctl{{name: MuteSwitch, value: "Off"}})
+}
+
+// stopped holds the amplifier's mute again as the stream ends, for whatever reason it ends.
+func (p *Player) stopped() {
+	p.playing.Store(false)
+	if MuteSwitch == "" {
+		return
+	}
+	p.pathMu.Lock()
+	defer p.pathMu.Unlock()
+	p.apply([]kctl{{name: MuteSwitch, value: "On"}})
+}
+
+// ampOff silences the speaker's amplifier: its mute first, where the board has one, then its switch.
+func ampOff() []kctl {
+	var seq []kctl
+	if MuteSwitch != "" {
+		seq = append(seq, kctl{name: MuteSwitch, value: "On"})
+	}
+	if AmpSwitch != "" {
+		seq = append(seq, kctl{name: AmpSwitch, value: "Off"})
+	}
+	return seq
+}
+
+// ampOn is ampOff the other way round: the switch first (on), and the mute let go last (unmute),
+// muteSettle later, and only when release says the stream is running. Without a mute, unmute is
+// empty and on is all of it.
+func ampOn(release bool) (on, unmute []kctl) {
+	if AmpSwitch != "" {
+		on = append(on, kctl{name: AmpSwitch, value: "On"})
+	}
+	if MuteSwitch != "" && release {
+		unmute = append(unmute, kctl{name: MuteSwitch, value: "Off"})
+	}
+	return on, unmute
 }
 
 // Output reports which output the player is driving. It never waits on a switch in progress.
@@ -339,9 +580,7 @@ func (p *Player) setOutput(out Output) {
 	// The tuning's history is of what went out the old way: Headphone to Both starts it again, and
 	// it should not start from audio it never processed.
 	p.stale.Store(true)
-	if AmpSwitch != "" {
-		p.apply([]kctl{{name: AmpSwitch, value: "Off"}})
-	}
+	p.apply(ampOff())
 	if out == OutputHeadphone && p.sink.Load() == nil {
 		if _, mixer := p.device(); mixer != nil {
 			// Keep the jack closed until old-gain samples have cleared the playback ring.
@@ -357,7 +596,7 @@ func (p *Player) setOutput(out Output) {
 	if out == OutputSpeaker {
 		p.apply(headphoneOff)
 	}
-	p.apply(pathSequence[out])
+	p.apply(p.path(out))
 	p.pathMu.Unlock()
 
 	p.SetVolume(int(p.step.Load()))
@@ -398,6 +637,29 @@ func (p *Player) SetOutputMode(mode OutputMode) {
 	p.setOutput(p.desiredOutput(DetectOutput()))
 }
 
+// Reopen writes the speaker's whole path again, the way Run first opens it: the init sequence, the
+// route, and the amplifier once the codec has settled. Choosing Speakers when the speaker is already
+// the output changes nothing in setOutput, and a path something has knocked out of place (#142) would
+// stay that way until a restart; asking for the speaker by hand is the moment to put it back.
+func (p *Player) Reopen() {
+	p.pathMu.Lock()
+	if p.out != OutputSpeaker || p.draining {
+		p.pathMu.Unlock()
+		return
+	}
+	p.apply(initSequence)
+	p.apply(headphoneOff)
+	p.apply(p.path(OutputSpeaker))
+	p.pathMu.Unlock()
+
+	p.SetVolume(int(p.step.Load()))
+	if _, mixer := p.device(); mixer != nil {
+		time.Sleep(codecSettle)
+		p.amp(true)
+	}
+	slog.Info("speaker path written again")
+}
+
 // watchJack tracks the physical headphone jack and updates playback routing.
 func (p *Player) watchJack(ctx context.Context) {
 	t := time.NewTicker(jackPoll)
@@ -428,12 +690,21 @@ func (p *Player) watchJack(ctx context.Context) {
 }
 
 // apply writes a mixer sequence in order, logging failures and continuing.
-func (p *Player) apply(seq []kctl) {
+func (p *Player) apply(seq []kctl) { _ = p.applyAll(seq) }
+
+// applyAll is apply that says whether every write was made: false with no mixer held, or when one
+// failed (each failure is logged as apply logs it).
+func (p *Player) applyAll(seq []kctl) bool {
 	_, mixer := p.device()
 	if mixer == nil {
-		return
+		return false
 	}
+	return applyTo(mixer, seq)
+}
 
+// applyTo is apply on a mixer that is not held yet, reporting whether every write was made.
+func applyTo(mixer *alsa.Mixer, seq []kctl) bool {
+	ok := true
 	for _, c := range seq {
 		if c.ifPresent {
 			if _, err := mixer.Find(c.name); err != nil {
@@ -452,8 +723,10 @@ func (p *Player) apply(seq []kctl) {
 		}
 		if err != nil {
 			slog.Error("mixer write failed", "control", c.name, "err", err)
+			ok = false
 		}
 	}
+	return ok
 }
 
 // Run feeds the stream until ctx is canceled, writing silence when nothing is queued.
@@ -465,10 +738,23 @@ func (p *Player) Run(ctx context.Context) error {
 	buf := make([]byte, period*Channels*Bits/8)
 
 	// The order the vendor HAL uses on a route change: route with the amplifier off, let the
-	// codec sit idle, enable the amplifier, then feed.
+	// codec sit idle, enable the amplifier, then feed. An amplifier mute (MuteSwitch) is held through
+	// all of it and let go once the card is playing, on silence or whatever is queued: after
+	// unmuteAfter periods, when the ring has filled and the card has taken from it.
+	defer p.stopped()
 	out := p.Output()
-	p.apply(initSequence)
+	p.initializeMixer()
 	p.route()
+	// Written on every start, even at 0 dB: 110 (0 dB) is the TAS5805M driver's own default (probe
+	// sets its vol to 110, and every unmute writes that cached vol to the chip), so at 0 dB this
+	// writes what is already there. But the driver keeps the last level written across a restart of
+	// this service, so the saved gain, 0 dB included (settings reset, say), is written over it. Where
+	// the gain goes with the path (gainOnPath), route has just written it.
+	if !gainOnPath && gainOn(p.heldMixer()) {
+		if err := p.applySpeakerGain(); err != nil {
+			slog.Error("restoring speaker gain failed, continuing playback", "err", err)
+		}
+	}
 
 	select {
 	case <-ctx.Done():
@@ -481,12 +767,49 @@ func (p *Player) Run(ctx context.Context) error {
 	safe.Go("jack watcher", func() { p.watchJack(ctx) })
 
 	silence := make([]byte, len(buf))
+	muted := 0 // periods written while an amplifier mute is still held
+
+	// A card that runs faster than Rate is sent each period upsampled, with the board's trim (paths_*.go),
+	// and a card sent 32-bit containers each sample widened. Both follow the format the device is open in,
+	// which on a board with two (formatFor) changes with the output.
+	p.devMu.Lock()
+	cur := p.pbFormat
+	p.devMu.Unlock()
+	var up *audio.Upsampler
+	var hw, wide []byte
+	upFor := func(f cardFormat) {
+		up, hw = nil, nil
+		if f.rate != Rate || hwTrimDB != 0 {
+			up = audio.NewUpsampler(f.rate/Rate, upsampleTaps, Channels, math.Pow(10, hwTrimDB/20))
+			hw = make([]byte, 0, len(buf)*f.rate/Rate)
+			slog.Info("playback at the card's own rate", "rate", f.rate, "trim_db", hwTrimDB)
+		}
+	}
+	upFor(cur)
+
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil
 		}
 
-		p.fill(buf)
+		// The output moved to one the device is opened differently for: it is closed and opened
+		// again in the new format, here, where nothing else is writing to it.
+		if want := formatFor(p.Output()); !want.same(cur) {
+			np, err := p.reformat(ctx, pb, want)
+			if err != nil {
+				return err
+			}
+			pb, cur = np, want
+			upFor(cur)
+		}
+
+		// An amplifier waking from its idle sleep (idle.go) is not ready for what is queued: the queue
+		// waits, and the card gets silence, until it is.
+		if p.gate != nil && p.idleStep() {
+			clear(buf)
+		} else {
+			p.fill(buf)
+		}
 		spectrum.Speaker.PushStereo(buf)
 		to := buf
 		if s := p.sink.Load(); s != nil {
@@ -494,14 +817,101 @@ func (p *Player) Run(ctx context.Context) error {
 			s.push(buf)
 			to = silence
 		}
+		sent := to
+		if up != nil {
+			hw = up.S16LE(to, hw[:0])
+			to = hw
+		}
+		if cur.bits == 32 {
+			wide = widenS16(to, wide[:0])
+			to = wide
+		}
 		if err := p.send(ctx, pb, to); err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
 			return err
 		}
-		p.written.Add(period)
+		if !p.playing.Load() {
+			if muted++; muted >= unmuteAfter {
+				p.playing.Store(true)
+				p.unmute()
+			}
+		}
+		// What the card holds now is what the period rendered next waits behind, so it is read here,
+		// between the write and the render, and published with the count it belongs to: in frames at
+		// Rate, which is what everything placing audio counts in.
+		d, err := pb.Delay()
+		d = d * Rate / cur.rate
+		at := time.Now()
+		w := p.written.Add(period)
+		if err == nil && d >= 0 {
+			p.ring.Store(&ringReading{written: w, frames: int64(d), at: at})
+			if softRef && echoref.InUse() {
+				// The period's last frame is the card's newest: heard once the ring ahead of it plays.
+				echoref.Push(sent, Rate, at.Add(time.Duration(d)*time.Second/Rate+OutputExtra))
+			}
+		} else {
+			p.ring.Store(nil)
+		}
 	}
+}
+
+// reformat closes pb and opens the stream again in want, on the card and mixer already held, and puts
+// the new stream where the rest of the player finds it. What was still in the old ring is dropped: a
+// change of output is a moment of quiet anyway (setOutput). A stream that will not open is tried again a
+// few times; after that the error ends Run, and the service restarts the player, which opens the device
+// in the format of the output it then has. The format's routes can change what the output's path set
+// (the jack's mutes the amplifier), so the path is written again once the stream is open.
+func (p *Player) reformat(ctx context.Context, pb playback, want cardFormat) (playback, error) {
+	_, mixer := p.device()
+	_ = pb.Close()
+	// Nothing holds a stream until the new one opens, so a Close meanwhile (a shutdown during a wait
+	// below) does not close this one a second time.
+	p.devMu.Lock()
+	p.pb = nil
+	p.devMu.Unlock()
+	p.ring.Store(nil)
+	var err error
+	for try := 0; try < reopenTries; try++ {
+		var np playback
+		if np, err = reopenPlayback(mixer, want); err == nil {
+			p.devMu.Lock()
+			p.pb, p.pbFormat = np, want
+			p.devMu.Unlock()
+			p.route()
+			slog.Info("playback opened again for the output", "output", p.Output(), "rate", want.rate, "bits", want.bits)
+			return np, nil
+		}
+		slog.Warn("speaker: opening playback again failed", "rate", want.rate, "bits", want.bits, "err", err)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(reopenWait):
+		}
+	}
+	return nil, fmt.Errorf("speaker: opening playback again at %d Hz: %w", want.rate, err)
+}
+
+// reopenTries and reopenWait are how often, and how far apart, reformat tries a stream that will not open.
+const (
+	reopenTries = 3
+	reopenWait  = 200 * time.Millisecond
+)
+
+// widenS16 appends in, S16_LE samples, to out as S24_LE ones: 24 bits in the low three bytes of a
+// 32-bit container, the 16 at the top of the 24 and the fourth byte the sign, so full scale stays full
+// scale. For a card that is sent 32-bit containers (cardFormat.bits). S24_LE rather than S32_LE because the Echo
+// Dot 3's TAS2770 plays nothing at all of S32_LE, while S24_LE plays (unit 1, 2026-10-23).
+func widenS16(in, out []byte) []byte {
+	for i := 0; i+1 < len(in); i += 2 {
+		sign := byte(0)
+		if in[i+1]&0x80 != 0 {
+			sign = 0xff
+		}
+		out = append(out, 0, in[i], in[i+1], sign)
+	}
+	return out
 }
 
 // send writes one period, putting the same buffer back after an underrun rather than refilling. fill
@@ -548,11 +958,18 @@ func (p *Player) fill(buf []byte) {
 	if len(p.pending) == 0 {
 		p.pending = nil
 	}
+	p.overlay = max(0, p.overlay-take)
 	bedTake := min(len(p.bed), period*Channels)
 	bed := p.bed[:bedTake]
 	p.bed = p.bed[bedTake:]
 	if len(p.bed) == 0 {
 		p.bed = nil
+	}
+	underTake := min(len(p.under), period*Channels)
+	under := p.under[:underTake]
+	p.under = p.under[underTake:]
+	if len(p.under) == 0 {
+		p.under = nil
 	}
 	rang := min(len(p.bell), period*Channels)
 	bell := p.bell[:rang]
@@ -573,56 +990,109 @@ func (p *Player) fill(buf []byte) {
 	// summed rather than one replacing the other, and a reply still sounds over a room stream.
 	rendered := p.render()
 
-	// The internal speaker is one driver wired to the right channel, so a stereo track would lose
-	// everything panned left. The line-out is not: it gets both channels as they came. Neither is a
-	// sink, which is stereo and untuned: it has its own driver and its own tuning.
+	if p.musicOn.Load() {
+		p.music.Feed(bed, rendered, Rate, period)
+	}
+
+	// The internal speakers are mixed to mono unless athena has explicitly enabled
+	// stereo, which preserves independent driver processing including EQ.
+	// The line-out and an external sink always receive stereo and remain untuned.
 	sinking := p.sink.Load() != nil
 	out := p.Output()
-	mono := (out == OutputSpeaker || out == OutputBoth) && !sinking
+	speaker := (out == OutputSpeaker || out == OutputBoth) && !sinking
+	stereo := p.stereo.Load()
+	mono := speaker && !stereo
 
 	// The write loop runs whether or not anything is playing, since the amplifier hisses when nothing
 	// drives the DAC, and tuning silence costs what tuning music costs. The block after the audio stops
 	// still goes through: that is the filter's own length, and it holds the tail.
-	fed := take > 0 || bedTake > 0 || len(rendered) > 0 || rang > 0
+	fed := take > 0 || bedTake > 0 || underTake > 0 || len(rendered) > 0 || rang > 0
 	drain := fed || p.fed
 	p.fed = fed
 
-	// The tuning is for the driver, so the line-out is left with what it was sent. Both is the
-	// exception: one mixer feeds the speaker and the jack, so the headphones get the speaker's mono
-	// and its tuning too.
-	tuned := mono && p.chain != nil && p.on.Load() && drain
+	// The tuning is for the internal drivers, not a line-out or external sink. In Both mode,
+	// the shared mixer feeds the same tuned output to the speaker and the headphones.
+	tuned := speaker && len(p.chains) > 0 && p.on.Load() && drain
 
 	// There is one gain after the tuning, so two levels are made from it: the output goes at the
 	// louder of the two, and whichever lane is quieter is scaled down by the difference before the
 	// mix. The music comes out at the media volume either way, and a muted one stays muted under
 	// the alarm. On the tuned path the compressor narrows that difference a little, since it works
 	// on the sum; the lane that sets the output level is exact.
-	gain, step := p.Volume(), int(p.step.Load())
-	mediaK, bellK := float32(1), float32(0)
-	if rang > 0 || p.ringing.Load() {
-		bs := int(p.bellStep.Load())
-		bg := p.gainFor(bs)
-		if bg > gain {
-			mediaK, bellK, gain, step = gain/bg, 1, bg, bs
-		} else if gain > 0 {
-			bellK = bg / gain
+	//
+	// The two are compared at the level they come out at: tuned with a curve in front, that is the
+	// curve's, which can rise where the usual one stands still (the Spot's and the Dot's vendor curves
+	// repeat values near the top).
+	// A panel plays at Android's volume, which a ring raises for as long as it sounds (paths_panel.go);
+	// an Echo's volume is all here.
+	//
+	// The queue (replies, announcements, a call's far end) and the underlay (a call's, under a reply)
+	// sit at their own steps when a voice or call volume is set (lanes), and join the same balance.
+	// One that sounds louder than the media volume counts for as long as it has audio, and a second
+	// after, so the level does not jump in the gaps of one reply.
+	ringing := rang > 0 || p.ringing.Load()
+	mainStep := int(p.step.Load())
+	queueStep, underStep := p.laneSteps(mainStep)
+	for i, on := range [2]bool{take > 0, underTake > 0} {
+		if on {
+			p.held[i] = Rate / period
+		} else if p.held[i] > 0 {
+			p.held[i]--
 		}
+	}
+	queueOn := queueStep > mainStep && p.held[0] > 0
+	underOn := underStep > mainStep && p.held[1] > 0
+	need, needOn := int(p.bellStep.Load()), ringing
+	if queueOn {
+		need, needOn = max(need, queueStep), true
+	}
+	if underOn {
+		need, needOn = max(need, underStep), true
+	}
+	p.followRing(needOn, need)
+	gain, step := p.Volume(), mainStep
+	mediaK, bellK, queueK, underK := float32(1), float32(0), float32(1), float32(1)
+	// Read once, so a period goes out on one curve even when Louder top volume changes during it.
+	curve := p.inFront()
+	if ringing || queueStep != mainStep || underStep != mainStep {
+		var first *[VolumeSteps + 1]float64
+		if tuned {
+			first = curve
+		}
+		bs := int(p.bellStep.Load())
+		var k [nLanes]float32
+		k, gain, step = laneBalance(first, out, [nLanes]laneIn{
+			laneMedia: {true, step, gain},
+			laneQueue: {queueOn, queueStep, p.gainFor(queueStep)},
+			laneUnder: {underOn, underStep, p.gainFor(underStep)},
+			laneBell:  {ringing, bs, p.gainFor(bs)},
+		})
+		mediaK, queueK, underK, bellK = k[laneMedia], k[laneQueue], k[laneUnder], k[laneBell]
 	}
 
 	// Where the tuning has a curve of its own the volume goes in front of it, as the vendor's chain
 	// has it, scaled from the gain worked out above so a bell over the music keeps its balance.
 	pre, post := float32(1), gain
-	if tuned && p.first != nil {
-		pre, post = gain*firstRatio(p.first, out, step), 1
+	if tuned && curve != nil {
+		pre, post = gain*firstRatio(curve, out, step), 1
 	}
 
 	// The vendor tunes by volume: each bucket has a filter of its own, and on the Show the quiet ones
 	// carry more bass and treble rather than simply less of everything. Telling the chain where the
 	// dial is picks the one it meant.
 	if tuned {
-		p.chain.Volume(float64(step) / VolumeSteps)
-		if want, ok := p.tone.Load().(asp.Tone); ok && want != p.applied {
-			p.chain.SetTone(want)
+		share := float64(step) / VolumeSteps
+		for _, chain := range p.chains {
+			chain.Volume(share)
+		}
+		want, _ := p.tone.Load().(asp.Tone)
+		if p.clearer.Load() && p.speaking.Load() > 0 {
+			want.Speech = asp.SpeechCut
+		}
+		if want != p.applied {
+			for _, chain := range p.chains {
+				chain.SetTone(want)
+			}
 			p.applied = want
 		}
 	}
@@ -641,13 +1111,25 @@ func (p *Player) fill(buf []byte) {
 		if i+1 < len(bed) {
 			r += int32(bed[i+1])
 		}
+		if i < len(under) {
+			l += int32(under[i])
+		}
+		if i+1 < len(under) {
+			r += int32(under[i+1])
+		}
 		if i < len(rendered) {
 			l += int32(rendered[i])
 		}
 		if i+1 < len(rendered) {
 			r += int32(rendered[i+1])
 		}
-		if mediaK != 1 || bellK != 0 {
+		if queueK != mediaK || underK != mediaK {
+			// Lanes at levels of their own are scaled apart, from the samples rather than the sum.
+			for c, to := range [2]*int32{&l, &r} {
+				*to = int32((sampleAt(bed, i+c)+sampleAt(rendered, i+c))*mediaK +
+					sampleAt(chunk, i+c)*queueK + sampleAt(under, i+c)*underK + sampleAt(bell, i+c)*bellK)
+			}
+		} else if mediaK != 1 || bellK != 0 {
 			var bl, br float32
 			if i < len(bell) {
 				bl = float32(bell[i])
@@ -658,12 +1140,22 @@ func (p *Player) fill(buf []byte) {
 			l = int32(float32(l)*mediaK + bl*bellK)
 			r = int32(float32(r)*mediaK + br*bellK)
 		}
+		// The real athena speaker wiring reverses the standard PCM L/R order.
+		// Apply this before either DSP branch so the same physical mapping is
+		// used with tuning enabled or disabled. The software reference taps
+		// the post-DSP PCM that is actually sent to the ALSA playback device.
+		if speaker && stereo && p.swapLR {
+			l, r = r, l
+		}
 		if mono {
 			l = (l + r) / 2
 			r = l
 		}
 		if tuned {
-			p.mono[j] = float32(clamp(l)) / full * pre
+			p.lanes[0][j] = float32(clamp(l)) / full * pre
+			if stereo {
+				p.lanes[1][j] = float32(clamp(r)) / full * pre
+			}
 			continue
 		}
 		binary.LittleEndian.PutUint16(buf[i*2:], uint16(limit(float32(l)*OutputBoost*gain)))
@@ -675,17 +1167,26 @@ func (p *Player) fill(buf []byte) {
 
 	// Resetting belongs to whoever processes, so a toggle only says that the history is no longer
 	// about what is playing.
-	if p.stale.Swap(false) {
-		p.chain.Reset()
-	}
+	stale := p.stale.Swap(false)
 
-	// Without a curve of its own, the volume attenuates what the tuning produced: the compressor then
-	// works on full-scale music at every volume, which is what firstCurves is for.
-	p.chain.Process(p.mono)
+	// Without a curve of its own, the volume attenuates what the tuning produced: the compressor
+	// then works on full-scale music at every volume. Each driver has independent limiter state;
+	// in mono the second chain, where there is one, waits, and is reset when stereo comes back.
+	for i, chain := range p.chains {
+		if stale {
+			chain.Reset()
+		}
+		if i == 0 || stereo {
+			chain.Process(p.lanes[i])
+		}
+	}
+	right := p.lanes[0]
+	if stereo {
+		right = p.lanes[1]
+	}
 	for i, j := 0, 0; i < period*Channels; i, j = i+Channels, j+1 {
-		s := int16(p.mono[j] * full * post)
-		binary.LittleEndian.PutUint16(buf[i*2:], uint16(s))
-		binary.LittleEndian.PutUint16(buf[(i+1)*2:], uint16(s))
+		binary.LittleEndian.PutUint16(buf[i*2:], uint16(clamp16(p.lanes[0][j]*full*post)))
+		binary.LittleEndian.PutUint16(buf[(i+1)*2:], uint16(clamp16(right[j]*full*post)))
 	}
 }
 
@@ -705,6 +1206,12 @@ func (p *Player) render() []int16 {
 	clear(p.srcBuf)
 
 	src.Render(p.written.Load(), p.srcBuf)
+	if slices.ContainsFunc(p.srcBuf, func(s int16) bool { return s != 0 }) {
+		p.srcQuiet.Store(0)
+	} else if q := p.srcQuiet.Load(); q < srcQuietAfter {
+		// A swap, not a store: an Attach in between has put the count back for a new Source.
+		p.srcQuiet.CompareAndSwap(q, q+1)
+	}
 	return p.srcBuf
 }
 
@@ -734,6 +1241,7 @@ func (p *Player) Take() []int16 {
 
 	pending := p.pending
 	p.pending = nil
+	p.overlay = 0
 	return pending
 }
 
@@ -761,6 +1269,7 @@ func (p *Player) PlayVoice(mono []int16) {
 func (p *Player) Drain() {
 	p.mu.Lock()
 	p.pending = nil
+	p.overlay = 0
 	p.mu.Unlock()
 
 	p.voiceMu.Lock()
@@ -778,10 +1287,24 @@ func (p *Player) SetResampling(r config.Resampling) config.Resampling {
 	return p.resampling
 }
 
+// CanStereo is whether this board's internal speakers can play stereo: athena's two drivers.
+func (p *Player) CanStereo() bool { return p.canStereo }
+
+// SetStereo plays the internal speakers in stereo or mono from the next block on, and reports what it
+// settled on, which is mono on a board without two drivers. A change starts the tuning's history
+// again, as turning the tuning on does.
+func (p *Player) SetStereo(on bool) bool {
+	on = on && p.canStereo
+	if p.stereo.Swap(on) != on {
+		p.stale.Store(true)
+	}
+	return on
+}
+
 // SetASP turns the driver tuning on or off and reports what it settled on, which is off on a device
 // whose tuning never loaded.
 func (p *Player) SetASP(on bool) bool {
-	on = on && p.chain != nil
+	on = on && len(p.chains) > 0
 	if on && !p.on.Load() {
 		p.stale.Store(true)
 	}
@@ -792,6 +1315,10 @@ func (p *Player) SetASP(on bool) bool {
 // SetTone hands the write loop the listener's own shelves. It is the tuning's own stage, so it does
 // nothing on a device playing untuned — there is no chain to put it in.
 func (p *Player) SetTone(t asp.Tone) { p.tone.Store(t) }
+
+// SetClearerSpeech turns Clearer speech on or off: while words play, the tuning's low band comes down
+// (asp.SpeechCut). It is the tuning's own stage, so it does nothing where the tuning is off.
+func (p *Player) SetClearerSpeech(on bool) { p.clearer.Store(on) }
 
 // Tone is what the shelves are set to.
 func (p *Player) Tone() asp.Tone {
@@ -826,6 +1353,23 @@ func (p *Player) Queued() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return len(p.pending) / Channels
+}
+
+// Sounding is whether anything is on its way out of the speaker: a sound queued, the music's bed, an
+// underlay, a bell, or a source placing audio by frame (Attach) that has placed some in the last two
+// seconds. The silence fill pads in when nothing is queued is not, and nor is a source with nothing to
+// place, such as a stream paused at the server. For whoever needs to know whether the room is hearing
+// the device now (feature/takes), which Backgrounds' top cannot say: a paused track keeps its place there.
+func (p *Player) Sounding() bool {
+	p.mu.Lock()
+	queued := len(p.pending)+len(p.bed)+len(p.under)+len(p.bell) > 0
+	p.mu.Unlock()
+	if queued {
+		return true
+	}
+	p.srcMu.Lock()
+	defer p.srcMu.Unlock()
+	return p.src != nil && p.srcQuiet.Load() < srcQuietAfter
 }
 
 // Note is one tone in a chime. A zero frequency is a rest.
@@ -866,6 +1410,19 @@ func (p *Player) Overlay(samples []int16) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.pending = mix(p.pending, samples)
+	p.overlaid(len(samples))
+}
+
+// overlaid notes that the first n samples of the queue now carry an overlay. Called with mu held.
+func (p *Player) overlaid(n int) { p.overlay = max(p.overlay, n) }
+
+// Overlaying reports whether a sound mixed in by Overlay is still queued. Something that keeps the queue
+// short by draining it (a call that has fallen behind) drops its own audio instead while this is so, or
+// the chime or the beep would go with it.
+func (p *Player) Overlaying() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.overlay > 0
 }
 
 // mix sums add into the front of into, extending it if add outlasts it.
@@ -935,6 +1492,7 @@ func tone(n Note, level float64) []int16 {
 func (p *Player) SetVolume(step int) {
 	step = max(0, min(step, VolumeSteps))
 	p.step.Store(int32(step))
+	volumeChanged(step)
 	if p.sink.Load() != nil {
 		p.volume.Store(math.Float32bits(sinkGain(step)))
 		return
@@ -950,6 +1508,127 @@ func firstRatio(first *[VolumeSteps + 1]float64, out Output, step int) float32 {
 		return 0
 	}
 	return float32(math.Pow(10, first[step]/20)) / usual
+}
+
+// ringBalance is how a ring and the media share the one gain after the tuning: the gain and step the
+// output goes at, the louder of the two, and what each lane is scaled by in front of it. They are
+// compared at the level they come out at, which with a curve in front of the tuning (first, nil when
+// untuned) is the curve's.
+func ringBalance(first *[VolumeSteps + 1]float64, out Output, gain float32, step int, bg float32, bs int) (mediaK, bellK, g float32, s int) {
+	k, g, s := laneBalance(first, out, [nLanes]laneIn{laneMedia: {true, step, gain}, laneBell: {true, bs, bg}})
+	return k[laneMedia], k[laneBell], g, s
+}
+
+// The lanes that go out at a level of their own: the media (a track's and a Source's audio), the queue
+// (replies, announcements, a call's far end), the underlay and the bell.
+const (
+	laneMedia = iota
+	laneQueue
+	laneUnder
+	laneBell
+	nLanes
+)
+
+// laneIn is one lane: whether it counts toward the output's level, the step it plays at and that step's
+// linear gain.
+type laneIn struct {
+	on   bool
+	step int
+	gain float32
+}
+
+// laneBalance shares the one gain after the tuning between the lanes: the output goes at the loudest
+// lane that counts (the media on a tie), and each lane is scaled by how far below that it sits. A lane
+// that does not count is scaled the same way but never raises the output; the bell, off, is scaled to 0.
+// Compared at the level they come out at (see ringBalance).
+func laneBalance(first *[VolumeSteps + 1]float64, out Output, in [nLanes]laneIn) (k [nLanes]float32, g float32, s int) {
+	level := func(l laneIn) float32 {
+		if first != nil {
+			return l.gain * firstRatio(first, out, l.step)
+		}
+		return l.gain
+	}
+	best, top := laneMedia, level(in[laneMedia])
+	for i := laneQueue; i < nLanes; i++ {
+		if lv := level(in[i]); in[i].on && lv > top {
+			best, top = i, lv
+		}
+	}
+	g, s = in[best].gain, in[best].step
+	if top <= 0 {
+		k[laneMedia] = 1
+		return k, g, s
+	}
+	for i := range in {
+		switch {
+		case i == best:
+			k[i] = 1
+		case i == laneBell && !in[i].on:
+			k[i] = 0
+		default:
+			k[i] = min(level(in[i])/top, 1)
+		}
+	}
+	return k, g, s
+}
+
+// sampleAt is s[i] as a float, 0 past the end.
+func sampleAt(s []int16, i int) float32 {
+	if i < len(s) {
+		return float32(s[i])
+	}
+	return 0
+}
+
+// What the queue lane carries, for the volume it plays at (SetRole): the device's own sounds follow the
+// media volume, a reply or an announcement the voice volume, a call the call volume.
+const (
+	RoleMedia = iota
+	RoleVoice
+	RoleCall
+)
+
+// SetRole says what the queue lane carries from here on. The driver sets it as a claim takes the
+// speaker (roleOf).
+func (p *Player) SetRole(role int) { p.role.Store(int32(role)) }
+
+// SetLaneOffsets sets how far replies and announcements (voice) and a call's audio (call) sit from the
+// media volume, in steps either way. Zero is the media volume itself, which is how a device plays that
+// never set them.
+func (p *Player) SetLaneOffsets(voice, call int) {
+	p.voiceOff.Store(int32(max(-VolumeSteps, min(voice, VolumeSteps))))
+	p.callOff.Store(int32(max(-VolumeSteps, min(call, VolumeSteps))))
+}
+
+// SetLaneCeiling is the most voice and call are raised above the media volume to, through quiet hours
+// (the night volume), 0 for no limit. The media volume itself is above it only if somebody put it there,
+// and then they follow it.
+func (p *Player) SetLaneCeiling(step int) { p.ceiling.Store(int32(max(0, min(step, VolumeSteps)))) }
+
+// LaneStep is the step a lane plays at for a media step and an offset: the media volume muted or at
+// zero keeps everything silent, and the night ceiling holds a raise.
+func LaneStep(media, off, ceiling int) int {
+	if media <= 0 {
+		return 0
+	}
+	step := max(0, min(media+off, VolumeSteps))
+	if ceiling > 0 && step > media {
+		step = min(step, max(media, ceiling))
+	}
+	return step
+}
+
+// laneSteps are the steps the queue lane and the underlay play at, for the media step now.
+func (p *Player) laneSteps(media int) (queue, under int) {
+	ceil := int(p.ceiling.Load())
+	voice, call := LaneStep(media, int(p.voiceOff.Load()), ceil), LaneStep(media, int(p.callOff.Load()), ceil)
+	switch int(p.role.Load()) {
+	case RoleVoice:
+		return voice, call
+	case RoleCall:
+		return call, call
+	}
+	return media, call
 }
 
 // gainFor is the linear gain for a step on whatever the audio is going to now.
@@ -995,16 +1674,18 @@ func (p *Player) Step() int { return int(p.step.Load()) }
 // Volume is the current linear gain.
 func (p *Player) Volume() float32 { return math.Float32frombits(p.volume.Load()) }
 
-// Close mutes the codec, turns the amplifier off and closes the stream.
-// Close mutes the codec, turns the amplifier off and lets the device go. The Player stays usable:
+// Close puts the mixer back as it starts (initializeMixer: on Amazon's kernel that mutes the codec and
+// turns the amplifier off; on the mainline card it sets the volume to unity) and lets the device go.
+// The Player stays usable:
 // Start can take it again, which is how a restart works.
 func (p *Player) Close() error {
-	p.apply(initSequence)
+	p.initializeMixer()
 
 	p.devMu.Lock()
 	pb, mixer, hold := p.pb, p.mixer, p.hold
 	p.pb, p.mixer, p.hold = nil, nil, nil
 	p.devMu.Unlock()
+	p.ring.Store(nil) // the next device says afresh
 
 	if mixer != nil {
 		_ = mixer.Close()
@@ -1074,4 +1755,42 @@ func (b *Bed) Drain() {
 	b.p.mu.Lock()
 	b.p.bed = nil
 	b.p.mu.Unlock()
+}
+
+// Underlay queues interleaved stereo for the underlay lane (under), dropped as Player.Play drops audio
+// with no device.
+func (p *Player) Underlay(samples []int16) {
+	if pb, _ := p.device(); pb == nil {
+		if n := p.deaf.Add(1); n == 1 || n%100 == 0 {
+			slog.Warn("audio dropped, no playback device", "times", n)
+		}
+		return
+	}
+	p.mu.Lock()
+	p.under = append(p.under, samples...)
+	p.mu.Unlock()
+}
+
+// UnderQueued is how many frames of the underlay are waiting.
+func (p *Player) UnderQueued() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.under) / Channels
+}
+
+// DrainUnder discards the underlay: the call has the speaker back, and plays its far end as itself.
+func (p *Player) DrainUnder() {
+	p.mu.Lock()
+	p.under = nil
+	p.mu.Unlock()
+}
+
+// initializeMixer keeps vendor amplifier controls off the mainline card.
+func (p *Player) initializeMixer() {
+	if p.mainline {
+		// TAS5805M index 110 is unity; the existing software volume curve controls loudness.
+		p.apply([]kctl{{name: "Master Playback Volume", level: 110}})
+		return
+	}
+	p.apply(initSequence)
 }

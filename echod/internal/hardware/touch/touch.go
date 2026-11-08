@@ -12,7 +12,6 @@ package touch
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"sync"
 	"time"
 
@@ -44,6 +43,15 @@ const (
 
 	// swipeMin is how far a horizontal movement has to go to be a swipe at release.
 	swipeMin = 120
+
+	// A finger's direction is settled once, when it has traveled a notch along one axis at least
+	// lockNum/lockDen times as far as along the other: up or down, and only that finger's vertical
+	// travel turns the volume, or sideways, and none of it does. A drift of a few pixels off a
+	// sideways swipe used to turn the volume, because every move was read on its own. A finger that
+	// has gone lockGiveUp notches without either is a slant: never the volume, and a sideways swipe
+	// only if it ends clearly sideways, as any swipe must.
+	lockNum, lockDen = 3, 2
+	lockGiveUp       = 2
 
 	// holdAfter is how long a finger stays put before it is a hold, where holds are reported.
 	holdAfter = 450 * time.Millisecond
@@ -82,6 +90,11 @@ func (g Gesture) String() string { return fmt.Sprintf("%s at %d,%d", g.Kind, g.X
 type Screen struct {
 	// Gestures fires as they happen, on the reader's goroutine: listeners must not block.
 	Gestures hook.Hook[Gesture]
+
+	// Down fires as the finger the screen follows lands (true) and lifts (false), on the reader's
+	// goroutine: listeners must not block. That is the first finger down, and a second one that lands
+	// while it is followed does not fire it. A listener that wants the current state reads Touched.
+	Down hook.Hook[bool]
 
 	dev  *input.Device
 	rawW int // panel x range, exclusive
@@ -140,35 +153,6 @@ func (s *Screen) Touched() bool {
 	return s.down
 }
 
-// Start opens the controller's node and reads its coordinate ranges.
-func (s *Screen) Start(context.Context) error {
-	dev, err := input.Find(deviceName)
-	if err != nil {
-		return fmt.Errorf("touch: %w", err)
-	}
-	x, errX := dev.Abs(absMTPositionX)
-	y, errY := dev.Abs(absMTPositionY)
-	if errX != nil || errY != nil || x.Max <= x.Min || y.Max <= y.Min {
-		// The panel's raw axes, from the device's hardware notes, when the controller will not say.
-		x.Min, x.Max, y.Min, y.Max = 0, int32(rawFallbackW-1), 0, int32(rawFallbackH-1)
-		slog.Warn("touch: using the documented ranges", "errX", errX, "errY", errY)
-	}
-	s.dev = dev
-	s.rawW = int(x.Max-x.Min) + 1
-	s.rawH = int(y.Max-y.Min) + 1
-	slog.Info("touchscreen open", "device", dev.Path, "raw", fmt.Sprintf("%dx%d", s.rawW, s.rawH))
-	return nil
-}
-
-func (s *Screen) Close() error {
-	if s.dev == nil {
-		return nil
-	}
-	err := s.dev.Close()
-	s.dev = nil
-	return err
-}
-
 // finger is the one contact being followed: the first slot that went down, until it lifts.
 type finger struct {
 	slot         int
@@ -177,18 +161,38 @@ type finger struct {
 	sx, sy       int // raw, where it started
 	at           time.Time
 	notched      int  // steps already reported along the vertical travel
+	axis         axis // the direction it settled on (settle)
 	swiped       bool // a notch went out, so this is not a tap
 	seenX, seenY bool
 	held         bool        // it became a hold: Drag and Release follow
 	holdTimer    *time.Timer // pending hold, stopped by movement or a lift
 }
 
-// Run reads until ctx is canceled; the node is closed from the side to end the blocking read.
-func (s *Screen) Run(ctx context.Context) error {
-	dev := s.dev
-	stop := context.AfterFunc(ctx, func() { _ = dev.Close() })
-	defer stop()
-	return s.track(ctx, dev.Path, dev.Read)
+// axis is the direction a finger settled on.
+type axis int8
+
+const (
+	unsettled axis = iota
+	vertical
+	horizontal
+	slanted // neither, clearly: never the volume, and a swipe only if it ends sideways
+)
+
+// settle decides a finger's direction from its travel so far in frame pixels, once: after that it
+// does not change, whatever the finger does. Called with s.mu held.
+func settle(f *finger, dx, dy int) {
+	if f.axis != unsettled {
+		return
+	}
+	dx, dy = abs(dx), abs(dy)
+	switch {
+	case dy >= notch && dy*lockDen >= dx*lockNum:
+		f.axis = vertical
+	case dx >= notch && dx*lockDen >= dy*lockNum:
+		f.axis = horizontal
+	case max(dx, dy) >= lockGiveUp*notch:
+		f.axis = slanted
+	}
 }
 
 // track turns the controller's events into gestures until read fails.
@@ -329,6 +333,16 @@ func (s *Screen) track(ctx context.Context, path string, read func() (input.Even
 				continue
 			}
 			s.mu.Lock()
+			// Evdev only sends coordinates that changed. A new contact may reuse
+			// either axis from the slot's previous contact.
+			if p := slots[f.slot]; p != nil {
+				if !f.seenX && p.seenX {
+					f.x, f.seenX = int(p.x), true
+				}
+				if !f.seenY && p.seenY {
+					f.y, f.seenY = int(p.y), true
+				}
+			}
 			if f.sx < 0 && f.seenX && f.seenY {
 				f.sx, f.sy = f.x, f.y
 			}
@@ -342,8 +356,12 @@ func (s *Screen) track(ctx context.Context, path string, read func() (input.Even
 
 func (s *Screen) setDown(v bool) {
 	s.mu.Lock()
+	changed := s.down != v
 	s.down = v
 	s.mu.Unlock()
+	if changed {
+		s.Down.Emit(v)
+	}
 }
 
 // landscape turns a raw panel point into the frame the screen draws in (device_*.go).
@@ -371,8 +389,8 @@ func (s *Screen) holdFired(f *finger) {
 	s.Gestures.Emit(Gesture{Kind: Hold, X: x0, Y: y0})
 }
 
-// moved reports vertical travel a notch at a time while the finger is down. "Up" on the landscape
-// screen is toward smaller landscape y.
+// moved reports vertical travel a notch at a time while the finger is down, once it has settled up
+// or down (settle). "Up" on the landscape screen is toward smaller landscape y.
 func (s *Screen) moved(f *finger) {
 	s.mu.Lock()
 	if f.held {
@@ -396,14 +414,14 @@ func (s *Screen) moved(f *finger) {
 	if f.holdTimer != nil && (abs(x1-x0) > tapMove || abs(y1-y0) > tapMove) {
 		f.holdTimer.Stop()
 	}
-	s.mu.Unlock()
-	if verticalOnly && abs(x1-x0) > abs(y1-y0) {
-		// Sideways as much as up or down: not a volume swipe, and it may yet be a sideways one.
+	settle(f, x1-x0, y1-y0)
+	if f.axis != vertical {
+		// Not settled yet, or settled on sideways or a slant: not a volume swipe.
+		s.mu.Unlock()
 		return
 	}
 	steps := (y0 - y1) / notch // positive: finger moved up
 	// Counted under the lock and sent after it: holdFired reads swiped on the hold timer's goroutine.
-	s.mu.Lock()
 	var ups, downs int
 	for f.notched < steps {
 		f.notched++
@@ -427,7 +445,9 @@ func (s *Screen) moved(f *finger) {
 }
 
 // lift is the finger leaving: a tap if it barely moved and did not stay, a horizontal swipe if it
-// traveled sideways, nothing otherwise (its vertical notches already went out).
+// settled sideways or on a slant and is clearly sideways where it lifts, nothing otherwise (its
+// vertical notches already went out). A slant is let through so that a swipe which starts at an
+// angle and then goes sideways is not lost; one settled up or down never is a sideways swipe.
 func (s *Screen) lift(f *finger) {
 	if f.sx < 0 {
 		return
@@ -443,6 +463,11 @@ func (s *Screen) lift(f *finger) {
 	x0, y0 := s.landscape(f.sx, f.sy)
 	x1, y1 := s.landscape(f.x, f.y)
 	dx, dy := x1-x0, y1-y0
+	// The last position can arrive in the frame that lifts the finger, with no report of its own.
+	s.mu.Lock()
+	settle(f, dx, dy)
+	sideways := f.axis == horizontal || f.axis == slanted
+	s.mu.Unlock()
 	held := time.Since(f.at)
 	switch {
 	// A finger that stayed put is a tap. tapHold only disqualifies one where a hold means something
@@ -451,7 +476,7 @@ func (s *Screen) lift(f *finger) {
 	// ringing alarm — did nothing anywhere on the device.
 	case !f.swiped && abs(dx) <= tapMove && abs(dy) <= tapMove && (held <= tapHold || !holdGestures):
 		s.Gestures.Emit(Gesture{Kind: Tap, X: x0, Y: y0})
-	case !f.swiped && abs(dx) >= swipeMin && abs(dx) > 2*abs(dy):
+	case !f.swiped && sideways && abs(dx) >= swipeMin && abs(dx) > 2*abs(dy):
 		k := SwipeRight
 		if dx < 0 {
 			k = SwipeLeft

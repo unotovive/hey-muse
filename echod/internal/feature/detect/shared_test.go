@@ -6,7 +6,10 @@ import (
 
 	"github.com/zserge/microwakeword"
 
+	"github.com/zserge/microwakeword/audiofrontend"
+
 	"github.com/HuskerMinion/techo5/echod/internal/feature/detect/assets"
+	"github.com/HuskerMinion/techo5/echod/internal/lib/mwwfront"
 	"github.com/HuskerMinion/techo5/echod/internal/lib/wake"
 )
 
@@ -42,7 +45,7 @@ func TestSharedFrontEndScoresExactlyAsAlone(t *testing.T) {
 		{ID: "c", Kind: wake.KindMicroWakeWord, Path: path, Config: microwakeword.Config{ModelPath: path, SlidingWindowSize: 5, FeaturesStepMs: 20}},
 	}
 
-	shared := newMicroBackend()
+	shared := newMicroBackend(false)
 	alone := map[string]*microwakeword.Detector{}
 	for _, m := range models {
 		if err := shared.load(m); err != nil {
@@ -89,7 +92,7 @@ func TestUnloadDropsAnUnusedFrontEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b := newMicroBackend()
+	b := newMicroBackend(false)
 	for id, step := range map[string]int{"a": 10, "b": 10, "c": 20} {
 		m := wake.Model{ID: id, Path: path, Config: microwakeword.Config{ModelPath: path, SlidingWindowSize: 5, FeaturesStepMs: step}}
 		if err := b.load(m); err != nil {
@@ -97,11 +100,11 @@ func TestUnloadDropsAnUnusedFrontEnd(t *testing.T) {
 		}
 	}
 	b.unload("c")
-	if _, ok := b.fronts[20]; ok || len(b.fronts) != 1 {
+	if _, ok := b.fronts[frontKey{20, false}]; ok || len(b.fronts) != 1 {
 		t.Errorf("fronts after unloading the only 20 ms model: %v", b.fronts)
 	}
 	b.unload("a")
-	if _, ok := b.fronts[10]; !ok {
+	if _, ok := b.fronts[frontKey{10, false}]; !ok {
 		t.Error("the 10 ms front end went while b still uses it")
 	}
 }
@@ -117,7 +120,19 @@ func BenchmarkMicroFeed(b *testing.B) {
 	frames := len(audio) / 160
 
 	b.Run("shared", func(b *testing.B) {
-		s := newMicroBackend()
+		s := newMicroBackend(false)
+		for _, id := range []string{"wake", "stop"} {
+			if err := s.load(wake.Model{ID: id, Path: path, Config: cfg}); err != nil {
+				b.Fatal(err)
+			}
+		}
+		for i := range b.N {
+			at := (i % frames) * 160
+			s.feed(audio[at : at+160])
+		}
+	})
+	b.Run("shared-exact", func(b *testing.B) {
+		s := newMicroBackend(true)
 		for _, id := range []string{"wake", "stop"} {
 			if err := s.load(wake.Model{ID: id, Path: path, Config: cfg}); err != nil {
 				b.Fatal(err)
@@ -144,4 +159,125 @@ func BenchmarkMicroFeed(b *testing.B) {
 			}
 		}
 	})
+}
+
+// The exact front end is what an exact backend feeds its models: each scores what a detector handed
+// mwwfront's features of the same audio directly scores, frame for frame. And it is not the old one.
+func TestExactBackendFeedsTheExactFeatures(t *testing.T) {
+	path, err := assets.Stop(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := microwakeword.Config{ModelPath: path, SlidingWindowSize: 5, FeaturesStepMs: 10}
+	b := newMicroBackend(true)
+	if err := b.load(wake.Model{ID: "stop", Path: path, Config: cfg}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := b.fronts[frontKey{10, true}].fe.(*mwwfront.Frontend); !ok {
+		t.Fatalf("an exact backend runs %T", b.fronts[frontKey{10, true}].fe)
+	}
+	cfg.ProbabilityCutoff = neverFires
+	ref, err := microwakeword.NewDetector(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fe := mwwfront.New(10)
+	audio := speechish(6)
+	var pending []int16
+	for at := 0; at+160 <= len(audio); at += 160 {
+		frame := audio[at : at+160]
+		scores, _ := b.feed(frame)
+		pending = append(pending, frame...)
+		for len(pending) >= fe.WindowSamples() {
+			ref.ProcessFeatures([][]int8{features(fe.ProcessFrame(pending[:fe.WindowSamples()]))})
+			pending = pending[fe.StepSamples():]
+		}
+		if scores["stop"] != ref.SlidingAverage() {
+			t.Fatalf("at sample %d: backend %v, mwwfront fed directly %v", at, scores["stop"], ref.SlidingAverage())
+		}
+	}
+
+	old := newMicroBackend(false)
+	old.front(frontKey{10, false})
+	if _, ok := old.fronts[frontKey{10, false}].fe.(*audiofrontend.Frontend); !ok {
+		t.Fatalf("the default backend runs %T", old.fronts[frontKey{10, false}].fe)
+	}
+}
+
+// BenchmarkFrontEnds is one 30 ms window's features on each front end: the cost per 10 ms step,
+// without the models.
+func BenchmarkFrontEnds(b *testing.B) {
+	audio := speechish(4)
+	for _, fe := range []struct {
+		name string
+		fe   featureFront
+	}{
+		{"zserge", audiofrontend.New(audiofrontend.DefaultConfig(10))},
+		{"exact", mwwfront.New(10)},
+	} {
+		b.Run(fe.name, func(b *testing.B) {
+			n := (len(audio) - 480) / 160
+			for i := range b.N {
+				at := (i % n) * 160
+				fe.fe.ProcessFrame(audio[at : at+480])
+			}
+		})
+	}
+}
+
+// A model sent from the setup page runs on the exact front end even on the default backend, next to
+// the image's word on the approximate one: two front ends for one step, each model fed its own (#352).
+func TestAnUploadedModelRunsOnTheExactFrontEnd(t *testing.T) {
+	path, err := assets.Stop(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := microwakeword.Config{ModelPath: path, SlidingWindowSize: 5, FeaturesStepMs: 10}
+	b := newMicroBackend(false)
+	if err := b.load(wake.Model{ID: "image", Path: path, Config: cfg}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.load(wake.Model{ID: "own", Path: path, Config: cfg, Uploaded: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := b.fronts[frontKey{10, true}].fe.(*mwwfront.Frontend); !ok {
+		t.Fatalf("the uploaded model's front end is %T", b.fronts[frontKey{10, true}].fe)
+	}
+	if _, ok := b.fronts[frontKey{10, false}].fe.(*audiofrontend.Frontend); !ok {
+		t.Fatalf("the image's word moved off the approximate front end: %T", b.fronts[frontKey{10, false}].fe)
+	}
+
+	// Each scores what its own front end fed directly gives: the uploaded one mwwfront's features, the
+	// image's the detector's own front end, zserge's.
+	cfg.ProbabilityCutoff = neverFires
+	exactRef, err := microwakeword.NewDetector(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	approxRef, err := microwakeword.NewDetector(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fe := mwwfront.New(10)
+	audio := speechish(6)
+	var pending []int16
+	for at := 0; at+160 <= len(audio); at += 160 {
+		frame := audio[at : at+160]
+		scores, _ := b.feed(frame)
+		approxRef.ProcessAudio(frame)
+		pending = append(pending, frame...)
+		for len(pending) >= fe.WindowSamples() {
+			exactRef.ProcessFeatures([][]int8{features(fe.ProcessFrame(pending[:fe.WindowSamples()]))})
+			pending = pending[fe.StepSamples():]
+		}
+		if scores["own"] != exactRef.SlidingAverage() || scores["image"] != approxRef.SlidingAverage() {
+			t.Fatalf("at sample %d: uploaded %v (exact alone %v), image's %v (approximate alone %v)",
+				at, scores["own"], exactRef.SlidingAverage(), scores["image"], approxRef.SlidingAverage())
+		}
+	}
+
+	b.unload("own")
+	if _, ok := b.fronts[frontKey{10, true}]; ok || len(b.fronts) != 1 {
+		t.Errorf("fronts after unloading the uploaded model: %v", b.fronts)
+	}
 }

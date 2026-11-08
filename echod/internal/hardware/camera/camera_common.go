@@ -1,4 +1,4 @@
-//go:build !dot
+//go:build !dot && !panel
 
 package camera
 
@@ -31,11 +31,12 @@ type Frame struct {
 	Seq uint64
 	At  time.Time
 
-	mu    sync.Mutex
-	raw   []byte // the sensor's frame as it came
-	rgba  *image.RGBA
-	tone  tone
-	toned bool
+	mu        sync.Mutex
+	raw       []byte      // the sensor's frame as it came
+	developed *image.RGBA // Full's picture, made once
+	rgba      *image.RGBA
+	tone      tone
+	toned     bool
 }
 
 // Image is the frame as a Width x Height picture, developed once however many ask for it.
@@ -114,10 +115,14 @@ type Camera struct {
 // ("Failed to enable CAM, GATING Mode is ON", then a power-down that unbalances the sensor's
 // regulator) however long after. Measured on a Show 8, 2026-10-04: opens at 0.15 s, 1.6 s and 72 s
 // after a short unmute all failed; a hold of the mute button for a second (Unwedge) brought the
-// camera straight back, without muting. The kernel's fix is amazon-oss android_kernel_amazon_mt8163
-// fac5c8e ("Fix camera dying when booting with privacy on"). A reboot clears it too. The 2nd gen
-// Show 5 (cronos) has another privacy driver and never gets here.
-var ErrNeedsReboot = errors.New("the camera is held off since the mute button was tapped: hold the mute button for a second, or restart the device")
+// camera straight back, without muting: after the tap the driver still holds its latch as set, so
+// the hold reads as an unmute and only says so. A boot image with tools/linux/patches 0002 and 0003
+// (v1.0.1) has the camera read the latch itself and the driver follow the tap, so nothing is left
+// to undo, and a hold there sets the latch on release like any hold with the microphones live; a
+// tap then lets it go, and the camera reads the latch afresh at its next open. Hence the hint's "if
+// that mutes". A reboot clears it too. The 2nd gen Show 5 (cronos) has another privacy driver and
+// never gets here.
+var ErrNeedsReboot = errors.New("the camera is held off since the mute button was tapped: hold the mute button for a second (if that mutes the microphones, tap it to turn them back on), or restart the device")
 
 var (
 	once   sync.Once
@@ -151,8 +156,15 @@ var errStopStuck = errors.New("the camera is still shutting down: the last strea
 // point it at something that exists everywhere and exercise the lifecycle off the device.
 var nodes = []string{"/dev/camera-isp", "/dev/kd_camera_hw", "/dev/ion", "/proc/m4u"}
 
+// muteSwitch is the privacy latch the camera obeys, failing closed when it cannot be read. It is a
+// variable so that a test off the device can stand in an unmuted one.
+var muteSwitch = privacy.Microphone
+
 // Available reports whether this device has the camera nodes.
 func Available() bool {
+	if is, there := v4l2Board(); is {
+		return there
+	}
 	for _, p := range nodes {
 		if _, err := os.Stat(p); err != nil {
 			return false
@@ -205,12 +217,18 @@ func (c *Camera) acquire(fast bool) (release func(), err error) {
 	if !Available() {
 		return nil, errors.New("no camera on this device")
 	}
-	if m, err := privacy.Microphone(); err == nil {
-		if muted, err := m.Get(); err == nil && muted {
-			return nil, errors.New("privacy is on")
-		}
+	m, err := muteSwitch()
+	if err != nil {
+		return nil, err
 	}
-	if lenscover.Get().Covered() {
+	muted, err := m.Get()
+	if err != nil {
+		return nil, err
+	}
+	if muted {
+		return nil, errors.New("privacy is on")
+	}
+	if coverClosed() {
 		return nil, errors.New("the lens cover is closed")
 	}
 	c.mu.Lock()
@@ -354,6 +372,15 @@ func (c *Camera) Snapshot(ctx context.Context) (*Frame, error) {
 	for {
 		select {
 		case f := <-got:
+			// The mute or the lens cover came between Acquire's check and the sensor: say so
+			// rather than hand out the black frame as a picture.
+			if f.Blank() {
+				why := heldOff()
+				if why == "" {
+					why = "held off"
+				}
+				return nil, errors.New("the camera is off: " + why)
+			}
 			return f, nil
 		case <-ctx.Done():
 			if err := c.startErr(mine); err != nil {
@@ -397,14 +424,15 @@ func (c *Camera) Last() *Frame {
 // run owns the hardware from start to stop. Muting while it runs powers the sensor down and hands
 // out one black frame, so a view on screen goes dark at once; unmuting brings the sensor back for
 // whoever still holds it. On the Show the mute latch cuts the camera's power as well; on the Spot the
-// mute is software, and this is the camera's half of it.
+// mute is software, and this is the camera's half of it. Closing the lens cover does the same: the
+// sensor would only stream black, which the exposure loop turns up until it is a white field.
 func (c *Camera) run(stop, stopped chan struct{}) {
 	defer close(stopped)
 	for {
-		if isMuted() {
+		if why := heldOff(); why != "" {
 			c.emit(&Frame{At: time.Now(), rgba: image.NewRGBA(image.Rect(0, 0, Width, Height))})
-			slog.Info("camera held off: muted")
-			for isMuted() {
+			slog.Info("camera held off: " + why)
+			for heldOff() != "" {
 				select {
 				case <-stop:
 					return
@@ -415,7 +443,7 @@ func (c *Camera) run(stop, stopped chan struct{}) {
 		d, err := open()
 		if err != nil {
 			if c.startFailed(err, stopped) {
-				slog.Error("camera held off by the privacy latch: hold the mute button for a second, or restart",
+				slog.Error("camera held off by the privacy latch: hold the mute button for a second, and tap it if that mutes, or restart",
 					"err", err)
 				return
 			}
@@ -434,7 +462,7 @@ func (c *Camera) run(stop, stopped chan struct{}) {
 					close(halt)
 					return
 				case <-time.After(mutePoll):
-					if isMuted() {
+					if heldOff() != "" {
 						close(halt)
 						return
 					}
@@ -496,14 +524,52 @@ func (c *Camera) startFailed(err error, stopped chan struct{}) (wedged bool) {
 // mutePoll is how often a running camera checks the mute.
 const mutePoll = 300 * time.Millisecond
 
+// coverClosed is the lens cover, a variable so a test can close it.
+var coverClosed = func() bool { return lenscover.Get().Covered() }
+
+// heldOff says what keeps the sensor off right now: the mute, the lens cover, or nothing ("").
+func heldOff() string {
+	switch {
+	case isMuted():
+		return "muted"
+	case coverClosed():
+		return "lens cover closed"
+	}
+	return ""
+}
+
 func isMuted() bool {
-	m, err := privacy.Microphone()
+	m, err := muteSwitch()
 	if err != nil {
-		return false
+		return true
 	}
 	muted, err := m.Get()
-	return err == nil && muted
+	return err != nil || muted
 }
+
+// ListenLatest hands frames to ch, one waiting at most: a newer frame replaces one not yet taken,
+// so a slow viewer skips frames but always ends on the last one. That matters when the sensor
+// stops (mute, lens cover): its last frame is the black one, and a viewer that kept the frame
+// before it would show a live-looking picture of a camera that is off. ch must have room for one.
+func (c *Camera) ListenLatest(ch chan *Frame) (cancel func()) {
+	return c.Frames.Listen(func(fr *Frame) {
+		for {
+			select {
+			case ch <- fr:
+				return
+			default:
+			}
+			select {
+			case <-ch:
+			default:
+			}
+		}
+	})
+}
+
+// Blank is whether this is the black frame sent when the sensor stops for the mute or the lens
+// cover, rather than a picture.
+func (f *Frame) Blank() bool { return f.raw == nil && f.rgba != nil }
 
 func (c *Camera) emit(f *Frame) {
 	c.mu.Lock()
@@ -521,7 +587,8 @@ func (c *Camera) setPowered(on bool) {
 }
 
 // Wedged is why the sensor cannot be opened at all, or nil. It is ErrNeedsReboot once the mute
-// latch has taken the sensor away, and nothing clears it but a reboot.
+// latch has taken the sensor away, and nothing clears it but a hold of the mute button (Unwedge) or
+// a reboot.
 func (c *Camera) Wedged() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -597,9 +664,9 @@ func (h *aeHold) heldAt(mean float64, now time.Time) bool {
 // not block.
 var Unwedged hook.Hook[struct{}]
 
-// Unwedge lets the camera be tried again: the mute button was held, which is what tells the kernel's
-// camera driver that the privacy latch is off (see ErrNeedsReboot). If it still will not open, the
-// next try finds that out again.
+// Unwedge lets the camera be tried again: the mute button was held, which on an older boot image is
+// what tells the kernel's camera driver that the privacy latch is off (see ErrNeedsReboot). If it
+// still will not open, the next try finds that out again.
 func (c *Camera) Unwedge() {
 	c.mu.Lock()
 	was := c.wedged != nil

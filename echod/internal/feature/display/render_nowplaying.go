@@ -16,24 +16,28 @@ import (
 // talk. Over it: the weather top left, the time top right, the station, the song and who plays
 // it across the middle, and what a tap does at the bottom.
 func (r *renderer) nowPlaying(s scene) {
+	if s.modernMusic {
+		r.modernNowPlaying(s)
+		return
+	}
 	rd := s.radio
 	r.background(rd)
 
 	r.cornerClockDated(s)
-	r.weatherCorner(s)
+	r.weatherCornerAt(s, false) // the time has the top right here
 
 	station := rd.Now
 	if station == "" {
 		station = rd.Chosen
 	}
 	if station == "" {
-		station = "Radio"
+		station = tr("drawer_radio")
 	}
-	label := "Radio"
+	label := tr("drawer_radio")
 	if s.paused {
-		label = "Paused"
+		label = tr("drawer_paused")
 	} else if s.playing {
-		label = "Playing"
+		label = tr("drawer_playing")
 	}
 
 	headline, sub := station, ""
@@ -106,33 +110,44 @@ func (r *renderer) lyricLines(l home.Lyric, rd home.Radio) {
 
 // transportRow is the foot of the page: the rule, back, play or pause, forward, Done and the star.
 func (r *renderer) transportRow(s scene) {
-	// A rule, then the three buttons: back, play or pause, and forward. What they do belongs to whoever
-	// is playing, so a stream Music Assistant is carrying is paused and skipped by the server.
-	draw.Draw(r.dst, image.Rect(r.margin, r.h-r.s(84), r.w-r.margin, r.h-r.s(81)), image.NewUniform(ember), image.Point{}, draw.Src)
+	// The three buttons: back, play or pause, and forward. What they do belongs to whoever is playing, so
+	// a stream Music Assistant is carrying is paused and skipped by the server. A rule used to run across
+	// here as well; the buttons' own rim and shadow separate the footer now, and it read as clutter.
 	back, play, next := r.transportButtons()
-	r.control(back, r.markBack)
+	r.footControls(play.Min.Y - r.s(10))
+	r.transportButton(back, "skip-previous", false)
 	if s.paused {
-		r.control(play, r.markPlay)
+		r.transportButton(play, "play", true)
 	} else {
-		r.control(play, r.markPause)
+		r.transportButton(play, "pause", true)
 	}
-	r.control(next, r.markNext)
+	r.transportButton(next, "skip-next", false)
+	r.musicFooter(s)
+}
 
+func (r *renderer) musicFooter(s scene) {
 	// Done, in the corner the buttons leave: the music ends and the screen goes back to the clock. A
 	// pause keeps this page up with play on it, and so does a stop from Music Assistant, which looks
 	// the same from here, so the page needs its own way out.
 	done := r.doneButton()
-	r.bevel(done, shift(ember, 16), true)
-	r.text(r.small, "Done", done.Min.X+(done.Dx()-r.width(r.small, "Done"))/2, done.Min.Y+done.Dy()/2+r.s(10), amber)
+	doneCol := r.buttonFace(done, float64(done.Dy())/2, btnSecondary)
+	// The sheet's button face, not this page's small text: a button drawn from one place has to be
+	// labeled from one place, or the same control is two sizes on two screens. The baseline is the
+	// sheet's too, from pillButton.
+	doneFace := r.faces().button
+	r.text(doneFace, tr("done"), done.Min.X+(done.Dx()-r.width(doneFace, tr("done")))/2, done.Min.Y+done.Dy()/2+r.s(8), doneCol)
 
 	// The star saves what is playing to favorites, and fills in once it has.
 	fav := r.favButton()
-	r.bevel(fav, shift(ember, 16), true)
+	r.buttonFace(fav, float64(fav.Dy())/2, btnSecondary)
+	// The icon font's star, not one drawn as a polygon: the same outline the rest of the program would
+	// draw, and filled in once the station is saved.
+	starIcon := "star-outline"
 	starColor := color.RGBA{0x9a, 0x8c, 0x7a, 0xff}
 	if s.faved {
-		starColor = amber
+		starIcon, starColor = "star", amber
 	}
-	r.star(fav.Min.X+fav.Dx()/2, fav.Min.Y+fav.Dy()/2, r.s(17), starColor)
+	r.iconIn(fav, starIcon, transportIcon, starColor)
 }
 
 // favButton is the star, beside Done.
@@ -162,48 +177,32 @@ func (r *renderer) transportButtons() (back, play, next image.Rectangle) {
 	return back, play, next
 }
 
-// control paints one of the three, with its mark in the middle.
-func (r *renderer) control(b image.Rectangle, mark func(x, top int)) {
-	r.bevel(b, shift(ember, 16), true)
-	mark(b.Min.X+b.Dx()/2-r.s(18), b.Min.Y+r.s(9))
-}
+// transportIcon is the size a transport icon is drawn at, the size the media sheet draws these same
+// controls at: small enough for the strip's circles and the page's pills both. closeIcon is the cross on
+// the strip's way out, a smaller button than the three.
+const (
+	transportIcon = 32
+	closeIcon     = 20
+)
 
-// The marks are 36 rows high from x and top at the Show 5's width, drawn as rows the way this panel has
-// always drawn its play mark. Sizes go through s() so a wider panel gets marks to match its buttons.
-
-func (r *renderer) markBack(x, top int) {
-	r.markTriangle(x+r.s(14), top, r.s(30), false)
-	r.markBar(x, top)
-}
-
-func (r *renderer) markNext(x, top int) {
-	r.markTriangle(x, top, r.s(30), true)
-	r.markBar(x+r.s(44), top)
-}
-
-func (r *renderer) markPlay(x, top int) { r.markTriangle(x, top, r.s(36), true) }
-
-func (r *renderer) markPause(x, top int) {
-	r.markBar(x, top)
-	r.markBar(x+r.s(19), top)
-}
-
-func (r *renderer) markBar(x, top int) {
-	mark := image.Rect(x, top, x+r.s(11), top+r.s(36))
-	draw.Draw(r.dst, mark, image.NewUniform(amber), image.Point{}, draw.Src)
-}
-
-// markTriangle draws a triangle pointing right or left, widest in the middle.
-func (r *renderer) markTriangle(x, top, size int, right bool) {
-	for i := 0; i < size; i++ {
-		half := min(i, size-1-i)
-		w := half*3/2 + 1
-		x0 := x
-		if !right {
-			x0 = x + (size/2)*3/2 + 1 - w
-		}
-		draw.Draw(r.dst, image.Rect(x0, top+i, x0+w, top+i+1), image.NewUniform(amber), image.Point{}, draw.Src)
+// transportButton draws one of the transport controls: the button the rest of the program draws, in the
+// accent for the one in the middle, with the icon font's mark for that control. The names are the media
+// sheet's, so the two screens show the same three buttons — and a glyph from the font is antialiased at
+// any size, which the rows this page used to paint its own marks from were not.
+func (r *renderer) transportButton(b image.Rectangle, icon string, accent bool) {
+	style := btnSecondary
+	if accent {
+		style = btnPrimary
 	}
+	col := r.buttonFace(b, float64(b.Dy())/2, style)
+	r.iconIn(b, icon, transportIcon, col)
+}
+
+// iconIn draws an icon-font glyph centered in b: the one place the transport marks, the star and the
+// strip's cross take their position from. mdiIconIn does it by the glyph's own ink, which is the only
+// thing that works for icons whose ink does not sit where a font's baseline puts text.
+func (r *renderer) iconIn(b image.Rectangle, name string, size int, col color.RGBA) {
+	r.mdiIconIn(name, b, size, col)
 }
 
 // background paints the picture behind the now-playing text, toned down so the text reads.
@@ -216,27 +215,27 @@ func (r *renderer) background(rd home.Radio) {
 		if rd.Logo {
 			alpha = 120
 		}
-		wash := color.RGBA{walnut.R, walnut.G, walnut.B, alpha}
-		draw.Draw(r.dst, r.dst.Rect, image.NewUniform(wash), image.Point{}, draw.Over)
+		washOver(r.dst, r.dst.Rect, washOf(walnut, alpha))
 		return
 	}
 	// No picture from the service: a drawn one, faint, on the right where the text is not.
 	r.faded(28, func() {
-		cx, cy := r.w-260, r.h/2
+		s := r.s
+		cx, cy := r.w-s(260), r.h/2
 		if rd.Music {
 			// Two notes: heads, stems and a beam.
-			r.disc(cx-70, cy+90, 34, amber)
-			r.disc(cx+80, cy+70, 34, amber)
-			r.stroke(cx-42, cy+80, cx-42, cy-120, 14, amber)
-			r.stroke(cx+108, cy+60, cx+108, cy-140, 14, amber)
-			r.stroke(cx-48, cy-120, cx+114, cy-140, 30, amber)
+			r.disc(cx-s(70), cy+s(90), s(34), amber)
+			r.disc(cx+s(80), cy+s(70), s(34), amber)
+			r.stroke(cx-s(42), cy+s(80), cx-s(42), cy-s(120), s(14), amber)
+			r.stroke(cx+s(108), cy+s(60), cx+s(108), cy-s(140), s(14), amber)
+			r.stroke(cx-s(48), cy-s(120), cx+s(114), cy-s(140), s(30), amber)
 			return
 		}
 		// Talk: rings going out from a transmitter dot, largest first so each ring shows.
 		for _, rad := range []int{190, 130, 70} {
-			r.disc(cx, cy, rad+9, amber)
-			r.disc(cx, cy, rad-9, walnut)
+			r.disc(cx, cy, s(rad+9), amber)
+			r.disc(cx, cy, s(rad-9), walnut)
 		}
-		r.disc(cx, cy, 22, amber)
+		r.disc(cx, cy, s(22), amber)
 	})
 }

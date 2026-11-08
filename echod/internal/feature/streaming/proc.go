@@ -33,29 +33,44 @@ type program struct {
 	env    []string
 	cred   *syscall.Credential
 	keep   func(line string) bool
+
+	// started, when set, is told each time the program is about to start, the first time and again.
+	started func()
 }
 
 // supervise runs p until ctx ends, starting it again whenever it stops.
-func supervise(ctx context.Context, p program) {
+func supervise(ctx context.Context, p program) { superviseTries(ctx, p, 0) }
+
+// superviseTries is supervise, but gives up once p has stopped soon after starting (within ranLong) tries
+// times in a row, and says whether it did; with tries 0 it never does.
+func superviseTries(ctx context.Context, p program, tries int) (gaveUp bool) {
 	wait := restartFirst
+	quick := 0
 	for ctx.Err() == nil {
+		if p.started != nil {
+			p.started()
+		}
 		start := time.Now()
 		err := runProgram(ctx, p)
 		if ctx.Err() != nil {
-			return
+			return false
 		}
 		slog.Warn("streaming: a program stopped", "program", p.name, "after", time.Since(start).Round(time.Second), "err", err)
 		if time.Since(start) > ranLong {
-			wait = restartFirst
+			wait, quick = restartFirst, 0
 		} else {
-			wait = min(wait*2, restartMost)
+			wait, quick = min(wait*2, restartMost), quick+1
+		}
+		if tries > 0 && quick >= tries {
+			return true
 		}
 		select {
 		case <-ctx.Done():
-			return
+			return false
 		case <-time.After(wait):
 		}
 	}
+	return false
 }
 
 // runProgram runs p once, until it stops or ctx ends. Asked to stop, it gets a moment to say goodbye
@@ -120,7 +135,12 @@ type logLines struct {
 	name string
 	keep func(string) bool
 	part []byte
+	seen map[string]time.Time // when each kept line was last logged
 }
+
+// keptEvery is how often the same kept line is logged again: librespot unable to play skips to the
+// next track and fails again, many times a second.
+const keptEvery = 30 * time.Second
 
 func (l *logLines) Write(p []byte) (int, error) {
 	l.part = append(l.part, p...)
@@ -132,13 +152,37 @@ func (l *logLines) Write(p []byte) (int, error) {
 		line := strings.TrimRight(string(l.part[:i]), "\r")
 		l.part = l.part[i+1:]
 		if line != "" && (l.keep == nil || l.keep(line)) {
-			slog.Debug("streaming: program says", "program", l.name, "line", clip(line, 300))
+			l.log(line, time.Now())
 		}
 	}
 	if len(l.part) > 4096 {
 		l.part = l.part[:0]
 	}
 	return len(p), nil
+}
+
+// log puts a line in the daemon's log. A program that filters what it says (librespot) is left with its
+// warnings and errors, which go in at Warn, where the log a user sends shows them: each line once in
+// keptEvery, its time stamp aside. Everything else is Debug.
+func (l *logLines) log(line string, now time.Time) {
+	if l.keep == nil {
+		slog.Debug("streaming: program says", "program", l.name, "line", clip(line, 300))
+		return
+	}
+	key := line
+	if strings.HasPrefix(key, "[") {
+		if i := strings.IndexByte(key, ' '); i > 0 {
+			key = key[i+1:]
+		}
+	}
+	if at, ok := l.seen[key]; ok && now.Sub(at) < keptEvery {
+		return
+	}
+	if l.seen == nil || len(l.seen) > 64 {
+		l.seen = map[string]time.Time{}
+	}
+	l.seen[key] = now
+	slog.Warn("streaming: program says", "program", l.name, "line", clip(line, 300))
 }
 
 func indexByte(b []byte, c byte) int {

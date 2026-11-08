@@ -1,4 +1,4 @@
-//go:build !dot && !spot
+//go:build !dot && !spot && !panel
 
 package privacy
 
@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/HuskerMinion/techo5/echod/internal/layout"
+	"github.com/HuskerMinion/techo5/echod/internal/lib/input"
 )
 
 // The Echo Show 5 exposes its mute through the gpio-privacy platform driver rather than a bare
@@ -33,6 +34,12 @@ import (
 // write-only, as on checkers. Whether its button also only releases has not been measured — that
 // needs a finger on the unit while a capture is open — so it is assumed to match the driver it
 // shares. If it turns out to set the latch itself, gating() is the one place to correct.
+//
+// The 2nd gen Show 8 (athena) is the 2nd gen Show 5's arrangement under Amazon's own kernel: the
+// gpio-privacy driver at the same path, with gpio-privacy-state and gpio-privacy-button input devices
+// and an enable line pulsed for 1000 ms. Read off the unit 2026-10-14: the state line goes low when
+// muted, which the driver reports as the latch set, and the red light follows it in hardware. That
+// the driver's state and enable files read and pulse there as they do on cronos is not yet checked.
 var (
 	dir    = latchDir()
 	state  = dir + "/state"
@@ -111,7 +118,64 @@ type noLED struct{}
 func (noLED) SetBright(bool) error  { return nil }
 func (noLED) Bright() (bool, error) { return true, nil }
 
+// TECHO5's mainline kernel on the 2nd gen Show 8 has no gpio-privacy driver: the hardware latch's
+// state line (GPIO63) is a gpio-keys switch, SW_MUTE_DEVICE, 1 while muted (seen 2026-10-15: 1 on the
+// first press, 0 on the second). The enable line that lets software flip the latch (GPIO159) is not
+// driven from mainline yet, so only the button mutes there.
+const swMuteDevice = 0x0e
+
+type mainlineMute struct{}
+
+func (mainlineMute) Get() (bool, error) {
+	dev, err := input.Find("gpio-keys")
+	if err != nil {
+		return false, fmt.Errorf("privacy: %w", err)
+	}
+	defer dev.Close()
+	return dev.Switch(swMuteDevice)
+}
+
+func (mainlineMute) HardwareActs(bool) bool { return true }
+
+func (mainlineMute) Lag() time.Duration { return toggleLag }
+
+func (m mainlineMute) Set(muted bool) error {
+	is, err := m.Get()
+	if err != nil {
+		return err
+	}
+	if is == muted {
+		return nil
+	}
+	if !muted {
+		return ErrButtonOnly
+	}
+	return errors.New("privacy: muting from software is not on the mainline kernel yet; use the button")
+}
+
+func (m mainlineMute) Toggle() (bool, error) {
+	is, err := m.Get()
+	if err != nil {
+		return false, err
+	}
+	return !is, m.Set(!is)
+}
+
+// boardMute, where a board of this build sets it, is its mute, ahead of every latch below: software{}
+// for a board with neither a mute button nor a switch. Nil on every Show.
+var boardMute Mute
+
 func platformMute() (Mute, error) {
+	if boardMute != nil {
+		return boardMute, nil
+	}
+	if layout.Skylight() {
+		// No microphone, so no latch and nothing to mute.
+		return nil, fmt.Errorf("privacy: this device has no microphone to mute")
+	}
+	if layout.AthenaMainline() {
+		return mainlineMute{}, nil
+	}
 	if !present(state) {
 		return nil, fmt.Errorf("privacy: %s is missing", state)
 	}
@@ -130,6 +194,11 @@ func reads(path, value string) (bool, error) {
 	return strings.TrimSpace(string(b)) == value, nil
 }
 
-// Nothing to seed: the hardware holds the microphones, and the saved state reaches the latch through
-// the mute feature. See privacy.Seed.
-func seedSoftwareCut(bool) {}
+// Nothing to seed where the hardware holds the microphones: the saved state reaches the latch through
+// the mute feature. A board whose mute is the software one (boardMute) is seeded as the Spot is, so a
+// mute saved from last time is in force before capture opens. See privacy.Seed.
+func seedSoftwareCut(muted bool) {
+	if _, soft := boardMute.(software); soft {
+		softwareCut.Store(muted)
+	}
+}

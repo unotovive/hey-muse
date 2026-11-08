@@ -11,9 +11,6 @@ import (
 	"time"
 
 	"golang.org/x/image/font"
-	"golang.org/x/image/font/gofont/gobold"
-	"golang.org/x/image/font/gofont/goregular"
-	"golang.org/x/image/font/opentype"
 
 	"github.com/HuskerMinion/techo5/echod/internal/config"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/alarm"
@@ -22,6 +19,7 @@ import (
 	"github.com/HuskerMinion/techo5/echod/internal/feature/home"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/media"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/mute"
+	"github.com/HuskerMinion/techo5/echod/internal/feature/ring"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/security"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/sendspin"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/timer"
@@ -40,55 +38,38 @@ const deviceModel = "Echo Spot"
 // themeRows are none: the Spot has its own colors and no themes.
 func themeRows() []settingRow { return nil }
 
+// calendarLookRows are none: the Spot's calendar is its own Today and Next (calendar_spot.go), with
+// nothing of the Show's calendar page to set.
+func calendarLookRows() []settingRow { return nil }
+
 // deviceCard, devicePicker, deviceChoose and deviceRowTap are the Show's own cards, lists and rows;
 // the Spot has none of its own.
 func deviceCard(sheetView) (cardView, bool)             { return cardView{}, false }
 func devicePicker(string, sheetView) (pickerView, bool) { return pickerView{}, false }
 func (d *Display) deviceChoose(string, int)             {}
 
-// deviceRowTap is a tap on one of the Spot's own rows: Forget, which asks twice.
-func (d *Display) deviceRowTap(id string, _ part, _ int) bool {
-	if id != "btforget" {
-		return false
-	}
-	d.mu.Lock()
-	armed := !d.forgetArm.IsZero() && time.Since(d.forgetArm) < restartWindow
-	d.forgetArm = time.Time{}
-	if !armed {
-		d.forgetArm = time.Now()
-	}
-	d.mu.Unlock()
-	if armed {
-		go btaudio.Get().Forget()
-	}
-	return true
-}
+// deviceRowTap is a tap on one of the Spot's own rows, of which it has none (Forget is every
+// device's: forgetRow).
+func (d *Display) deviceRowTap(string, part, int) bool { return false }
 
 // swatchStrip is the custom colors row, which the Spot has no use for.
 func (r *paint) swatchStrip(settingRow, int, int, int) {}
 
-// openSettings puts the settings screen up on its six categories. Called with d.mu held.
+// openSettings puts the settings screen up on its six categories. The settings lock does not keep it
+// shut: the rows behind the lock ask for the PIN as they are tapped (gate, pin.go). Called with d.mu
+// held.
 func (d *Display) openSettings() {
-	if security.Locked() {
-		// The settings lock: the PIN pad first, and the settings once the PIN is right.
-		d.closeMenu()
-		openPIN(func() {
-			d.mu.Lock()
-			d.openSettingsNow()
-			d.mu.Unlock()
-			d.wake()
-		})
-		return
-	}
-	d.openSettingsNow()
-}
-
-// openSettingsNow is openSettings past the lock. Called with d.mu held.
-func (d *Display) openSettingsNow() {
 	d.closeMenu()
 	d.sheetOpen, d.sheetGrid, d.sheetAt = true, true, time.Now()
 	d.picker, d.cardScroll, d.pickScroll, d.draft, d.dragging = "", 0, 0, nil, false
 	d.followFingers(true)
+}
+
+// sheetUp is whether the settings screen is showing.
+func (d *Display) sheetUp() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.sheetOpen
 }
 
 // closeSheet takes the settings screen down, back to the face.
@@ -132,18 +113,22 @@ func (d *Display) showForecast() {
 // restartNow restarts the device.
 func restartNow() { restartDevice() }
 
-// nightRowLabel is what the Display card calls the night setting: the Spot dims at night rather
-// than going dark.
-const nightRowLabel = "Dim at night"
+// atNightChoices are what the night does to the Spot's face: dims it (nightCeiling), leaves only the
+// red clock (render_night_spot.go), or puts it out, as the Show's Screen off does (night_spot.go).
+var atNightChoices = []atNightChoice{{"Dim", false, false, false}, {"Night clock", true, true, false}, {"Screen off", false, false, true}}
 
-// hasNightLight is the Show's choice of a night light or a dark screen; the Spot's night only dims.
-const hasNightLight = false
+// atNightSub is what the At night row says under its name.
+const atNightSub = "Dim, a red clock, or dark"
 
 // hasCalendarPopups: not on the Spot yet.
 const hasCalendarPopups = false
 
 // hasDimmest: the Spot's auto-brightness keeps its own floor (display_spot.go), with no setting.
 const hasDimmest = false
+
+// setIdleDim is nothing on the Spot: Dim after idle is the Show's (idle_dim_show.go), and its row is
+// never offered here (hasDimmest).
+func (d *Display) setIdleDim(int) {}
 
 func dimmestSetting() int          { return 0 }
 func (d *Display) stepDimmest(int) {}
@@ -160,31 +145,38 @@ func adaptRows(rows []settingRow, sv sheetView) []settingRow {
 			row.value = ""
 		case row.id == "slideshow":
 			row.sub = "" // its choice needs the room
-		case row.id == "ringvol" && row.value == "Silent":
-			row.sub = "No sound at all"
+		case row.id == "ringvol" && ring.Level() == 0:
+			row.sub = tr("ui_no_sound_at_all")
 		case row.id == "ringvol":
-			row.sub = "Not the music's"
+			row.sub = tr("ui_not_the_music_s")
 		case row.id == "musicstrip":
 			continue // the strip is the Show's; the round face has no clock page under it to share
+		case row.id == "musiclayout":
+			continue // the layout is for the rectangular page
 		case row.id == "lyrics":
 			continue // the words need the Show's page; the round face has room for the song alone
 		case row.id == "wakesens":
-			row.label = "Sensitivity"
+			row.label = tr("spot_threshold")
+		case row.id == "wakesensplaying":
+			// Under Threshold on the round face, "Playing" says which it is in the room there is.
+			row.label, row.sub = tr("drawer_playing"), tr("wake_word_threshold_playing")
 		case row.id == "output":
-			row.sub = "With headphones in"
+			row.sub = tr("ui_with_headphones_in")
 		case row.id == "sendspin":
 			row.label = "Music Assistant"
+		case row.id == "btsc":
+			row.label, row.sub = tr("ui_secure_connections"), tr("ui_off_if_a_phone_pairs_then_drops")
 		case row.id == "screenweb":
-			row.label = "Screen on network"
+			row.label = tr("screen_on_network")
 		case row.id == "camweb":
-			row.label = "Camera on network"
+			row.label = tr("camera_on_network")
 		case row.id == "talkback":
-			row.label, row.sub = "Talk to cameras", "Talk on camera page"
+			row.label, row.sub = tr("ui_talk_to_cameras"), tr("ui_talk_on_camera_page")
 		case row.id == "e.days":
 			row.label = ""
 		case row.id == "updates":
-			check := settingRow{id: "updatecheck", label: "Check for updates", sub: row.sub, kind: ctlButton, button: row.button}
-			row.label, row.sub, row.button = "Update channel", "", ""
+			check := settingRow{id: "updatecheck", label: tr("ui_check_for_updates"), sub: row.sub, kind: ctlButton, button: row.button}
+			row.label, row.sub, row.button = tr("update_channel"), "", ""
 			out = append(out, row, check)
 			continue
 		case row.kind == ctlChoice:
@@ -193,14 +185,6 @@ func adaptRows(rows []settingRow, sv sheetView) []settingRow {
 			row.sub, row.value = row.value, ""
 		}
 		out = append(out, row)
-		if row.id == "bt" {
-			// The Spot could always forget its speaker from the screen; asks twice.
-			forget := settingRow{id: "btforget", label: "Forget " + row.label, sub: "Asks twice", kind: ctlDanger, button: "Forget"}
-			if !sv.st.forgetArm.IsZero() && sv.now.Sub(sv.st.forgetArm) < restartWindow {
-				forget.sub, forget.button = "Tap again to forget it", "Confirm"
-			}
-			out = append(out, forget)
-		}
 	}
 	return out
 }
@@ -211,23 +195,36 @@ func init() {
 	// Empty is the default night here (defaultNight), so Never needs a value of its own, which
 	// inNight reads as no night; the default is offered as a choice of its own.
 	nightPresets = []string{"off", defaultNight, "22-6", "23-6", "0-7", "21-7", "23-8"}
-	categoryBlurbs[catDisplay] = "Brightness, night, clock and photos"
-	categoryBlurbs[catSecurity] = "Remote access and security"
+	categoryBlurbs[catDisplay] = tr("ui_brightness_night_clock_and_photos")
+	categoryBlurbKeys[catDisplay] = "ui_brightness_night_clock_and_photos"
+	categoryBlurbs[catSecurity] = tr("ui_remote_access_and_security")
+	categoryBlurbKeys[catSecurity] = "ui_remote_access_and_security"
 }
 
-// spotFaces are the settings screen's text sizes on the round panel, a size down from the Show's.
-var spotFaces = sync.OnceValue(func() *sheetFaces {
-	bold, _ := opentype.Parse(gobold.TTF)
-	regular, _ := opentype.Parse(goregular.TTF)
-	f := func(fn *opentype.Font, size float64) font.Face {
-		fc, _ := newTextFace(fn, &opentype.FaceOptions{Size: size, DPI: 72, Hinting: font.HintingFull})
+// spotFaceCache is spotFaces' faces, per font.
+var spotFaceCache struct {
+	mu    sync.Mutex
+	faces map[fontKey]*sheetFaces
+}
+
+// spotFaces are the settings screen's text sizes on the round panel, a size down from the Show's, in
+// the font k names; made once per font.
+func spotFaces(k fontKey) *sheetFaces {
+	spotFaceCache.mu.Lock()
+	defer spotFaceCache.mu.Unlock()
+	if fc, ok := spotFaceCache.faces[k]; ok {
 		return fc
 	}
-	return &sheetFaces{
-		header: f(bold, 30), label: f(regular, 24), labelBold: f(bold, 24), sub: f(regular, 16),
-		value: f(regular, 20), nav: f(regular, 20), navBold: f(bold, 20), button: f(bold, 19),
+	f := func(bold bool, size float64) font.Face { return k.face(bold, size) }
+	fc := &sheetFaces{
+		header: f(true, 30), label: f(false, 24), labelBold: f(true, 24), sub: f(false, 16),
+		value: f(false, 20), nav: f(false, 20), navBold: f(true, 20), button: f(true, 19),
+		labelSm: f(false, 21), labelBoldSm: f(true, 21), valueSm: f(false, 18),
 	}
-})
+	spotFaceCache.faces = roomFor(spotFaceCache.faces, k)
+	spotFaceCache.faces[k] = fc
+	return fc
+}
 
 // The round card's frame: rows between spotListTop and spotListBottom, their labels and controls
 // between spotCardLeft and spotCardRight (where the circle is wide enough for both), and its
@@ -273,7 +270,7 @@ func (r *roundRenderer) centeredText(face font.Face, s string, baseline int, c c
 // raised in the accent, and Done.
 func (r *roundRenderer) categoryTiles(sel category) {
 	fc := r.faces()
-	r.centeredText(fc.header, "Settings", 70, cream)
+	r.centeredText(fc.header, tr("settings"), 70, cream)
 	const tw, th, gap = 142, 96, 12
 	x0, y0 := center-tw-gap/2, 96
 	for c := category(0); c < categories; c++ {
@@ -291,14 +288,14 @@ func (r *roundRenderer) categoryTiles(sel category) {
 			r.roundHighlight(b, 20)
 		}
 		r.paint.icon(c, b.Min.X+tw/2, b.Min.Y+36, fg)
-		name := categoryNames[c]
+		name := tr(categoryNameKeys[c])
 		r.paint.text(fc.navBold, name, b.Min.X+(tw-r.paint.width(fc.navBold, name))/2, b.Min.Y+78, fg)
 		r.addZone(zone{r: b.Inset(-gap / 2), kind: zoneCat, cat: c})
 	}
 	done := image.Rect(center-62, 424, center+62, 460)
 	r.roundFill(done, 18, surface(4), surface(3))
 	r.roundStroke(done, 18, 1, ember)
-	r.centeredText(fc.button, "Done", 449, cream)
+	r.centeredText(fc.button, tr("done"), 449, cream)
 	r.addZone(zone{r: done.Inset(-8), kind: zoneDone})
 }
 
@@ -327,17 +324,17 @@ func (r *roundRenderer) roundCard(v cardView) int {
 // cardButtons are the card's buttons, side by side at its foot: Back, and the card's own action (Add
 // on the Alarms card); the alarm editor has Cancel and Save instead.
 func (r *roundRenderer) cardButtons(actions []headerAction) {
-	buttons := []headerAction{{id: "back", label: "‹  Back", style: btnSecondary}}
+	buttons := []headerAction{{id: "back", label: tr("ui_back"), style: btnSecondary}}
 	for _, a := range actions {
 		if a.id == "cancel" {
-			buttons = []headerAction{{id: "cancel", label: "Cancel", style: btnSecondary}, {id: "save", label: "Save", style: btnPrimary}}
+			buttons = []headerAction{{id: "cancel", label: tr("cancel"), style: btnSecondary}, {id: "save", label: tr("ui_save"), style: btnPrimary}}
 			break
 		}
 	}
 	if len(buttons) == 1 && len(actions) > 0 {
 		a := actions[0]
 		if a.id == "add" {
-			a.label = "+  Add"
+			a.label = tr("ui_add_alarm")
 		}
 		buttons = append(buttons, a)
 	}
@@ -386,7 +383,7 @@ func (r *roundRenderer) roundList(p pickerView, scroll int) int {
 			r.roundFill(b, 16, surface(5), surface(4))
 		}
 		r.paint.text(fc.value, r.fit(fc.value, o, b.Dx()-60), b.Min.X+20, b.Min.Y+b.Dy()/2+7, fg)
-		r.addZone(zone{r: image.Rect(left, y0, right, y0+optH).Intersect(list), kind: zoneOption, opt: i})
+		r.addZone(zone{r: image.Rect(left, y0, right, y0+optH).Intersect(list), kind: zoneOption, opt: i, label: p.title})
 	}
 	if maxScroll > 0 {
 		r.restore(under, image.Rect(list.Min.X, 0, list.Max.X, list.Min.Y))
@@ -405,6 +402,7 @@ func (d *Display) sheetGesture(g touch.Gesture) {
 	d.mu.Lock()
 	d.sheetAt = time.Now()
 	d.mu.Unlock()
+	stillHere()
 	switch g.Kind {
 	case touch.Hold:
 		d.mu.Lock()
@@ -450,9 +448,9 @@ func (d *Display) sheetGesture(g touch.Gesture) {
 			id := d.picker
 			d.picker = ""
 			d.mu.Unlock()
-			d.choose(id, z.opt)
+			d.tapOption(id, z.label, z.opt)
 		case zoneRow:
-			d.rowTap(z.id, z.part, z.opt)
+			d.tapRow(z)
 		}
 	}
 	d.wake()
@@ -487,14 +485,15 @@ func (d *Display) sheetView(now time.Time) sheetView {
 	st.version = layout.Version
 	st.night = cmpOr(c.Screen.Night, defaultNight)
 	st.address = deviceAddress()
-	st.wifiName = "Connected"
+	st.wifiName = tr("wifi_connected")
 	if st.address == "" || st.address == "-" {
-		st.wifiName = "Not connected"
+		st.wifiName = tr("not_connected")
 	}
 	st.slot = bootedSlot()
 	st.sendspin = sendspin.Get().Enabled()
 	st.insecureTLS = c.Diag.InsecureTLS
 	st.btProxy = bluetooth.Get().Enabled()
+	st.btSCOff, st.btSCFixed = c.Bluetooth.SecureConnectionsOff, !btaudio.Get().SecureConnectionsHere()
 	if st.demo {
 		st.name, st.address, st.weather = "Kitchen", "192.168.1.50", "Home"
 	}
@@ -526,28 +525,12 @@ func (d *Display) OpenSheet(name string) bool {
 	if !ok && !grid {
 		return false
 	}
-	open := func() {
-		d.openSettingsNow()
-		if !grid {
-			d.cat, d.sheetGrid = cat, false
-		}
-	}
-	if security.Locked() {
-		// The PIN first, then the settings on the page asked for. Called back without d.mu.
-		d.mu.Lock()
-		d.closeMenu()
-		d.mu.Unlock()
-		openPINRemote(func() {
-			d.mu.Lock()
-			open()
-			d.mu.Unlock()
-			d.wake()
-		})
-		d.wake()
-		return true
-	}
+	// Asked for from Home Assistant or by voice, the rows behind the lock ask for the PIN all the same.
 	d.mu.Lock()
-	open()
+	d.openSettings()
+	if !grid {
+		d.cat, d.sheetGrid = cat, false
+	}
 	d.mu.Unlock()
 	d.wake()
 	return true
@@ -560,3 +543,5 @@ func (d *Display) Demo(for_ time.Duration) {
 	d.mu.Unlock()
 	d.wake()
 }
+
+func atNightSubText() string { return tr("night_description_spot") }

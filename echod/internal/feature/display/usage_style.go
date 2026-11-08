@@ -98,8 +98,8 @@ func untilReset(d time.Duration) string {
 	}
 }
 
-// since is how long ago a board came, in the largest unit that fits.
-func since(d time.Duration) string {
+// usageSince is how long ago a board came, in the largest unit that fits.
+func usageSince(d time.Duration) string {
 	switch {
 	case d >= 48*time.Hour:
 		return fmt.Sprintf("%d days ago", int(d/(24*time.Hour)))
@@ -150,7 +150,7 @@ func (r *renderer) usageStyle(s scene) {
 
 	note, ink := board.Note, usageAccent
 	if age := s.now.Sub(board.At); age >= usageStale {
-		note, ink = "Updated "+since(age), usageFaint
+		note, ink = "Updated "+usageSince(age), usageFaint
 	} else if note != "" {
 		note = "* " + note
 	}

@@ -66,11 +66,19 @@ func (u *Firmware) autoLoop(ctx context.Context) {
 		}
 		now := time.Now()
 		playing, _ := media.Get().Playing()
-		busy := playing || ring.IsSounding() || update.Installing()
+		// First run still pending is somebody partway through setting the device up (feature/firstrun):
+		// it waits until they are done, so nothing restarts under them.
+		busy := playing || ring.IsSounding() || update.Installing() || config.Get().FirstRunPending()
 		if !autoDue(config.Get().Update.AutoInstall, now, tried, busy) {
 			continue
 		}
 		tried = now.Format("2006-01-02")
+		if !update.Published() {
+			// A panel's app looks and installs in one go (askApp), and installs nothing that is not newer.
+			slog.Info("asking the app to install an update by itself, overnight")
+			u.Install(ctx)
+			continue
+		}
 		u.Check(ctx)
 		if v := u.Offered(); v != "" {
 			slog.Info("installing an update by itself, overnight", "version", v)

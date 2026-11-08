@@ -36,6 +36,10 @@ type Dashboard struct {
 	// Tiles is how big a drawn dashboard's tiles are on the Show: empty for the usual size, "large",
 	// or "fill", which lays a view of a few tiles out over the whole screen.
 	Tiles string `json:"tiles,omitempty"`
+
+	// Layout is how a drawn dashboard's tile sets its badge and words on the Show: empty for the name
+	// beside the badge, or "below", the badge and state along the top and the name under them.
+	Layout string `json:"layout,omitempty"`
 }
 
 // DashboardChoice is one dashboard view: how a list names it, and its path.
@@ -51,11 +55,14 @@ const (
 	DashboardOff      DashboardMode = ""
 	DashboardDrawn    DashboardMode = "drawn"
 	DashboardStreamed DashboardMode = "streamed"
+	// DashboardTessera is the layout the Tessera add-on sent the screen (feature/tessera), on the Show.
+	DashboardTessera DashboardMode = "tessera"
 )
 
-// DashboardModes is every mode, in the order a list shows them.
+// DashboardModes is every mode, in the order a list shows them. Not every device offers every one
+// (dashboard.Modes).
 func DashboardModes() []DashboardMode {
-	return []DashboardMode{DashboardOff, DashboardDrawn, DashboardStreamed}
+	return []DashboardMode{DashboardOff, DashboardDrawn, DashboardStreamed, DashboardTessera}
 }
 
 // Label is how Home Assistant and the screen name a mode.
@@ -65,6 +72,8 @@ func (m DashboardMode) Label() string {
 		return "Drawn on the device"
 	case DashboardStreamed:
 		return "Streamed"
+	case DashboardTessera:
+		return "Tessera"
 	}
 	return "Off"
 }
@@ -103,6 +112,10 @@ func (w DashboardWriter) ReturnAfter(seconds int) error {
 
 func (w DashboardWriter) Tiles(v string) error {
 	return w.st.Update(func(c *Config) { c.Dashboard.Tiles = v })
+}
+
+func (w DashboardWriter) Layout(v string) error {
+	return w.st.Update(func(c *Config) { c.Dashboard.Layout = v })
 }
 
 // Return is how long a dashboard opened by hand stays up untouched; ok is false when it

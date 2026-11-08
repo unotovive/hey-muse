@@ -5,6 +5,8 @@ package display
 import (
 	"fmt"
 	"image"
+	"image/color"
+	"image/draw"
 	"image/png"
 	"os"
 	"path/filepath"
@@ -14,7 +16,10 @@ import (
 	"github.com/HuskerMinion/techo5/echod/internal/config"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/alarm"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/announce"
+	"github.com/HuskerMinion/techo5/echod/internal/feature/btaudio"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/home"
+	"github.com/HuskerMinion/techo5/echod/internal/feature/media"
+	"github.com/HuskerMinion/techo5/echod/internal/feature/notify"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/phone"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/remind"
 	"github.com/HuskerMinion/techo5/echod/internal/lib/hass"
@@ -28,12 +33,17 @@ const (
 	// The Echo Show 8's panel, which draws the same layout scaled.
 	show8Wide = 1280
 	show8High = 800
+
+	// The Skylight Calendar 15's panel: twice the Show 5's width, 16:9.
+	skylightWide = 1920
+	skylightHigh = 1080
 )
 
 // Every scene draws without panicking; with SHOW_PREVIEW set to a directory, each is written there
 // as a PNG to look at. The Spot has had this since its screen was built (render_spot_test.go); the
 // Show never did, so a change to its layout was argued about in words.
 func TestShowScenesDraw(t *testing.T) {
+	previewFont(t)
 	at := time.Date(2026, 9, 16, 14, 7, 0, 0, time.Local)
 	sky := home.Weather{Condition: "partlycloudy", Temp: "72°"}
 	var week []hass.Day
@@ -55,11 +65,19 @@ func TestShowScenesDraw(t *testing.T) {
 		"drawer-call-empty": {now: at, phase: "idle", weather: sky, showDrawer: true, drawerTab: drawerCall},
 		"nowplaying": {now: at, phase: "idle", nowPlaying: true, playing: true, weather: sky,
 			radio: home.Radio{Now: "KXYZ 101.1", Title: "Take It Easy", Artist: "Eagles"}},
+		// Words in a script none of the screen's fonts has: boxes, unless a font of one's own has it.
+		"nowplaying-korean": {now: at, phase: "idle", nowPlaying: true, playing: true, weather: sky,
+			radio: home.Radio{Now: "Music Assistant", Title: "밤편지", Artist: "아이유", Music: true}},
 		// Music Assistant's track, carried over Sendspin: named, with the three buttons.
 		"nowplaying-music-assistant": {now: at, phase: "idle", nowPlaying: true, playing: true, weather: sky,
 			radio: home.Radio{Playing: true, Now: "Music Assistant", Title: "Some Jazz", Artist: "The Quartet", Music: true}},
 		"nowplaying-music-assistant-paused": {now: at, phase: "idle", nowPlaying: true, paused: true, weather: sky,
 			radio: home.Radio{Now: "Music Assistant", Title: "Some Jazz", Artist: "The Quartet", Music: true}},
+		"nowplaying-modern": {now: at, phase: "idle", nowPlaying: true, modernMusic: true, playing: true, weather: sky,
+			radio:         home.Radio{Now: "Music Assistant", Title: "After the Rain", Artist: "The Glass Hours", Thumb: previewMusicCover()},
+			musicPosition: media.Position{At: at, Pos: 86 * time.Second, Dur: 222 * time.Second, Rate: 1}},
+		"nowplaying-modern-paused": {now: at, phase: "idle", nowPlaying: true, modernMusic: true, paused: true, weather: sky,
+			radio: home.Radio{Now: "AirPlay", Title: "A Very Long Track Title That Wraps Across the Screen", Artist: "The Glass Hours"}},
 		"weather":              {now: at, phase: "idle", weather: sky, forecast: week, showWeather: true},
 		"weather-rain":         {now: at, phase: "idle", weather: home.Weather{Condition: "rainy", Temp: "54°"}, forecast: week, showWeather: true, sky: fxRain},
 		"weather-pouring":      {now: at, phase: "idle", weather: home.Weather{Condition: "pouring", Temp: "54°"}, forecast: week, showWeather: true, sky: fxPour},
@@ -82,6 +100,42 @@ func TestShowScenesDraw(t *testing.T) {
 			announcement: announce.Message{From: "Laundry Room",
 				Text: "the washing machine has finished its cycle and the door is unlocked now"}},
 		"announce-recording": {now: at, phase: "idle", weather: sky, announceRecording: true, announcePeers: 3},
+		"notification": {now: at, phase: "idle", weather: sky, showNotification: true,
+			notification: notify.Notification{Kind: notify.Text, Title: "Washer", Icon: "mdi:washing-machine",
+				Message: "The washing machine is done"}},
+		// The device's own notes (home/hint.go): a station Home Assistant never started, the star refused.
+		"notification-radio-hint": {now: at, phase: "idle", weather: sky, showNotification: true,
+			notification: notify.Notification{Kind: notify.Text, Title: "Radio", Message: home.NoStartHint, Own: true}},
+		"notification-favorite-hint": {now: at, phase: "idle", weather: sky, showNotification: true,
+			notification: notify.Notification{Kind: notify.Text, Title: "Favorites", Message: home.FavoriteHint, Own: true}},
+		"notification-no-title": {now: at, phase: "idle", weather: sky, showNotification: true,
+			notification: notify.Notification{Kind: notify.Text, Message: "The washing machine is done"}},
+		"notification-unknown-icon": {now: at, phase: "idle", weather: sky, showNotification: true,
+			notification: notify.Notification{Kind: notify.Text, Title: "Washer", Icon: "mdi:no-such-icon", Message: "Done"}},
+		"notification-longest": {now: at, phase: "idle", weather: sky, showNotification: true,
+			notification: notify.Notification{Kind: notify.Text, Title: "A title that runs on and on past the card's edge",
+				Message: "Move the washing to the dryer, then put the towels on the rack by the back door and the " +
+					"sheets on the line, and fold what is already dry before the rain comes in this afternoon"}},
+		// An event's pop-up over the clock: its title on one line, long ones cut short, and an all-day one.
+		"popup": {now: at, phase: "idle", weather: sky, popup: &hass.Event{Calendar: "calendar.family",
+			Summary: "Dentist", Start: at.Add(15 * time.Minute), End: at.Add(75 * time.Minute)}},
+		"popup-longest": {now: at, phase: "idle", weather: sky, popup: &hass.Event{Calendar: "calendar.family",
+			Summary: "Parent-teacher conferences for the whole middle school, rooms 12 through 40",
+			Start:   at.Add(3 * time.Hour), End: at.Add(4 * time.Hour)}},
+		"popup-all-day": {now: at, phase: "idle", weather: sky, popup: &hass.Event{Summary: "Trash day", AllDay: true,
+			Start: at, End: at.Add(24 * time.Hour)}},
+		"notification-under-reminder": {now: at, phase: "idle", weather: sky, showReminder: true,
+			reminder: remind.Reminder{Label: "Take the trash out"}, showNotification: true,
+			notification: notify.Notification{Kind: notify.Text, Message: "hidden under the reminder"}},
+		"camera-captioned": {now: at, phase: "idle", showCamera: true, camera: home.CameraView{Entity: "camera.front_door",
+			Name: "Front door", Until: at.Add(30 * time.Second), Frame: image.NewRGBA(image.Rect(0, 0, 853, 480)),
+			Caption: &home.Caption{ID: "1", Title: "Doorbell", Message: "Someone is at the front door"}}},
+		"camera-wordless": {now: at, phase: "idle", showCamera: true, camera: home.CameraView{Entity: "camera.front_door",
+			Name: "Front door", Until: at.Add(30 * time.Second), Frame: image.NewRGBA(image.Rect(0, 0, 853, 480)),
+			Caption: &home.Caption{ID: "1"}}},
+		"camera-captioned-no-title": {now: at, phase: "idle", showCamera: true, camera: home.CameraView{Entity: "/local/a.png",
+			Name: "Notification", Until: at.Add(30 * time.Second), Error: "hass: GET /local/a.png: 404 Not Found",
+			Caption: &home.Caption{ID: "1", Message: "The picture could not be fetched"}}},
 		"reminder": {now: at, phase: "idle", weather: sky, showReminder: true,
 			reminder: remind.Reminder{Label: "Take the medication"}},
 		"reminder-from-elsewhere": {now: at, phase: "idle", weather: sky, showReminder: true, reminderFrom: "Kitchen",
@@ -133,6 +187,14 @@ func TestShowScenesDraw(t *testing.T) {
 			sheet: settings{cat: catSound, volume: 15, wakeWord: "Okay Nabu", cardScroll: 1000}},
 		"settings-display": {now: at, phase: "idle", showSheet: true,
 			sheet: settings{cat: catDisplay, brightness: 70}},
+		// Bluetooth's rows, Secure Connections among them (#183): on, as it comes, and turned off.
+		"settings-connections": {now: at, phase: "idle", showSheet: true, bt: btaudio.State{Available: true, Remembered: "Speaker"},
+			sheet: settings{cat: catConnections, wifiName: "Home", address: "192.168.1.50", wifiOK: true}},
+		"settings-connections-sc-off": {now: at, phase: "idle", showSheet: true, bt: btaudio.State{Available: true, Remembered: "Speaker"},
+			sheet: settings{cat: catConnections, wifiName: "Home", address: "192.168.1.50", wifiOK: true, btSCOff: true, cardScroll: 1000}},
+		// The custom colors editor: a strip of swatches for each part of the theme, sized to the screen.
+		"settings-colors": {now: at, phase: "idle", showSheet: true,
+			sheet: settings{cat: catDisplay, colors: true}},
 		"settings-display-mid": {now: at, phase: "idle", showSheet: true,
 			sheet: settings{cat: catDisplay, brightness: 70, cardScroll: 420}},
 		"settings-display-end": {now: at, phase: "idle", showSheet: true,
@@ -202,19 +264,32 @@ func TestShowScenesDraw(t *testing.T) {
 		}
 	}
 
+	// The calendar's views and the clock's next-up card, on a made-up week (calendar_look_test.go).
+	for name, s := range calendarScenes() {
+		scenes[name] = s
+	}
+
 	dir := os.Getenv("SHOW_PREVIEW")
-	// Both panels this build draws on. The Show 8 is not a second layout: it is this one scaled, and
-	// the point of drawing it here is that the scaling can be looked at without a device.
+	// Every panel this build draws on. The Show 8 and the Skylight are not layouts of their own: they
+	// are this one scaled, and the point of drawing them here is that the scaling can be looked at
+	// without a device.
 	for _, panel := range []struct {
 		name       string
 		wide, high int
 	}{
 		{"", showWide, showHigh},
 		{"-show8", show8Wide, show8High},
+		{"-skylight", skylightWide, skylightHigh},
 	} {
 		for name, s := range scenes {
 			img := image.NewRGBA(image.Rect(0, 0, panel.wide, panel.high))
-			newRenderer(img).draw(s)
+			r := newRenderer(img)
+			if s.modernMusic {
+				cover, _ := r.modernMusicLayout()
+				var sized screenSized
+				s.radio.Thumb = sized.of(s.radio.Thumb, cover.Dx(), cover.Dy())
+			}
+			r.draw(s)
 			if dir == "" {
 				continue
 			}
@@ -230,6 +305,17 @@ func TestShowScenesDraw(t *testing.T) {
 			}
 		}
 	}
+}
+
+// previewMusicCover is made-up artwork for the renderer preview.
+func previewMusicCover() *image.RGBA {
+	img := image.NewRGBA(image.Rect(0, 0, 240, 240))
+	draw.Draw(img, img.Bounds(), image.NewUniform(color.RGBA{25, 41, 65, 255}), image.Point{}, draw.Src)
+	r := newRenderer(img)
+	r.disc(120, 108, 76, color.RGBA{59, 104, 125, 255})
+	r.disc(120, 108, 53, color.RGBA{117, 169, 165, 255})
+	r.disc(120, 108, 29, color.RGBA{242, 191, 141, 255})
+	return img
 }
 
 // A size written as a literal in this package is in the Show 5's pixels, and the Show 8 scales them.

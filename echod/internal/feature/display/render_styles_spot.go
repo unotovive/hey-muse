@@ -6,18 +6,13 @@ import (
 	"fmt"
 	"image"
 	"image/color"
-	"log/slog"
 	"math"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/HuskerMinion/techo5/echod/internal/lib/locale"
 	xdraw "golang.org/x/image/draw"
 	"golang.org/x/image/font"
-	"golang.org/x/image/font/gofont/gobold"
-	"golang.org/x/image/font/gofont/goregular"
-	"golang.org/x/image/font/opentype"
 	"golang.org/x/image/math/fixed"
 )
 
@@ -25,39 +20,22 @@ import (
 // rim stays the status ring - listening, muted, a running timer - except that the Sun style draws the
 // day's light on it while there is nothing else to say there. The alert pill stays at the top.
 
-// spotStyleFont is the two faces the styles are cut from, parsed once.
-var spotStyleFont struct {
-	once          sync.Once
-	bold, regular *opentype.Font
-}
-
 type spotFaceKey struct {
 	bold bool
 	size int
 }
 
-// styleFace is a face at size pixels, kept once made; sizes are rounded to a few pixels so a style
-// that fits its words to the circle keeps a handful rather than one per pixel.
+// styleFace is a face at size pixels in the screen font at the text size, kept once made; sizes are
+// rounded to a few pixels so a style that fits its words to the circle keeps a handful rather than one
+// per pixel. A new font or text size empties the set (useFont).
 func (r *roundRenderer) styleFace(bold bool, size int) font.Face {
-	spotStyleFont.once.Do(func() {
-		spotStyleFont.bold, _ = opentype.Parse(gobold.TTF)
-		spotStyleFont.regular, _ = opentype.Parse(goregular.TTF)
-	})
-	px := max(size/2*2, 8)
+	px := max(r.atTextSize(size)/2*2, 8)
 	k := spotFaceKey{bold, px}
 	if f, ok := r.styleFaces[k]; ok {
 		return f
 	}
-	src := spotStyleFont.regular
-	if bold {
-		src = spotStyleFont.bold
-	}
-	if src == nil {
-		return r.small
-	}
-	f, err := newTextFace(src, &opentype.FaceOptions{Size: float64(px), DPI: 72, Hinting: font.HintingFull})
-	if err != nil {
-		slog.Error("making a clock style's face failed", "size", px, "err", err)
+	f := fontFace(r.font, bold, float64(px))
+	if f == nil {
 		return r.small
 	}
 	if r.styleFaces == nil || len(r.styleFaces) > 24 {
@@ -103,6 +81,12 @@ func (r *roundRenderer) styledClockFace(s roundScene, style string) {
 		r.agendaFace(s)
 	case styleGlow:
 		r.glowFace(s)
+	case styleNixie:
+		r.nixieFace(s)
+	case styleStack:
+		r.stackFace(s)
+	case styleOverlap:
+		r.overlapFace(s)
 	}
 }
 
@@ -111,7 +95,7 @@ func (r *roundRenderer) styledClockFace(s roundScene, style string) {
 func (r *roundRenderer) footLine(s roundScene, baseline int, otherwise string) {
 	switch {
 	case len(s.timers) > 0:
-		r.centered(r.body, "Timer "+clockDuration(s.timers[0].Left), baseline, colTimer)
+		r.centered(r.body, tr("timer")+" "+clockDuration(s.timers[0].Left), baseline, colTimer)
 	case s.missed != "":
 		r.centered(r.small, s.missed, baseline, colTimer)
 	case s.slideshowTrouble != "":
@@ -125,15 +109,15 @@ func (r *roundRenderer) footLine(s roundScene, baseline int, otherwise string) {
 func (r *roundRenderer) statusWord(s roundScene, baseline int) {
 	switch {
 	case s.setupAsking:
-		r.centered(r.label, "A BROWSER IS ASKING", baseline, colMuted)
+		r.centered(r.label, tr("a_browser_is_asking"), baseline, colMuted)
 	case s.muted:
-		r.centered(r.label, "MICROPHONE OFF", baseline, colMuted)
+		r.centered(r.label, tr("microphone_off"), baseline, colMuted)
 	case s.btPairing:
-		r.centered(r.label, "BLUETOOTH PAIRING", baseline, colBluetooth)
+		r.centered(r.label, tr("bluetooth_pairing"), baseline, colBluetooth)
 	case s.playing:
-		r.centered(r.label, "PLAYING", baseline, colDim)
+		r.centered(r.label, tr("ui_playing"), baseline, colDim)
 	case s.paused:
-		r.centered(r.label, "PAUSED", baseline, colDim)
+		r.centered(r.label, tr("ui_paused"), baseline, colDim)
 	}
 }
 
@@ -187,7 +171,7 @@ func (r *roundRenderer) flipFace(s roundScene) {
 	for i, c := range cards {
 		b := image.Rect(x, y, x+cw, y+ch)
 		r.roundFill(b, 10, color.RGBA{36, 42, 52, 255}, color.RGBA{28, 33, 41, 255})
-		r.cardFigure(f, c, image.Rect(x, y+ch*12/100, x+cw, y+ch-ch*12/100))
+		r.cardFigure(f, c, image.Rect(x, y+ch*12/100, x+cw, y+ch-ch*12/100), colText)
 		r.line(float64(x), float64(y+ch/2), float64(x+cw), float64(y+ch/2), 3, colBackground)
 		x += cw + gap
 		if i == len(cards)-3 {
@@ -202,9 +186,9 @@ func (r *roundRenderer) flipFace(s roundScene) {
 	r.footLine(s, 372, "")
 }
 
-// cardFigure draws a flip card's figure stretched tall and narrow into box, as the night's flip clock
-// does. Zero is the face's round O, since its own zero carries a slash.
-func (r *roundRenderer) cardFigure(face font.Face, s string, box image.Rectangle) {
+// cardFigure draws a flip card's figure in ink, stretched tall and narrow into box, as the night's
+// flip clock does. Zero is the face's round O, since its own zero carries a slash.
+func (r *roundRenderer) cardFigure(face font.Face, s string, box image.Rectangle, ink color.RGBA) {
 	c := []rune(s)[0]
 	if c == '0' {
 		c = 'O'
@@ -215,7 +199,7 @@ func (r *roundRenderer) cardFigure(face font.Face, s string, box image.Rectangle
 		return
 	}
 	glyph := image.NewRGBA(image.Rect(0, 0, gw, gh))
-	(&font.Drawer{Dst: glyph, Src: image.NewUniform(colText), Face: face,
+	(&font.Drawer{Dst: glyph, Src: image.NewUniform(ink), Face: face,
 		Dot: fixed.Point26_6{X: -b.Min.X, Y: -b.Min.Y}}).DrawString(string(c))
 	h := box.Dy()
 	w := min(gw*h/gh*72/100, box.Dx()*80/100)
@@ -241,15 +225,7 @@ var segmentsLit = [10]string{"abcdef", "bc", "abdeg", "abcdg", "bcfg", "acdfg", 
 // ledFace is the time in seven-segment digits, the unlit segments faintly behind.
 func (r *roundRenderer) ledFace(s roundScene) {
 	r.statusWord(s, 118)
-	h, m := hourMinute(s.now)
-	digits := []int{-1, -1, -1, -1}
-	if len(h) == 2 {
-		digits[0] = int(h[0] - '0')
-	}
-	digits[1] = int(h[len(h)-1] - '0')
-	if len(m) == 2 {
-		digits[2], digits[3] = int(m[0]-'0'), int(m[1]-'0')
-	}
+	digits := faceDigits(s.now)
 	const dw, dh, t = 40.0, 84.0, 9.0
 	gap, colon := dw*0.42, t*2
 	ampm := clockSuffix(s.now)
@@ -275,6 +251,21 @@ func (r *roundRenderer) ledFace(s roundScene) {
 	}
 	r.centered(r.small, locale.LongDate(s.now, screenLang()), 330, colDim)
 	r.footLine(s, 372, "")
+}
+
+// faceDigits is the time as four digit places, hours then minutes; a 12-hour clock leaves the first
+// place empty (-1) before ten.
+func faceDigits(now time.Time) [4]int {
+	h, m := hourMinute(now)
+	digits := [4]int{-1, -1, -1, -1}
+	if len(h) == 2 {
+		digits[0] = int(h[0] - '0')
+	}
+	digits[1] = int(h[len(h)-1] - '0')
+	if len(m) == 2 {
+		digits[2], digits[3] = int(m[0]-'0'), int(m[1]-'0')
+	}
+	return digits
 }
 
 // segmentDigitAt draws one seven-segment digit, w by h at x, top, each segment t thick.
@@ -336,9 +327,11 @@ func (r *roundRenderer) analogFace(s roundScene) {
 		}
 		r.text(r.small, w.Temp, left+int(2*u)+8, 150, colText)
 	}
-	day := strings.ToUpper(locale.DayAndNumber(s.now, screenLang()))
+	day := upper(locale.DayAndNumber(s.now, screenLang()))
 	dw := r.width(r.label, day) + 20
-	r.roundFill(image.Rect(center-dw/2, 302, center+dw/2, 334), 8, color.RGBA{24, 29, 36, 255}, color.RGBA{24, 29, 36, 255})
+	// The window a shade up from the ground, toward the track's color: on a light skin too.
+	window := lerpRGB(colBackground, colTrack, 0.6)
+	r.roundFill(image.Rect(center-dw/2, 302, center+dw/2, 334), 8, window, window)
 	r.centered(r.label, day, 325, colText)
 	r.footLine(s, 362, "")
 	hand := func(deg, length, back, w float64, c color.RGBA) {
@@ -404,7 +397,7 @@ func (r *roundRenderer) sunFace(s roundScene) {
 		line += 34
 	}
 	warm := color.RGBA{230, 170, 120, 255}
-	r.centered(r.tiny, "Sun up "+clockText(s.style.rise)+"  ·  down "+clockText(s.style.set), line+4, warm)
+	r.centered(r.tiny, fmt.Sprintf(tr("ui_sunrise_sunset_times"), clockText(s.style.rise), clockText(s.style.set)), line+4, warm)
 }
 
 // sunRim is the rim as the whole day: noon at the top, midnight at the bottom, daylight from sunrise
@@ -498,7 +491,7 @@ func (r *roundRenderer) dashboardFace(s roundScene) {
 
 	f := r.styleFace(false, 20)
 	if len(s.style.next) == 0 {
-		r.centered(f, "Nothing coming up", 246, colDim)
+		r.centered(f, tr("calendar_nothing_coming_up"), 246, colDim)
 	}
 	for i, e := range s.style.next[:min(len(s.style.next), 2)] {
 		y := 232 + i*36
@@ -517,7 +510,7 @@ func (r *roundRenderer) dashboardFace(s roundScene) {
 		cx := center - 100 + i*100
 		name := locale.ShortWeekday(d.When, screenLang())
 		if i == 0 {
-			name = "Now"
+			name = tr("today")
 		}
 		r.centered2(r.styleFace(true, 18), name, cx, 318, colDim)
 		r.weatherIcon(d.Condition, float64(cx), 350, 13)
@@ -531,15 +524,15 @@ func dashWhenSpot(start time.Time, allDay bool, now time.Time) string {
 	tomorrow := today.AddDate(0, 0, 1)
 	switch {
 	case !allDay && !start.After(now):
-		return "Now"
+		return tr("ui_running")
 	case allDay && start.Before(tomorrow):
-		return "Today"
-	case allDay:
-		return "Tmrw"
+		return tr("today")
 	case start.Before(tomorrow):
 		return clockText(start)
+	case start.Before(tomorrow.AddDate(0, 0, 1)):
+		return tr("tomorrow")
 	}
-	return "Tmrw"
+	return locale.ShortWeekday(start, screenLang())
 }
 
 // spotClip is s cut to fit w, with an ellipsis.
@@ -547,9 +540,5 @@ func spotClip(r *roundRenderer, f font.Face, s string, w int) string {
 	if r.width(f, s) <= w {
 		return s
 	}
-	rs := []rune(s)
-	for len(rs) > 0 && r.width(f, string(rs)+"…") > w {
-		rs = rs[:len(rs)-1]
-	}
-	return string(rs) + "…"
+	return clipRunes(s, 0, func(line string) bool { return r.width(f, line) <= w })
 }

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/HuskerMinion/techo5/echod/internal/config"
+	"github.com/HuskerMinion/techo5/echod/internal/lib/asp"
 )
 
 // Output is one of the device's audio outputs: the speaker, or the 3.5 mm jack.
@@ -30,6 +31,16 @@ const (
 // DRAMHold keeps the DL1 driver off its SRAM ring, which faults on this kernel build on the Show
 // (paths_cronos.go). Held on the Spot as a precaution until the SRAM path is proven safe here.
 const DRAMHold = "/dev/snd/pcmC0D1c"
+
+// startFull is the Show's (paths_cronos.go): the same DL1 driver and the same restart after an
+// underrun.
+const startFull = true
+
+// softRef is off: the card's own loopback is the echo reference.
+const softRef = false
+
+// openSequence is empty: the playback device opens with the card as the kernel left it.
+var openSequence []kctl
 
 // A mixer write, as the shared player applies it.
 type kctl struct {
@@ -83,6 +94,9 @@ var pathSequence = map[Output][]kctl{
 		{name: driverGain, level: 11},
 		{name: "PCM Playback Volume", level: 127},
 		{name: "Right Channel Only", value: "Off"},
+		// The jack is the line-out: Fire OS's HAL turns it on in code, not in audio_device.xml, and
+		// without it nothing is heard there (#100).
+		{name: "Audio_LineOut_Setting", value: "On"},
 	},
 }
 
@@ -115,13 +129,17 @@ func DetectOutput() Output {
 // volume is in.
 const VolumeSteps = config.VolumeSteps
 
-// volumeCurves maps a volume step to attenuation in dB. Not yet tuned on the Spot: the Show's curve,
-// linear in dB and topping out 6 dB under unity, which starts quiet rather than loud.
+// volumeCurves maps a volume step to attenuation in dB. The speaker's is the Dot's vendor curve, which
+// the Spot's codec and speaker are closest to, 6 dB down: it is what plays when the
+// tuning is off or missing, with no limiter behind it, and it stops where the Spot's untuned curve
+// always has. Tuned, the speaker follows firstCurves instead, which is worked out from the vendor curve
+// itself. The Show's curve, which the Spot had before, is made for the Show's much louder amplifier
+// and left a tuned Spot at half the dial about 16 dB quieter than Fire OS (#95).
 var volumeCurves = map[Output][VolumeSteps + 1]float64{
 	OutputSpeaker: {
-		-90, -45, -43.5, -42, -40.5, -39, -37.5, -36, -34.5, -33,
-		-31.5, -30, -28.5, -27, -25.5, -24, -22.8, -21.6, -20.4, -19.2,
-		-18, -16.8, -15.6, -14.4, -13.2, -12, -10.8, -9.6, -8.4, -7.2, -6,
+		-90, -39, -36, -32, -31, -29, -27, -25, -23, -22,
+		-20, -19, -18, -16, -15, -14, -13, -11, -11, -10,
+		-10, -10, -10, -9, -9, -9, -9, -9, -8, -7, -6,
 	},
 	OutputHeadphone: {
 		-100, -39, -38, -36, -34, -33, -31, -29, -27, -26,
@@ -154,6 +172,16 @@ const MediaService = "vendor.audio-hal"
 // AmpSwitch gates the speaker. On the Spot it is safe to switch, unlike the Show's.
 const AmpSwitch = "Ext_Speaker_Amp_Switch"
 
+// MuteSwitch is a mute on the amplifier besides AmpSwitch: none on the Spot.
+const MuteSwitch = ""
+
+// idleGate is none: the amplifier is AmpSwitch's to gate (idle.go).
+var idleGate *ampGate
+
+// mayHaveTAS5805M is whether a board of this build can carry the TAS5805M amplifier (GainAvailable):
+// the Spot plays through its TLV320AIC32x4 and an external amplifier gated by AmpSwitch.
+const mayHaveTAS5805M = false
+
 // OutputBoost is make-up gain on everything the speaker plays. Unity until measured.
 const OutputBoost = 1.0
 
@@ -163,15 +191,20 @@ const OutputBoost = 1.0
 // A unit whose files are missing says so and plays untuned.
 const DriverTuning = true
 
+// tuningSet is the tuning to load by name, where the files cannot tell it: nil, the Spot's can.
+var tuningSet *asp.Set
+
 // firstCurves puts the volume in front of the tuning, as on the Show (paths_cronos.go, which says
 // why and how these were worked out). The Spot's AFE.cfg has no volume stage of its own, so Android
-// turned the volume down before the tuning, which is where this puts it too. Worked out from a
-// Spot's own files the same way as the Show's: each step as loud as it was.
+// turned the volume down before the tuning, which is where this puts it too. Worked out from a Spot's
+// own files the same way as the Dot's: each step up to 16 as loud as the vendor curve's step was behind
+// the tuning (volumeCurves 6 dB up), and from 16 to 30 rising evenly to the same top, since the vendor
+// curve's repeated values leave steps there no louder than the one below.
 var firstCurves = map[string][VolumeSteps + 1]float64{
 	"spot": {
-		-90, -57.9, -56.4, -54.9, -53.3, -51.9, -50.4, -48.9, -47.4, -45.9,
-		-44.4, -42.9, -41.4, -39.8, -38.4, -36.8, -35.6, -34.4, -33.2, -31.9,
-		-30.3, -28.6, -26.7, -24.7, -22.6, -20.6, -18.8, -17.1, -15.4, -13.8, -12.1,
+		-90, -45.8, -42.8, -38.9, -37.9, -35.8, -33.8, -31.7, -28.9, -27.3,
+		-24, -22.3, -20.6, -17.6, -16.2, -14.9, -13.5, -12.8, -12.1, -11.4,
+		-10.6, -9.8, -9, -8.1, -7.1, -6.1, -4.9, -3.7, -2.5, -1.3, 0,
 	},
 }
 
@@ -181,3 +214,12 @@ const HasJack = true
 // HasBoth is whether the speaker and the jack can play at once, and so the Both choice. Not here:
 // the routes have not been tried together on this board.
 const HasBoth = false
+
+// PlaybackDevice is the codec's playback PCM, which the card takes at Rate as it is: hwRate is Rate
+// and nothing is trimmed after the volume (see paths_cronos.go for the board where neither holds).
+const (
+	PlaybackDevice = 23
+	hwRate         = Rate
+	hwTrimDB       = 0.0
+	hwBits         = Bits
+)

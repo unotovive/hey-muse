@@ -40,11 +40,15 @@ type Set struct {
 // is what happens today anyway, so they are worth shipping and worth correcting.
 var Languages = map[string]Set{
 	"ja": {
-		Weather:    []string{"天気", "降水確率", "雨予報", "雨が降", "雨は降", "雨雲", "雨の予報"},
-		Radar:      []string{"雨雲レーダー", "雨雲マップ"},
-		NotWeather: []string{"雨音", "雨の音", "音楽", "再生"},
-		GoHome:     []string{"ホームに戻", "ホーム画面", "時計に戻", "待機画面"},
-		Camera:     []string{"カメラ"},
+		// Match phrases rather than single kanji: 雨宮 and 雪子 are names, and
+		// 雪見だいふく is food. A bare レーダー can be a car's radar as well.
+		Weather: []string{"天気", "気温", "降水確率", "雨が降", "雨は降", "雨降", "雪が降", "雪は降", "雪降",
+			"雨の予報", "雪の予報", "降雪予報", "雷雨の予報", "雨雲レーダー", "降水レーダー", "雨雲の動き",
+			"雨予報", "雨雲"},
+		Radar:      []string{"雨雲レーダー", "降水レーダー", "雨雲の動き", "雨雲マップ"},
+		NotWeather: []string{"雨の音", "雨音", "雨の曲", "雨の音楽", "雨が降る音", "天気の子", "を再生", "を流して", "という曲", "音楽", "再生"},
+		GoHome:     []string{"ホーム画面に戻", "時計に戻", "時計を表示", "ホームに戻", "待機画面"},
+		Camera:     []string{"カメラ", "の映像", "を映して"},
 	},
 	"en": {
 		Weather:    []string{"weather", "forecast", "temperature", "rain", "snow", "how hot", "how cold", "storm", "radar", "weather map"},
@@ -68,14 +72,28 @@ var Languages = map[string]Set{
 		Camera: []string{"muestra", "muéstrame", "muestrame", "enseña", "cámara", "camara"},
 	},
 	"fr": {
+		// Matched inside what was heard, and under Match all inside English too: so not "neig"
+		// (neighbor) or "orage" alone (storage).
 		Weather: []string{"météo", "meteo", "quel temps", "prévisions", "previsions", "température", "temperature",
-			"pluie", "pleu", "neige", "neig", "orage", "tempête", "tempete", "ensoleillé", "ensoleille", "nuageux", "radar"},
+			"pluie", "pleu", "neige", "neigé", "un orage", "d'orage", "l'orage", "des orages", "orageux", "tempête", "tempete",
+			"ensoleillé", "ensoleille", "nuageux", "radar"},
 		Radar:  []string{"radar", "carte des pluies", "carte météo", "carte meteo"},
 		GoHome: []string{"écran d'accueil", "ecran d'accueil", "page d'accueil", "retour à l'horloge", "retour a l'horloge", "montre l'horloge"},
 		Camera: []string{"montre", "affiche", "caméra", "camera"},
 	},
+	"gl": {
+		// Not "neve" alone: it is inside the English "never", which Match all would take as the weather.
+		Weather: []string{"o tempo", "que tempo", "previsión", "temperatura", "choiva", "chove", "choverá",
+			"neve hoxe", "neve mañá", "nevará", "nevando",
+			"treboada", "tormenta", "soleado", "anubrado", "radar"},
+		Radar:  []string{"radar", "mapa da choiva", "mapa do tempo"},
+		GoHome: []string{"pantalla de inicio", "pantalla principal", "volve ao reloxo", "amosa o reloxo"},
+		Camera: []string{"amosa", "ensina", "móstrame", "cámara"},
+	},
 	"it": {
-		Weather: []string{"meteo", "che tempo", "previsioni", "temperatura", "pioggia", "piov", "neve", "nevic",
+		// Not "neve" alone: it is inside the English "never", which Match all would take as the weather.
+		Weather: []string{"meteo", "che tempo", "previsioni", "temperatura", "pioggia", "piov", "la neve", "di neve",
+			"c'è neve", "sarà neve", "neve oggi", "neve domani", "nevic",
 			"temporale", "tempesta", "soleggiato", "nuvoloso", "radar"},
 		Radar:  []string{"radar", "mappa della pioggia", "mappa meteo"},
 		GoHome: []string{"schermata principale", "schermata iniziale", "torna all'orologio", "mostra l'orologio"},
@@ -87,6 +105,44 @@ var Languages = map[string]Set{
 		Radar:  []string{"radar", "regenkaart", "buienradar", "weerkaart"},
 		GoHome: []string{"beginscherm", "startscherm", "terug naar de klok", "laat de klok zien"},
 		Camera: []string{"laat", "toon", "camera"},
+	},
+	"pt": {
+		// Matched inside what was heard, so "tempo" alone is left out: it is in "quanto tempo" (how long)
+		// and timers. The weather is asked for in phrases instead, and "temporal" too: alone, it is the
+		// English "temporal lobe" under Match all. Brazilian Portuguese, as it is spoken.
+		Weather: []string{"previsão do tempo", "previsao do tempo", "como está o tempo", "como esta o tempo", "como tá o tempo",
+			"como ta o tempo", "como vai estar o tempo", "tempo hoje", "tempo amanhã", "tempo amanha", "clima hoje", "clima amanhã",
+			"clima amanha", "mapa do tempo", "qual a temperatura", "qual é a temperatura", "quantos graus", "chuva", "chover",
+			"chove", "nevar", "tempestade", "vai fazer calor", "vai fazer frio", "ensolarado", "nublado", "radar",
+			"previsão", "previsao", "como vai o tempo", "que tempo faz", "tá frio", "ta frio", "tá calor", "ta calor", "faz frio",
+			"fazer sol", "ter temporal", "um temporal", "vem temporal", "temporal hoje", "temporal amanhã", "temporal amanha"},
+		Radar: []string{"radar", "mapa de chuva", "mapa da chuva", "mapa do tempo"},
+		NotWeather: []string{"som de chuva", "som da chuva", "sons de chuva", "barulho de chuva", "barulho da chuva", "ruído", "ruido",
+			"toca chuva", "toca a chuva", "toque chuva", "coloca chuva", "coloca a chuva", "bota chuva", "bota a chuva",
+			"põe chuva", "poe chuva", "põe a chuva", "poe a chuva"},
+		GoHome: []string{"tela inicial", "tela principal", "volta pro relógio", "volta pro relogio", "volta para o relógio",
+			"volta para o relogio", "voltar ao relógio", "voltar ao relogio", "mostra o relógio", "mostra o relogio",
+			"volta pro início", "volta pro inicio", "volta para o início", "volta para o inicio", "tela de início", "tela de inicio"},
+		Camera: []string{"mostra", "mostre", "mostrar", "câmera", "camera"},
+	},
+	"ru": {
+		// Matched inside what was heard, so each form is listed where the stem is inside another word:
+		// "погод" is in "погоди" (wait), "облачн" in cloud storage. Thunderstorm is left out: every
+		// form of "гроза" is inside one of "угроза" (threat).
+		Weather: []string{"погода", "погоду", "погоде", "погоды", "погодой", "погодка", "погодку", "погодке", "погодкой", "погодн", "прогноз", "температур", "дожд", "снег", "снеж",
+			"шторм", "буря", "бури", "бурю", "ураган", "осадк", "сколько градус", "радар"},
+		Radar:      []string{"радар", "карта дождя", "карту дождя", "карта осадков", "карту осадков", "карта погоды", "карту погоды"},
+		NotWeather: []string{"звук", "шум", "включи дождь"},
+		GoHome:     []string{"главный экран", "главном экран", "вернись на главную", "на главную страниц", "домашний экран", "домашнем экран", "верни часы", "вернись к часам", "вернись домой"},
+		Camera:     []string{"покажи", "показать", "камер"},
+	},
+	"tr": {
+		Weather: []string{"hava durumu", "hava nasıl", "sıcaklık", "yağmur", "yağış", "kar yağ", "kar var",
+			"fırtına", "güneşli", "bulutlu", "kaç derece", "radar", "hava tahmini", "hava haritası"},
+		Radar:      []string{"radar", "yağmur haritası", "hava haritası"},
+		NotWeather: []string{"yağmur sesi", "yağmur müziği", "yağmur çal"},
+		GoHome:     []string{"ana ekran", "ana sayfa", "saate dön", "saati göster", "ana ekrana dön", "geri dön"},
+		Camera:     []string{"göster", "kamera"},
 	},
 }
 

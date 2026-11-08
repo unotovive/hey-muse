@@ -5,13 +5,14 @@ package display
 import (
 	"image"
 	"image/color"
-	"image/draw"
 	"math"
 	"time"
 
 	"golang.org/x/image/font"
 
 	"github.com/HuskerMinion/techo5/echod/internal/config"
+	"github.com/HuskerMinion/techo5/echod/internal/feature/hastate"
+	"github.com/HuskerMinion/techo5/echod/internal/feature/voice"
 	"github.com/HuskerMinion/techo5/echod/internal/lib/avatar"
 )
 
@@ -114,7 +115,7 @@ func (r *renderer) splashPlace(set *avatar.Set) splash {
 
 // drawSplash paints the splash as it stands elapsed into its animation.
 func (r *renderer) drawSplash(set *avatar.Set, now time.Time, elapsed time.Duration) {
-	draw.Draw(r.dst, r.dst.Rect, image.NewUniform(navy), image.Point{}, draw.Src)
+	fillCanvas(r.dst, navy)
 	s := r.splashPlace(set)
 	r.arcs(s, elapsed)
 	if s.set != nil {
@@ -146,9 +147,9 @@ func (r *renderer) splashWaiting(s splash) {
 	}
 	// Under the mark, in what room is left. If a panel leaves less than the two lines need, they sit
 	// on the bottom edge instead of climbing onto the name.
-	const gap, lead = 26, 32
+	gap, lead := r.s(26), r.s(32)
 	y := s.below + gap
-	if bottom := r.h - 6; y+lead > bottom {
+	if bottom := r.h - r.s(6); y+lead > bottom {
 		y = bottom - lead
 	}
 	r.text(r.tiny, what, (r.w-r.width(r.tiny, what))/2, y, teal)
@@ -200,4 +201,15 @@ func (r *renderer) arcs(s splash, elapsed time.Duration) {
 
 func blend(under, over uint8, a float64) uint8 {
 	return uint8(float64(under)*(1-a) + float64(over)*a + 0.5)
+}
+
+// homeAssistantHere is what ends the splash: Home Assistant's voice pipeline listening, or, on a
+// screen without microphones that has no voice assistant for it to listen to, Home Assistant
+// connected and following its entities. Waiting for the pipeline there kept the logo up for good.
+// Under Muse the pipeline's readiness is Muse's (voice's backend).
+func homeAssistantHere() bool {
+	if !hasMicrophone() {
+		return hastate.Get().Subscribed()
+	}
+	return voice.Get().Ready()
 }

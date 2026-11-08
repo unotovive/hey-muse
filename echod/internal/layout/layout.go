@@ -28,7 +28,14 @@ var (
 	OldBinary  = Binary + ".old"
 )
 
-const (
+// BoardDoubt says why Board is a guess, empty where it is known (and off the Dot's build, where there
+// is only one board). The board is found as the package loads, before the daemon's logger is set up,
+// so boot.Run logs this rather than detection itself.
+var BoardDoubt string
+
+// Variables rather than constants, as everything under StateDir is: a panel finds its StateDir when
+// it starts (device_panel.go).
+var (
 	KeyPath  = StateDir + "/psk"
 	NamePath = StateDir + "/name"
 
@@ -45,14 +52,6 @@ const (
 	// has and no plain Linux does.
 	setprop = "/system/bin/setprop"
 )
-
-// OnAndroid reports whether an Android userspace is running around the daemon. Off Android — the
-// Linux image, or a workstation — there are no properties, no init services and no vendor firewall,
-// and everything that would speak to them stands down.
-func OnAndroid() bool {
-	_, err := os.Stat(setprop)
-	return err == nil
-}
 
 func installDir() string {
 	if OnAndroid() {
@@ -73,10 +72,9 @@ func installDir() string {
 }
 
 // BackupSuffix marks the vendor binary an install displaced, and Backup is where it is kept.
-const (
-	BackupSuffix = ".orig"
-	Backup       = Service + BackupSuffix
-)
+const BackupSuffix = ".orig"
+
+var Backup = Service + BackupSuffix
 
 // OurLabel is the SELinux label echod's files carry. A service's domain comes from the label of the
 // file init execs, and system_file has no transition rule, which leaves echod in init's own domain.
@@ -114,15 +112,18 @@ const Platform = "echolocal"
 const MACPath = "/proc/idme/mac_addr"
 
 // StatePath holds echod's runtime settings.
-const StatePath = StateDir + "/state.json"
+var StatePath = StateDir + "/state.json"
 
 // Wake word models live in /data, not /system: Home Assistant can offer new ones at runtime and
 // /system is mounted read-only.
-const ModelDir = StateDir + "/models"
+var ModelDir = StateDir + "/models"
 
 // RecordingDir holds the kept turn audio, one WAV and one metadata file per turn, named by turn id.
 // A variable rather than a constant so that a test can keep recordings somewhere harmless.
 var RecordingDir = StateDir + "/recordings"
+
+// WakeClipDir holds the kept wake word clips, a folder for each kind (feature/detect, clips.go).
+var WakeClipDir = StateDir + "/wake-clips"
 
 // MAC normalizes an address into the form Home Assistant compares against, and reports "" for
 // anything that would not identify a device. idme writes twelve hex digits with no separators.
@@ -151,9 +152,13 @@ func MAC(raw string) string {
 
 // FactoryMAC reads and normalizes the immutable address recorded for the Wi-Fi device.
 func FactoryMAC() (string, error) {
-	raw, err := os.ReadFile(MACPath)
+	raw, err := readMAC()
 	if err != nil {
-		return "", fmt.Errorf("reading the factory MAC: %w", err)
+		v, ok := idmeFallback("mac_addr")
+		if !ok {
+			return "", fmt.Errorf("reading the factory MAC: %w", err)
+		}
+		raw = []byte(v)
 	}
 	mac := MAC(string(raw))
 	if mac == "" {
@@ -177,25 +182,48 @@ func NameFromMAC(mac string) string {
 	return DefaultName + " " + s[len(s)-6:]
 }
 
-// Idme reads a factory identity field from /proc/idme, empty on any error. These are written at
+// Idme reads a factory identity field from vendor IDME or the device tree (on the 2nd gen Show 8's
+// mainline kernel, from the eMMC: idmeFallback), empty on any error. These are written at
 // manufacture and never change, so a caller reads once and holds it.
 func Idme(name string) string {
-	raw, err := os.ReadFile("/proc/idme/" + name)
+	raw, err := readIDME(name, os.ReadFile)
 	if err != nil {
-		return ""
+		v, _ := idmeFallback(name)
+		return v
 	}
-	return strings.TrimSpace(string(raw))
+	return strings.TrimSpace(strings.TrimRight(string(raw), "\x00"))
+}
+
+func readIDME(name string, readFile func(string) ([]byte, error)) ([]byte, error) {
+	paths := []string{"/proc/idme/" + name, "/proc/device-tree/idme/" + name + "/value"}
+	for _, path := range paths {
+		raw, err := readFile(path)
+		if err == nil {
+			return raw, nil
+		}
+		if !os.IsNotExist(err) {
+			return nil, err
+		}
+	}
+	return nil, fmt.Errorf("IDME field %s: %w", name, os.ErrNotExist)
 }
 
 // Color is the device's shell, worked out from two idme fields: productid2 is 0 on a black unit and a
 // nonzero code on a white one, and the serial runs G090LF… on black against G090L9… on white. They
 // confirm each other; a disagreement, or nothing to read, is left unknown rather than guessed.
+//
+// That holds only for the model whose serials start G090L, which it was read from. Other models break
+// it: a white Dot 3 reads 0 and a black Dot 2 2020, and their serials say nothing either way.
 func Color(productID2, serial string) string {
 	const (
 		black   = "black"
 		white   = "white"
 		unknown = "unknown"
 	)
+
+	if !strings.HasPrefix(strings.TrimSpace(serial), "G090L") {
+		return unknown
+	}
 
 	prod := unknown
 	if n, err := strconv.Atoi(strings.TrimSpace(productID2)); err == nil {
@@ -226,6 +254,46 @@ func Color(productID2, serial string) string {
 	default:
 		return unknown
 	}
+}
+
+// LabelMax is the most a DNS label holds, in bytes. An mDNS service's instance name is one label, so
+// the device's name advertised as one (AirPlay, Spotify Connect, Sendspin, announcements) has to fit
+// it: a name of 31 characters outside ASCII can take 124 bytes.
+const LabelMax = 63
+
+// CutName is name cut to at most n bytes, at a character boundary, so what is left is still the
+// characters it started with. A name that fits comes back as it is.
+func CutName(name string, n int) string {
+	if len(name) <= n {
+		return name
+	}
+	cut := 0
+	for i := range name {
+		if i > n {
+			break
+		}
+		cut = i
+	}
+	return strings.TrimRight(name[:cut], " ")
+}
+
+// NodeName is the ESPHome node's own name, which it is advertised under over mDNS: the device's name as
+// a slug (Slug), one DNS label long at most. A name with nothing in it a slug keeps (one in Greek,
+// Cyrillic or Chinese, say) falls back to the name the device would have had with none, which carries
+// the end of its MAC address, so two such devices are still two nodes. Home Assistant names the
+// device's actions after it: esphome.<node>_<action>, with its dashes made underscores.
+func NodeName(name, mac string) string {
+	return strings.TrimRight(CutName(SlugOr(name, mac), LabelMax), "-")
+}
+
+// SlugOr is name's Slug, or, for a name with nothing in it a slug keeps (one in Greek, Cyrillic or
+// Chinese, say), the slug of the name the device has with none set (NameFromMAC), which carries the end
+// of its MAC address: never empty, and two such devices still differ.
+func SlugOr(name, mac string) string {
+	if slug := Slug(name); slug != "" {
+		return slug
+	}
+	return Slug(NameFromMAC(mac))
 }
 
 // Slug turns a display name into a node name: the mDNS hostname and the ESPHome node's own name.

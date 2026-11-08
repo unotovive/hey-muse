@@ -70,7 +70,7 @@ Kernel/initramfs updates are separate: they are a `fastboot flash boot`
 Inputs (kept out of the repo, in `inputs/` or `$TECHO5_INPUTS`; [docs/building.md](../../docs/building.md) says where each comes from):
 
 - `boot-lineage-18.1-20260904-cronos.img` — LineageOS boot image (kernel + header)
-- `alpine-minirootfs-3.24.1-armv7.tar.gz`, `busybox.static` (from `busybox-static-1.37.0-r31.apk`)
+- `alpine-minirootfs-3.24.2-armv7.tar.gz`, `busybox.static` (from `busybox-static-1.37.0-r31.apk`)
 - `apks/`, `apks312/` — the packages in `packages.txt` (initramfs) and the
   wpa_supplicant 2.9 set (both)
 - no vendor tree: images don't carry LineageOS's drivers and firmware. Each unit keeps its own in the
@@ -185,8 +185,9 @@ exposes a raw H4 channel at `/dev/stpbt` rather than a Linux HCI device.
 copies packets between `/dev/stpbt` and the kernel's `/dev/vhci`, so BlueZ sees
 an ordinary `hci0`. `t5_bt_up` (techo5-lib.sh) loads the module, keeps the
 bridge running, starts `dbus-daemon`, `bluetoothd`, and `bluealsa -p
-a2dp-source` after it, and power-cycles `hci0` once: on the bench the
-controller answered commands but never reported an inquiry result or an
+a2dp-source -p a2dp-sink` after it (out to earbuds and speakers, in from a
+phone; the class says loudspeaker, in bluetoothd's `main.conf` as well), and
+power-cycles `hci0` once: on the bench the controller answered commands but never reported an inquiry result or an
 advertisement until it had been powered off and on after the first bring-up.
 Bonds live on userdata (`/data/misc/techo5/bluetooth`, bind-mounted over
 `/var/lib/bluetooth`).
@@ -227,10 +228,13 @@ volume; a tap is the action button.
 The camera is driven from userspace through the ISP driver's register windows; the code is
 `echod/internal/hardware/camera` and the map, with the dead ends, is docs/camera-research.md.
 (The probe tools that got there, camprobe and camframe, were removed once the package worked;
-they are in the history before 2026-09-16 evening.) `hardware/camera` streams on demand with
+they are in the history before 2026-09-16 evening. Today's `echod/cmd/camprobe` is another tool,
+the bench check for the 2nd gen Show 8's V4L2 camera; its kernel drivers are in
+tools/linux/athena/kernel.) `hardware/camera` streams on demand with
 auto-exposure and `feature/camera` serves
 the ESPHome camera entity Home Assistant creates on its own, plus `http://<device>:8181/camera.jpg`
-and `/camera.mjpeg` while Camera web access is on. `/screen.png[?sheet=<category>&list=<row>&theme=<name>]` on the
+and `/camera.mjpeg` while Camera web access is on (with the camera stream's login, or a browser the
+setup page has let in; the green dot shows while either is read). `/screen.png[?sheet=<category>&list=<row>&theme=<name>]` on the
 same port, while Screen web access is on, is a screenshot of the panel, for checking layouts from a
 PC; the parameters that put a page up first work the screen rather than read it, so they need a
 browser the setup page has let in. With both off the port is closed.
@@ -241,6 +245,64 @@ A release may carry a rootfs tarball (`release.ps1 -Rootfs <techo5-rootfs-*.tar.
 `deploy-rootfs.sh` and copied back from `/data/techo5-linux/`). A device that boots from a slot
 installs that through `slotctl install` into the other slot and reboots; the boot scripts run the
 trial and commit or fall back. The daemon-only binary in the manifest is for the Android install.
+
+The 2nd gen Show 8 (athena) runs the same daemon binary but a rootfs of its own (Amazon's kernel, its
+vendor partition; tools/linux/athena), keyed `arm-athena` in the manifest (`release.ps1 -AthenaRootfs`,
+published as `techo5-rootfs-athena-<version>.tar.gz`). An athena never takes the `arm` rootfs, and
+its store (`.techo5-store`: `board=athena`) makes `slotctl install` refuse any rootfs whose
+`etc/techo5/device.conf` doesn't say `T5_BOARD=athena`. New units: docs/install-athena.md.
+On the mainline path athena boots TECHO5's own Linux 6.18 kernel; its source, patches and build
+script are in tools/linux/athena/kernel (README.md there).
+
+### The boot layer (opt-in)
+
+The boot layer is U-Boot with an A/B boot menu, from
+[u-boot-amazon-echo](https://github.com/nuno407/u-boot-amazon-echo) (its SPEC.md is the contract
+below; issue #336). It is opt-in: `tools/install-athena.py --boot-layer` installs it on an athena
+(docs/install-athena.md, "The boot layer"). Where it is, it keeps an A/B record in
+the misc partition, picks the slot, counts its tries, starts that slot's own kernel from
+`slots/<x>/boot/boot.img` and says which on the kernel command line (`ab.slot=<x>`, `ab.kernel=`).
+The OS side, in this tree:
+
+- `bootctl` (a copy of the boot layer's own) reads and changes the record. Without a record it
+  changes nothing and exits 3. On a board whose bootloader is systemd-boot (the Surface RT,
+  `surface-rt/`), its systemd-boot backend keeps the same record as the ESP's loader entries and
+  their boot counters (`slot-x.conf` good, `slot-x+N.conf` on trial, `+0` bad; loader.conf's
+  `preferred` and `default`), the way systemd's own bootctl does, with the same commands and
+  output. The board's entries carry `ab.slot=<x> ab.kernel=<x>`, so `boot.sh` and `slotctl` need
+  not know which bootloader runs. Chosen by `BACKEND=systemd-boot` in `/etc/bootctl.conf`, or where
+  no misc partition holds a record and the ESP has such entries.
+- `slotctl` keeps its files as before and tells the record the same through bootctl: install,
+  commit, switch and rollback. Where there is a record, install also puts the slot's kernel at
+  `slots/<x>/boot/boot.img` (a hard link) and a label at `slots/<x>/boot/label`. A rootfs with no
+  kernel of its own keeps the one the unit runs with now (the booted slot's `boot/boot.img`, else
+  the other slot's), and slotctl says so.
+- The initramfs `init` (and athena's `/init`) boot the slot named by `ab.slot=` without
+  `slotctl next`, and start busybox's watchdog daemon on `/dev/watchdog`, which the boot layer's
+  command line asks for (the kernel feeds it only for the first 120 s).
+- `boot.sh`'s slot trial (commit after five healthy minutes, reboot after 15 minutes if the slot
+  never gets there) also covers a slot the boot layer still has on trial. Its commit marks the slot
+  good in the record too, and its reboot is a try the boot layer counts. The kernel update
+  (`KERNEL_UPDATE`) is off: the kernel comes with the slot.
+
+Without the boot layer there is no `ab.slot=` and no record, and all of this stays off.
+
+Moving an existing unit: nothing changes until the boot layer is installed. `install-athena.py
+--boot-layer` saves boot and misc, writes the A/B record with the slot running now marked good, and
+fills in `slots/<x>/boot/` for both existing slots before U-Boot replaces the boot partition: from
+each rootfs's own kernel image where there is one, otherwise from the kernel in the boot partition
+that the unit runs today. After that, every release brings its kernel in the slot, or keeps the
+current one. `--boot-layer-off` puts the saved kernel back and clears the record. echod's kernel
+update never writes over U-Boot (echod/internal/update/kernel/uboot.go).
+
+U-Boot itself is built from source by `tools/linux/athena/uboot/build.sh`, at the u-boot-amazon-echo
+and upstream U-Boot commits it pins, with TECHO5's settings (`techo5-athena.config`: the marker the
+guards look for, and `CONFIG_AB_DT_CARRY="techo5,dsp-config"`, so each slot's kernel gets the unit's
+amp tuning from U-Boot's own image). The release workflow runs it and attests the binary and its
+source; a release names the binary in its signed manifest (`techo5-uboot-athena-<version>.bin`). The
+installer packs it into that release's boot image with `pack-uboot.py` and fills in the tuning.
+`python3 tools/test_boot_layer.py` runs bootctl, slotctl and the command line checks under
+busybox, in Docker, both with and without a record.
 
 ## Next
 

@@ -61,9 +61,6 @@ const (
 	chimeLevel = 0.4
 )
 
-// announceTone is what an announcement arrives with: two notes rising, distinct from the alarm's.
-var announceTone = []speaker.Note{{Freq: 659, Ms: 90}, {Freq: 988, Ms: 160}}
-
 // Message is an announcement as it arrives: who it came from, what was said, and the saying of it.
 //
 // Audio is the point and text is the trimming. A device with a screen shows the words when there are
@@ -252,7 +249,7 @@ func (f *Feature) show(m Message) {
 // announcement stops all of it, and so that whatever was playing is put back afterwards.
 func (f *Feature) sound(m Message) {
 	claim := speaker.Sound().ClaimSpeech("announcement", func(ctx context.Context, p *speaker.Player) error {
-		p.Chime(chimeLevel, announceTone...)
+		p.Chime(chimeLevel, speaker.AnnounceSound()...)
 		if len(m.Voice) == 0 {
 			return nil
 		}
@@ -469,12 +466,12 @@ func post(p Peer, word string, body []byte, headers map[string]string) error {
 		_ = resp.Body.Close()
 		if resp.StatusCode == http.StatusConflict && try == 0 {
 			if theirs, err := strconv.ParseInt(resp.Header.Get(timeHeader), 10, 64); err == nil {
-				off := time.Until(time.Unix(theirs, 0))
-				setOffset(addr, off)
+				off := setOffset(addr, time.Until(time.Unix(theirs, 0)), time.Now())
 				slog.Info("announce: signing by another device's clock", "device", p.Name, "off_by", off.Round(time.Second))
 				continue
 			}
 		}
+		refusedBy(p.Name, resp.StatusCode) // otherword.go
 		if resp.StatusCode >= 300 {
 			return fmt.Errorf("%s said %s", p.Name, resp.Status)
 		}

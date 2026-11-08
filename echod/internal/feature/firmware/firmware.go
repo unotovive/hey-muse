@@ -46,6 +46,9 @@ type Firmware struct {
 
 	mu    sync.Mutex
 	found update.Manifest
+	// appOffered is what a panel's app last said its release server offers, newer than this build, or
+	// "": a panel has no release stream of its own (see askApp).
+	appOffered string
 
 	announced  sync.Once
 	rolledBack string
@@ -54,6 +57,13 @@ type Firmware struct {
 	// did not install: for the setup page, which has no update card to watch.
 	at     float32
 	failed string
+
+	// phase and target describe the update currently being installed.
+	phase  string
+	target string
+	// progressListener reports updates to an optional on-device display.
+	progressListener func(bool, float32, string, string, string)
+
 	// busy counts the Install calls running, which re-read the channel before the download starts.
 	busy atomic.Int32
 }
@@ -73,6 +83,21 @@ func (u *Firmware) Failed() string {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	return u.failed
+}
+
+// SetProgressListener registers a listener for the on-device update dialog.
+func (u *Firmware) SetProgressListener(listener func(bool, float32, string, string, string)) {
+	u.mu.Lock()
+	u.progressListener = listener
+
+	active := u.busy.Load() > 0 || update.Installing()
+	at, phase, target, message := u.at, u.phase, u.target, u.failed
+	u.mu.Unlock()
+
+	// A display starting after an update has begun should see the current state too.
+	if listener != nil && (active || message != "") {
+		listener(active, at, phase, target, message)
+	}
 }
 
 var (
@@ -155,6 +180,9 @@ func build() *Firmware {
 			Category: esphome.CategoryDiagnostic,
 		},
 	}
+	// Empty until an attempt settles: no outcome claimed for one this process did not see (Settled),
+	// and not unknown in Home Assistant either.
+	u.status.Set("")
 
 	u.events = &esphome.Event{
 		Base: esphome.Base{
@@ -220,6 +248,9 @@ func (u *Firmware) Settled(event, status string) {
 func (u *Firmware) Offered() string {
 	u.mu.Lock()
 	defer u.mu.Unlock()
+	if !update.Published() {
+		return u.appOffered
+	}
 	if u.found.Version == "" || u.found.Version == layout.Version || !u.found.Serves() ||
 		!update.Newer(u.found.Version, layout.Version) {
 		return ""
@@ -245,6 +276,10 @@ func (u *Firmware) Channel() update.Channel {
 // A fetch that fails leaves the last answer in place, so a device that briefly cannot reach the channel
 // keeps reporting what it knew rather than blanking the card.
 func (u *Firmware) Check(ctx context.Context) {
+	if !update.Published() {
+		askApp(false)
+		return
+	}
 	channel := u.Channel()
 
 	found, err := update.Fetch(ctx, channel)
@@ -291,8 +326,13 @@ func (u *Firmware) command(cmd esphome.UpdateCommand) {
 // Nothing is installed that was not offered: the version comes from the manifest this device fetched,
 // not from Home Assistant, which has no way to name one.
 func (u *Firmware) Install(ctx context.Context) {
+	if !update.Published() {
+		askApp(true) // a panel's app installs a newer build if its release server has one
+		return
+	}
 	u.busy.Add(1)
 	defer u.busy.Add(-1)
+
 	found, err := update.Fetch(ctx, u.Channel())
 	if err != nil {
 		slog.Warn("re-reading the channel failed, using the last check", "err", err)
@@ -323,7 +363,9 @@ func (u *Firmware) Install(ctx context.Context) {
 	defer working.Done()
 
 	u.progress(found, 0)
-	err = update.Install(ctx, found, func(at float32) { u.progress(found, at) })
+	err = update.Install(ctx, found,
+		func(at float32) { u.progress(found, at) },
+		func(phase string) { u.phaseReport(found, phase) })
 
 	// Home Assistant learns nothing from the command it sent — the update entity has no way to say an
 	// install failed, and the card just goes back to offering it. So the failure has to arrive as state,
@@ -339,26 +381,72 @@ func (u *Firmware) Install(ctx context.Context) {
 	}
 	if err != nil {
 		slog.Error("installing an update failed", "version", found.Version, "err", err)
+
+		message := err.Error()
+
 		u.mu.Lock()
-		u.failed = found.Version + ": " + err.Error()
+		u.failed = found.Version + ": " + message
+		u.phase, u.target = "failed", found.Version
+		listener := u.progressListener
 		u.mu.Unlock()
+
+		if listener != nil {
+			listener(false, 0, "failed", found.Version, message)
+		}
+
 		u.publish(found)
-		u.Settled(EventFailed, "installing "+found.Version+" failed: "+err.Error())
+		u.Settled(EventFailed, "installing "+found.Version+" failed: "+message)
 		feedback.Failure()
 		return
 	}
-	update.Restart("update to " + found.Version)
+
+	// update.Install ran the countdown and asked for the restart (or, on a slot device, the reboot)
+	// itself, with the install lock held throughout. All that is left is to let the progress
+	// listener's last phase stand.
+}
+
+// phaseReport is a named step of the install with no progress of its own — the countdown before it
+// goes away, and the restart itself. It goes to the on-device dialog, and the version fields are kept
+// current for whoever reads them.
+func (u *Firmware) phaseReport(found update.Manifest, phase string) {
+	u.mu.Lock()
+	u.at, u.phase, u.target = 1, phase, found.Version
+	listener := u.progressListener
+	u.mu.Unlock()
+
+	if listener != nil {
+		listener(true, 1, phase, found.Version, "")
+	}
 }
 
 // progress republishes the state with how far the download has got. The version fields go out with it
 // because Home Assistant reads the whole state each time.
 func (u *Firmware) progress(found update.Manifest, at float32) {
+	if at < 0 {
+		at = 0
+	}
+	if at > 1 {
+		at = 1
+	}
+
+	phase := "downloading"
+	if at >= 1 {
+		phase = "installing"
+	}
+
 	u.mu.Lock()
 	u.at, u.failed = at, ""
+	u.phase, u.target = phase, found.Version
+	listener := u.progressListener
 	u.mu.Unlock()
+
 	state := u.state(found)
 	state.InProgress, state.Progress = true, at*100
 	u.entity.Set(state)
+
+	if listener != nil {
+		listener(true, at, phase, found.Version, "")
+	}
 }
 
 // publish is the state with nothing happening, which is also how a failed install stops looking like one
@@ -386,5 +474,9 @@ func (u *Firmware) state(found update.Manifest) esphome.UpdateState {
 func (u *Firmware) Name() string { return "firmware" }
 
 func (u *Firmware) Entities() []esphome.Entity {
+	if !update.Published() {
+		// A panel follows no channel of its own (its app updates it): no Stable or Dev to choose.
+		return []esphome.Entity{u.entity, u.look, u.status, u.events, u.auto}
+	}
 	return []esphome.Entity{u.entity, u.channel, u.look, u.status, u.events, u.auto}
 }

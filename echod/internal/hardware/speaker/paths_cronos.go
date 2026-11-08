@@ -1,20 +1,22 @@
-//go:build !dot && !spot
+//go:build !dot && !spot && !panel
 
 package speaker
 
 import (
 	"math"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/HuskerMinion/techo5/echod/internal/config"
 	"github.com/HuskerMinion/techo5/echod/internal/layout"
+	"github.com/HuskerMinion/techo5/echod/internal/lib/asp"
 )
 
-// Output is one of the device's audio outputs. Only the 1st gen Show 5 has a headphone jack (see
-// HasJack); on the others OutputHeadphone exists only so the shared code compiles, and DetectOutput
-// never returns it.
+// Output is one of the device's audio outputs. The 1st gen Show 5 and the Show 8 have a headphone
+// jack (see HasJack); on the 2nd gen Show 5 OutputHeadphone exists only so the shared code compiles,
+// and DetectOutput never returns it.
 type Output string
 
 const (
@@ -39,7 +41,23 @@ const (
 // ffffff8009eb0004), reproduced five times on 2026-09-14 with rings of 12 and 16 KB — while the
 // DRAM path plays cleanly. Holding any other AFE node marks the SRAM taken, so DL1 takes DRAM.
 // MultiMedia1_Capture is an AFE capture nothing on this device uses.
-const DRAMHold = "/dev/snd/pcmC0D1c"
+//
+// athena on TECHO5's mainline kernels has no such fault, and its pcmC0D1c is the microphones' capture
+// (an older tools/linux/athena kernel) or the echo reference (DL1_AWB_Record), so nothing is held
+// there. Nor on the Skylight, which has no MediaTek AFE.
+var DRAMHold = onSkylight("", onMainline("", "/dev/snd/pcmC0D1c"))
+
+// startFull starts the stream only once the whole ring is written, at open and after every underrun.
+//
+// The DL1 driver's pointer check (mtk_pcm_I2S0dl1_pointer) calls it an underflow when it reads the
+// DMA as further along than what it holds. After a stop it starts counting from the top of the ring
+// again, and the first readings after a restart can still show the DMA where it stopped. With one
+// period in the ring that reads as an underflow every time, so the stream stops and restarts
+// thousands of times a second: constant "pointer underflow" and "stop" lines in the kernel log and
+// choppy sound until a reboot (#142). With the whole ring written no such reading can exceed what it
+// holds. That is the theory from the driver source and the unit's kernel log; the fix has not been
+// seen to end the storm on a unit yet.
+const startFull = true
 
 // A mixer write, as the shared player applies it.
 type kctl struct {
@@ -78,7 +96,161 @@ type kctl struct {
 // was not enough; setting Ext_Speaker_Amp_Switch Off is what reached the room, so crown's amplifier
 // switch is active low as well and its separate amp_gpio is not the gate. A 1 kHz tone at 0.3 FS
 // then read -4 dBFS at the microphones, up from -53. See TECHO5-CROWN crown-port-notes.md.
-var initSequence = showInit(rt5616())
+//
+// The 2nd gen Show 8 (athena) has none of this to do: on Amazon's own kernel the TAS5805M driver
+// loads the amplifier's tuning and protection itself (the "speaker-config" table, its -9.5 dB analog
+// gain and the DSP's limiter) and powers it with the stream. Nothing is written to it, and its
+// "Master TAS5805m Playback Volume" is left where the driver put it.
+//
+// On TECHO5's mainline kernel (tools/linux/athena/kernel, machine driver mt8183-athena) the AFE's
+// interconnect from DL1 into I2S1 is a mixer switch per channel that starts off, and the upstream
+// tas5805m driver starts its digital volume at 0, which is silence. The driver loads Amazon's DSP
+// blob itself (tas5805m_dsp_athena.bin), and the machine driver sets I2S1's low-jitter clock. Master
+// 110 is 0 dB, as Amazon's setup runs it, with the blob's analog gain and DSP limiter as the
+// protection. The first bring-up used 100 (-10 dB); with a phone at full volume over Bluetooth that
+// played clearly quieter than the device can, and 110 measured +10 dB at the microphones with peaks
+// still 12 dB under full scale (unit 1, 2026-10-15).
+//
+// The Skylight Calendar 15 (RK3566 on TECHO5's mainline kernel) plays through the RK809 PMIC's codec
+// into an external amplifier that is fed from the codec's headphone outputs, not its SPKO line out:
+// measured on the unit 2026-10-17 with a Dot's microphones, a -36 dBFS tone reached them
+// only with "Playback Mux" on HP. The amplifier's enable is a GPIO the device tree hands to the
+// kernel (simple-audio-amplifier), powered with the stream. The codec's digital volume is set to its
+// 0 dB top (255) and the volume curve is applied in software, as on every Show.
+var initSequence = boardInit()
+
+func boardInit() []kctl {
+	if layout.Skylight() {
+		return skylightInit
+	}
+	if layout.AthenaMainline() {
+		return athenaMainlineInit
+	}
+	if layout.Athena() {
+		return nil
+	}
+	return showInit(rt5616())
+}
+
+var athenaMainlineInit = append(athenaMainlineRoutes, kctl{name: athenaMaster, level: athenaMasterUnity})
+
+// athenaMaster is the upstream tas5805m driver's digital volume, one level per channel, both written
+// alike. Its table (tas5805m_volume) makes 110 0 dB and each step 1 dB, the same scale as the Show 5's
+// TAS5805M control (gain.go), under another name and with two channels.
+const (
+	athenaMaster      = "Master Playback Volume"
+	athenaMasterUnity = 110
+)
+
+// gainOnPath is whether the Speaker gain setting goes with the speaker's path rather than to the Show
+// 5's TAS5805M control (gain.go): on athena's mainline kernel it does, as the amplifier's digital
+// volume. initSequence writes that volume at 0 dB on every start, Reopen and Close, so a gain written
+// once beside it would be lost on the next Reopen; written with the path, it follows every one. The
+// Skylight's "Master Playback Volume" is another chip's and is never touched.
+var gainOnPath = layout.AthenaMainline()
+
+// withSpeakerGain is seq, out's path, with the Speaker gain in it: on athena's mainline kernel the
+// amplifier's digital volume at db dB over 0 dB, written after initSequence's 0 dB. Kept to 0 to
+// config.SpeakerGainMax (+6 dB). Elsewhere, and on any output but the speaker, seq as it is.
+//
+// The echo reference needs nothing for it: it is made from what the speaker sent (softRef), ahead of
+// the amplifier, so it neither grows nor clips with it. The echo at the microphones grows by db, as on
+// the Dot (paths_dot.go). Amazon's DSP tuning in the amplifier is left as it is.
+func withSpeakerGain(seq []kctl, out Output, db int) []kctl {
+	if !gainOnPath || out != OutputSpeaker {
+		return seq
+	}
+	return append(slices.Clone(seq), speakerGainControls(db)...)
+}
+
+// speakerGainControls is what a change of the Speaker gain writes while the speaker plays: athena's
+// amplifier volume alone, as withSpeakerGain puts it in the speaker's path. Nothing on other boards.
+func speakerGainControls(db int) []kctl {
+	if !gainOnPath {
+		return nil
+	}
+	db = max(0, min(db, config.SpeakerGainMax))
+	return []kctl{{name: athenaMaster, level: int32(athenaMasterUnity + db)}}
+}
+
+var skylightInit = []kctl{
+	{name: "Playback Mux", value: "HP"},
+	{name: "Master Playback Volume", level: 255},
+}
+
+// athenaMainlineRoutes are the AFE's DL1 into I2S1. Without them the DPCM front end has no back end
+// and the playback device does not open ("no backend DAIs enabled for Playback_1", EINVAL), so they
+// are also the openSequence.
+var athenaMainlineRoutes = []kctl{
+	{name: "I2S1_CH1 DL1_CH1", level: 1},
+	{name: "I2S1_CH2 DL1_CH2", level: 1},
+}
+
+// openSequence is written before the playback device is opened: athena's mainline routes, and nothing
+// on any other Show.
+var openSequence = onMainline(athenaMainlineRoutes, nil)
+
+// PlaybackDevice is the playback PCM: the AFE's DL1 into the codec on the Show 5s and crown, and on
+// athena "I2S0DL1_PLayback", the AFE's DL1 into the TAS5805M (hw:0,7). On athena's mainline kernel
+// DL1 is the card's first front end, Playback_1 (hw:0,0). The Skylight's simple-audio-card has one
+// playback device, hw:0,0.
+var PlaybackDevice = onSkylight(0, onMainline(0, onAthena(7, 23)))
+
+// hwRate is the rate the card runs at. Everything up to the card works at Rate; athena's amplifier
+// runs at 96 kHz, as Fire OS runs it (AFE.cfg: "Speakers SamplingRate" 48000, "SpeakerHw
+// SamplingRate" 96000, the "PlaybackUpsampler" last in the chain), because the tuning inside the
+// TAS5805M was made for that rate: at 48 kHz every corner of its EQ and limiter would sit an octave
+// low. So the write loop doubles the rate on the way out (lib/audio Upsampler).
+var hwRate = onAthena(96000, Rate)
+
+// athenaRingMax is the most ring hw:0,7 may be given. Amazon's capture drivers on this kernel do not
+// hold a ring to the DMA block they set aside and panic the kernel when it is larger (mic/athena.go),
+// so athena's rings are sized against what each driver was seen to use rather than what hw_params
+// offers. The playback ring is 4 periods of 1536 frames at 96 kHz, 24576 bytes: exactly the AFE SRAM
+// block the DL1 driver took for it on the unit (dma_bytes 24576, "MaxSramSize = 24576").
+const athenaRingMax = 24576
+
+// hwTrimDB is taken off everything the card is sent, after the volume and the tuning. Zero on every
+// Show. athena started 10 dB under crown (M4 to M8) until its speaker had been heard; on the unit
+// (2026-10-14) a 30% test tone played loud and clean, and a reply at the media volume crown would use
+// was barely audible, so athena now plays at crown's level: the same volume curves in front of the
+// same Crown tuning set, nothing trimmed. The amplifier's own protection (its -9.5 dB analog gain and
+// the DSP limiter Amazon's driver loads) is untouched, and athenaTrimDB stays a cut, never a boost.
+var hwTrimDB = onAthena(athenaTrimDB, 0)
+
+const athenaTrimDB = 0.0
+
+// hwBits is the sample width the card is sent: Bits, as everything up to it works.
+const hwBits = Bits
+
+// softRef is whether the speaker may feed the software echo reference (lib/echoref): only athena on
+// the mainline kernel, and there only while the microphones use it (echoref.InUse), which is when the
+// card's own DL1_AWB_Record did not open (mic/athena.go).
+var softRef = layout.AthenaMainline()
+
+// onMainline picks the value for athena on TECHO5's mainline kernel over any other.
+func onMainline[T any](mainline, other T) T {
+	if layout.AthenaMainline() {
+		return mainline
+	}
+	return other
+}
+
+// onSkylight picks the Skylight's value over any other.
+func onSkylight[T any](skylight, other T) T {
+	if layout.Skylight() {
+		return skylight
+	}
+	return other
+}
+
+// onAthena picks athena's value over every other Show's.
+func onAthena[T any](athena, other T) T {
+	if layout.Athena() {
+		return athena
+	}
+	return other
+}
 
 // rt5616 is whether the speaker is the Realtek codec and its GPIO amplifier rather than the
 // MAX98396: true on the 1st gen Show 5 and on the Show 8, false on the 2nd gen Show 5.
@@ -107,14 +279,15 @@ func showInit(rt5616 bool) []kctl {
 	}
 }
 
-// pathSequence and headphoneOff move the 1st gen Show 5 between its speaker and its jack; the other
-// boards have no jack and nothing to move.
+// pathSequence and headphoneOff move the 1st gen Show 5 and the Show 8 between their speaker and
+// their jack; the 2nd gen Show 5 has no jack and nothing to move.
 var pathSequence, headphoneOff = showPaths(HasJack)
 
 // showPaths is the RT5616's two outputs on the 1st gen Show 5, found on a unit 2026-10-03 with
-// headphones in. The jack hangs off the codec's headphone pins: OUT MIX feeds HPVOL, HPVOL feeds HPO
-// MIX, and HP Playback Switch unmutes the pins; out of reset all three are off, which is why the jack
-// was silent. The speaker is the line-out (see showInit), so muting OUT Playback Switch quiets it
+// headphones in. The Show 8 has the same codec and jack, and the same paths moved its sound to
+// earbuds and back on a unit 2026-10-12 (#118). The jack hangs off the codec's headphone pins: OUT
+// MIX feeds HPVOL, HPVOL feeds HPO MIX, and HP Playback Switch unmutes the pins; out of reset all
+// three are off, which is why the jack was silent. The speaker is the line-out (see showInit), so muting OUT Playback Switch quiets it
 // while the headphones play. The board's own Headphone_Speaker_Mux and Ext_Headphone_Amp_Switch were
 // left alone and were not needed.
 func showPaths(jack bool) (map[Output][]kctl, []kctl) {
@@ -122,28 +295,28 @@ func showPaths(jack bool) (map[Output][]kctl, []kctl) {
 		return map[Output][]kctl{OutputSpeaker: {}, OutputHeadphone: {}, OutputBoth: {}}, []kctl{}
 	}
 	return map[Output][]kctl{
-			OutputSpeaker: {
-				{name: "OUT Playback Switch", level: 1},
-			},
-			OutputHeadphone: {
-				{name: "OUT Playback Switch", level: 0},
-				{name: "HPVOL Playback Switch", level: 1},
-				{name: "HPO MIX HPVOL Switch", level: 1},
-				{name: "HP Playback Switch", level: 1},
-			},
-			// Both is the headphone path with the line-out left open: the speaker and the jack play
-			// the same audio at the same volume.
-			OutputBoth: {
-				{name: "OUT Playback Switch", level: 1},
-				{name: "HPVOL Playback Switch", level: 1},
-				{name: "HPO MIX HPVOL Switch", level: 1},
-				{name: "HP Playback Switch", level: 1},
-			},
-		}, []kctl{
-			{name: "HP Playback Switch", level: 0},
-			{name: "HPO MIX HPVOL Switch", level: 0},
-			{name: "HPVOL Playback Switch", level: 0},
-		}
+		OutputSpeaker: {
+			{name: "OUT Playback Switch", level: 1},
+		},
+		OutputHeadphone: {
+			{name: "OUT Playback Switch", level: 0},
+			{name: "HPVOL Playback Switch", level: 1},
+			{name: "HPO MIX HPVOL Switch", level: 1},
+			{name: "HP Playback Switch", level: 1},
+		},
+		// Both is the headphone path with the line-out left open: the speaker and the jack play
+		// the same audio at the same volume.
+		OutputBoth: {
+			{name: "OUT Playback Switch", level: 1},
+			{name: "HPVOL Playback Switch", level: 1},
+			{name: "HPO MIX HPVOL Switch", level: 1},
+			{name: "HP Playback Switch", level: 1},
+		},
+	}, []kctl{
+		{name: "HP Playback Switch", level: 0},
+		{name: "HPO MIX HPVOL Switch", level: 0},
+		{name: "HPVOL Playback Switch", level: 0},
+	}
 }
 
 // jackState is the kernel's headphone jack switch: 1 while something is plugged in. Only read where
@@ -153,9 +326,19 @@ const jackState = "/sys/class/switch/h2w/state"
 // jackPoll is how often the jack switch is sampled.
 const jackPoll = 500 * time.Millisecond
 
+// jackSense, where a board of this build sets it, says whether headphones are in, in place of
+// jackState: a board whose jack the kernel reports some other way. Nil on every Show.
+var jackSense func() bool
+
 // DetectOutput picks the output to use. A board with no jack, or a missing switch, is the speaker.
 func DetectOutput() Output {
 	if !HasJack {
+		return OutputSpeaker
+	}
+	if jackSense != nil {
+		if jackSense() {
+			return OutputHeadphone
+		}
 		return OutputSpeaker
 	}
 	b, err := os.ReadFile(jackState)
@@ -242,6 +425,31 @@ const MediaService = "vendor.audio-hal"
 // (found 2026-09-14). The amplifier is left as the kernel brought it up.
 const AmpSwitch = ""
 
+// MuteSwitch is a mute on the amplifier besides AmpSwitch: none on any Show.
+const MuteSwitch = ""
+
+// idleGate is the amplifier the player puts to sleep while nothing plays (idle.go): the 1st gen Show
+// 5's alone. There Ext_Speaker_Amp_Switch is not the cronos reset line AmpSwitch warns of but a plain
+// enable on a GPIO (amp_gpio, pio 35), active low, so it is the reverse of its name: "Off" plays, "On"
+// is the amplifier off (amp_gpio hi). Left on all the time it amplifies the RT5616's idle output,
+// which is the hum of #291; switched On by hand on a unit (2026-10-25) the hum was gone. The line-out's
+// OUT Playback Switch is the mute in front of it, the same one the headphone path uses.
+//
+// crown has the same codec and the same active-low switch (showInit), and very likely the same hum,
+// but nobody has listened to this on one yet, so it keeps its amplifier on.
+var idleGate = showIdleGate(layout.Checkers())
+
+func showIdleGate(checkers bool) *ampGate {
+	if !checkers {
+		return nil
+	}
+	return &ampGate{control: "Ext_Speaker_Amp_Switch", on: "Off", off: "On", mute: "OUT Playback Switch"}
+}
+
+// mayHaveTAS5805M is whether a board of this build can carry the TAS5805M amplifier (GainAvailable):
+// some 2nd gen Show 5 units do, and the Show 8's kernel carries its driver too.
+const mayHaveTAS5805M = true
+
 // OutputBoost is make-up gain on everything the speaker plays, before the volume curve and the
 // limiter. Unity: the quiet output that once seemed to need it was the amplifier's safe mode
 // (see initSequence), and speech has its own normalizer.
@@ -250,14 +458,17 @@ const OutputBoost = 1.0
 // DriverTuning applies the vendor driver's volume-dependent EQ and limiter (lib/asp), read from the
 // unit's own vendor partition. Both generations of Show 5 declare the same four filters and the same
 // compressor in their AFE.cfg ("Cronos" and "Checkers"), which lib/asp knows as asp.Show; a unit
-// whose files are missing or are a set we do not know says so and plays untuned.
-const DriverTuning = true
+// whose files are missing or are a set we do not know says so and plays untuned. A variable: a board of
+// this build with no vendor partition at all turns it off, and plays untuned without the error.
+var DriverTuning = true
+
+// tuningSet is the tuning to load by name, where the files cannot tell it: nil, the Shows' can.
+var tuningSet *asp.Set
 
 // HasJack is whether the device has a headphone jack, and so the Audio output choice: the 1st gen
-// Show 5 does; the 2nd gen Show 5 has none, and the Show 8 is not known to. The kernel's jack switch
-// has to be there as well: a board told apart by the mute driver alone, with no panel name, could be
-// a Show 8 taken for a 1st gen Show 5.
-var HasJack = layout.Checkers() && exists(jackState)
+// Show 5 and the Show 8 do; the 2nd gen Show 5 has none. The kernel's jack switch has to be there as
+// well, so a board whose device tree leaves the jack off is the speaker only.
+var HasJack = (layout.Checkers() || layout.Crown()) && exists(jackState)
 
 func exists(path string) bool {
 	_, err := os.Stat(path)
@@ -266,5 +477,6 @@ func exists(path string) bool {
 
 // HasBoth is whether the speaker and the jack can play at once, and so the Both choice: wherever
 // there is a jack, since the speaker is the line-out and the jack the headphone pins, and the codec
-// drives both from the one mixer (heard on a 1st gen 2026-10-03).
+// drives both from the one mixer (heard on a 1st gen 2026-10-03; the Show 8's codec is the same, but
+// Both has not been listened to on one).
 var HasBoth = HasJack

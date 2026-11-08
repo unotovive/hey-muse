@@ -3,7 +3,6 @@
 package display
 
 import (
-	"context"
 	"log/slog"
 	"slices"
 	"strings"
@@ -12,7 +11,7 @@ import (
 	"github.com/HuskerMinion/techo5/echod/internal/component"
 	"github.com/HuskerMinion/techo5/echod/internal/config"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/home"
-	"github.com/HuskerMinion/techo5/echod/internal/hardware/speaker"
+	"github.com/HuskerMinion/techo5/echod/internal/feature/notify"
 	"github.com/HuskerMinion/techo5/echod/internal/lib/hass"
 )
 
@@ -39,7 +38,7 @@ func popupKey(e hass.Event) string {
 // popupMorning is when all-day events pop up on day: as the night ends, or seven o'clock without one.
 func popupMorning(day time.Time) time.Time {
 	at := 7 * 60
-	if _, to, ok := config.ParseWindow(config.Get().Screen.Night); ok {
+	if to, ok := config.NightEndOn(config.Get().Screen.Night, config.Get().Screen.NightWeekend, day); ok {
 		at = to
 	}
 	return time.Date(day.Year(), day.Month(), day.Day(), at/60, at%60, 0, 0, time.Local)
@@ -52,7 +51,7 @@ func duePopups(events []hass.Event, now time.Time, c config.Calendar, shown map[
 	lead := time.Duration(c.PopupLead()) * time.Minute
 	var out []hass.Event
 	for _, e := range events {
-		if len(c.PopupCalendars) > 0 && !slices.Contains(c.PopupCalendars, e.Calendar) {
+		if len(c.PopupCalendars) > 0 && !slices.ContainsFunc(c.PopupCalendars, func(cal string) bool { return home.OnCalendar(e, cal) }) {
 			continue
 		}
 		if shown[popupKey(e)] {
@@ -104,7 +103,7 @@ func (d *Display) popupTick(now time.Time) {
 	// Due and not yet shown; an event already waiting its turn, or up now, is not queued twice. An event
 	// counts as shown - and is saved as shown - only once it comes up, so a restart while it waits loses
 	// nothing.
-	due := duePopups(events, now, c, popupShownNow())
+	due := duePopups(popupCandidates(events, c), now, c, popupShownNow())
 	d.mu.Lock()
 	for _, e := range due {
 		k := popupKey(e)
@@ -159,13 +158,13 @@ func (d *Display) popupTick(now time.Time) {
 	shown[popupKey(e)] = true
 	keepPopupShown(shown, now)
 
-	slog.Info("calendar: pop-up", "event", e.Summary, "starts", e.Start.Format(time.Kitchen), "night", night)
+	slog.Info("calendar: pop-up", "summary", e.Summary, "starts", e.Start.Format(time.Kitchen), "night", night)
 	component.Fire.Emit(component.Event{Name: CalendarEvent, Data: map[string]string{
 		"event": "popup", "summary": e.Summary, "calendar": e.Calendar,
 		"start": e.Start.Format(time.RFC3339), "device": config.Get().Device.Name,
 	}})
 	if !c.PopupSilent && !night && !config.Quiet() {
-		go popupChime()
+		go notify.Chime()
 	}
 }
 
@@ -196,23 +195,6 @@ func keepPopupShown(shown map[string]bool, now time.Time) {
 	}
 }
 
-// popupFloor is the least the chime plays at, in volume steps, so it is heard.
-const popupFloor = 6
-
-// popupChime is the pop-up's sound: two soft falling notes, once.
-func popupChime() {
-	notes := []speaker.Note{{Freq: 988, Ms: 150}, {Freq: 0, Ms: 60}, {Freq: 784, Ms: 260}}
-	claim := speaker.Sound().Claim("calendar", func(ctx context.Context, pl *speaker.Player) error {
-		pl.Bell(max(pl.Step(), popupFloor), 0.5, notes...)
-		select {
-		case <-ctx.Done():
-		case <-time.After(700 * time.Millisecond):
-		}
-		return nil
-	})
-	<-claim.Done()
-}
-
 // dismissPopup takes the pop-up down, and has the next in turn, if any, come up at once.
 func (d *Display) dismissPopup() {
 	d.mu.Lock()
@@ -226,4 +208,10 @@ func (d *Display) popupUp() *hass.Event {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.popup
+}
+
+// popupCandidates is the events that may pop up: not those of a calendar hidden on this screen's
+// calendar page, which are hidden here everywhere, pop-ups as well.
+func popupCandidates(events []hass.Event, c config.Calendar) []hass.Event {
+	return visibleEvents(events, hiddenHere(c))
 }

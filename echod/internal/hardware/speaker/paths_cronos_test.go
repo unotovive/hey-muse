@@ -1,4 +1,4 @@
-//go:build !dot && !spot
+//go:build !dot && !spot && !panel
 
 package speaker
 
@@ -6,6 +6,9 @@ import (
 	"math"
 	"testing"
 	"time"
+
+	"github.com/HuskerMinion/techo5/echod/internal/config"
+	"github.com/HuskerMinion/techo5/echod/internal/layout"
 )
 
 // The Show's curve is linear in dB: −45 dB at the first step, −24 dB at half, −6 dB at the top.
@@ -69,7 +72,34 @@ func TestShowInit(t *testing.T) {
 	}
 }
 
-// The 1st gen's jack: headphones open the codec's headphone pins and mute the line-out that feeds the
+// Only the 1st gen Show 5 puts its amplifier to sleep while idle, and its switch is active low: "Off"
+// wakes it, "On" puts it to sleep, the reverse of what showInit's start would suggest if read by name.
+// Every other Show (cronos, whose switch is the MAX98396's reset; crown, untested; athena; the
+// Skylight) has no gate, and its amplifier is left exactly as before.
+func TestShowIdleGate(t *testing.T) {
+	if g := showIdleGate(false); g != nil {
+		t.Errorf("a Show other than checkers has an idle gate: %+v", g)
+	}
+	g := showIdleGate(true)
+	if g == nil {
+		t.Fatal("checkers has no idle gate")
+	}
+	if *g != *testGate {
+		t.Errorf("checkers gate %+v, want %+v", *g, *testGate)
+	}
+	start := showInit(true)
+	if start[0].name != g.control || start[0].value != g.on {
+		t.Errorf("the gate's on (%q) is not what showInit starts the amplifier with (%+v)", g.on, start[0])
+	}
+	if idleGate != nil {
+		t.Errorf("the test board %q has an idle gate", layout.Board)
+	}
+	if New().gate != nil {
+		t.Error("a player off checkers carries an idle gate")
+	}
+}
+
+// The jack (1st gen Show 5 and Show 8): headphones open the codec's headphone pins and mute the line-out that feeds the
 // speaker; the speaker opens the line-out again, after headphoneOff has closed the pins. The boards
 // without a jack touch nothing.
 func TestShowPaths(t *testing.T) {
@@ -165,5 +195,195 @@ func TestOutputDoesNotWaitOnASwitch(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Output waited on the path lock")
+	}
+}
+
+// The Show's DL1 driver reads a restart with one period in the ring as an underflow and stops it
+// again; the stream has to start full (#142).
+func TestTheShowStartsWithAFullRing(t *testing.T) {
+	if !startFull {
+		t.Fatal("the Show's playback starts before its ring is full")
+	}
+}
+
+// A workstation reads as a Show 5, so the board values have to be the Show 5's: its playback device,
+// the card at the pipeline's own rate, nothing trimmed, and its own start sequence.
+func TestTheShowsPlaybackIsUnchangedOffAthena(t *testing.T) {
+	if PlaybackDevice != 23 || hwRate != Rate || hwTrimDB != 0 {
+		t.Errorf("device %d at %d Hz trimmed %v dB, want 23 at %d and 0", PlaybackDevice, hwRate, hwTrimDB, Rate)
+	}
+	if got, want := len(boardInit()), len(showInit(rt5616())); got != want {
+		t.Errorf("start sequence has %d writes, want the Show's %d", got, want)
+	}
+	if onAthena(7, 23) != 23 {
+		t.Error("onAthena picked athena's value on a workstation")
+	}
+}
+
+// athena's card runs at twice the pipeline's rate, so a period has to come out whole there, and its
+// trim only ever turns the speaker down.
+func TestAthenasPlaybackSettings(t *testing.T) {
+	const athenaRate = 96000
+	if athenaRate%Rate != 0 || period*athenaRate%Rate != 0 {
+		t.Errorf("%d Hz is not a whole multiple of %d with a %d-frame period", athenaRate, Rate, period)
+	}
+	if athenaTrimDB > 0 {
+		t.Errorf("athena's trim is %+v dB: it may only make the speaker quieter", athenaTrimDB)
+	}
+}
+
+// athena's playback ring fits the block the driver used for it on the unit (paths_cronos.go).
+func TestAthenasPlaybackRingFits(t *testing.T) {
+	if bytes := period * 96000 / Rate * periods * Channels * Bits / 8; bytes > athenaRingMax {
+		t.Errorf("playback ring %d bytes, the driver's block is %d", bytes, athenaRingMax)
+	}
+}
+
+// The Skylight's speaker is the RK809 codec's headphone outputs feeding an external amplifier: the
+// SPKO path was silent on the unit. The mux has to name HP, and the codec runs at its 0 dB top (255)
+// with the volume in software.
+func TestTheSkylightPlaysThroughTheHeadphoneOutputs(t *testing.T) {
+	want := map[string]kctl{
+		"Playback Mux":           {name: "Playback Mux", value: "HP"},
+		"Master Playback Volume": {name: "Master Playback Volume", level: 255},
+	}
+	if len(skylightInit) != len(want) {
+		t.Fatalf("%d writes, want %d: %+v", len(skylightInit), len(want), skylightInit)
+	}
+	for _, c := range skylightInit {
+		w, ok := want[c.name]
+		if !ok || c.value != w.value || c.level != w.level || c.ifPresent {
+			t.Errorf("write %+v, want %+v", c, w)
+		}
+	}
+}
+
+// athenaLevel is the level a sequence writes to athena's amplifier volume, or -1 when it writes none.
+func athenaLevel(t *testing.T, seq []kctl) int32 {
+	t.Helper()
+	level := int32(-1)
+	for _, k := range seq {
+		if k.name == athenaMaster {
+			if level >= 0 {
+				t.Fatalf("the amplifier volume is written twice in %v", seq)
+			}
+			level = k.level
+		}
+	}
+	return level
+}
+
+// onAthenaMainline makes the test's board athena on the mainline kernel, as far as the Speaker gain
+// is concerned.
+func onAthenaMainline(t *testing.T) {
+	was := gainOnPath
+	gainOnPath = true
+	t.Cleanup(func() { gainOnPath = was })
+}
+
+// On athena's mainline kernel the Speaker gain is the amplifier's digital volume, 110 (0 dB) plus 1 a
+// dB, written with the speaker's path after initSequence's 0 dB, held to 0..+6 dB.
+func TestSpeakerGainOnAthenaIsTheAmplifierVolume(t *testing.T) {
+	if got := athenaLevel(t, athenaMainlineInit); got != 110 {
+		t.Fatalf("athena's init writes the amplifier at %d, want 110 (0 dB)", got)
+	}
+	onAthenaMainline(t)
+	path := []kctl{{name: "Some Switch", level: 1}}
+	for db := 0; db <= config.SpeakerGainMax; db++ {
+		gained := withSpeakerGain(path, OutputSpeaker, db)
+		if got := athenaLevel(t, gained); got != int32(110+db) {
+			t.Errorf("+%d dB: level %d, want %d", db, got, 110+db)
+		}
+		if len(gained) != 2 || gained[0].name != path[0].name || gained[0].level != path[0].level || gained[1].name != athenaMaster {
+			t.Errorf("+%d dB: the path is %v, want %v then the amplifier volume", db, gained, path)
+		}
+		if got := withSpeakerGain(path, OutputHeadphone, db); len(got) != 1 {
+			t.Errorf("+%d dB off the speaker: %v", db, got)
+		}
+	}
+	for db, want := range map[int]int32{-1: 110, -40: 110, 7: 116, 29: 116} {
+		if got := athenaLevel(t, withSpeakerGain(nil, OutputSpeaker, db)); got != want {
+			t.Errorf("%d dB: level %d, want %d", db, got, want)
+		}
+	}
+	if len(path) != 1 || cap(path) != 1 {
+		t.Errorf("the path itself was changed: %v", path)
+	}
+	if got := speakerGainControls(4); len(got) != 1 || athenaLevel(t, got) != 114 {
+		t.Errorf("a live change writes %v, want the amplifier volume alone at 114", got)
+	}
+	if !GainAvailable() || !GainPossible() {
+		t.Error("athena's amplifier volume is always there")
+	}
+}
+
+// Every other Show build board keeps the Show 5's TAS5805M gain (gain.go): no path carries it.
+func TestSpeakerGainOffAthenaIsNotOnThePath(t *testing.T) {
+	if gainOnPath {
+		t.Skip("this test host reads as athena on the mainline kernel")
+	}
+	path := []kctl{{name: "OUT Playback Switch", level: 1}}
+	if got := withSpeakerGain(path, OutputSpeaker, 6); len(got) != 1 || athenaLevel(t, got) != -1 {
+		t.Errorf("the path became %v", got)
+	}
+	if got := speakerGainControls(6); got != nil {
+		t.Errorf("a live change writes %v, want nothing", got)
+	}
+}
+
+// athena's gain follows every path the player writes (Player.path), and a change while the speaker
+// plays is written at once, both channels by the one level.
+func TestSpeakerGainOnAthenaFollowsThePath(t *testing.T) {
+	onAthenaMainline(t)
+	p := &Player{out: OutputSpeaker}
+	for db := 0; db <= config.SpeakerGainMax; db++ {
+		p.gainDB = db
+		if got := athenaLevel(t, p.path(OutputSpeaker)); got != int32(110+db) {
+			t.Errorf("speaker at +%d dB: level %d", db, got)
+		}
+	}
+
+	m := &athenaGainWrites{}
+	was := heldPathMixer
+	heldPathMixer = func(*Player) pathGainMixer { return m }
+	t.Cleanup(func() { heldPathMixer = was })
+	if err := p.SetSpeakerGain(6); err != nil {
+		t.Fatal(err)
+	}
+	if len(m.levels) != 1 || m.names[0] != athenaMaster || m.levels[0] != 116 || p.gainDB != 6 {
+		t.Fatalf("+6 dB on the speaker: wrote %v %v, kept %d", m.names, m.levels, p.gainDB)
+	}
+	if err := p.SetSpeakerGain(7); err == nil || p.gainDB != 6 {
+		t.Fatalf("+7 dB was taken: err %v, kept %d", err, p.gainDB)
+	}
+}
+
+type athenaGainWrites struct {
+	names  []string
+	levels []uint32
+}
+
+func (m *athenaGainWrites) SetInt(name string, v uint32) error {
+	m.names = append(m.names, name)
+	m.levels = append(m.levels, v)
+	return nil
+}
+
+// A board's own jack sense decides the output where it is set, and the speaker stays where there is
+// no jack at all.
+func TestABoardJackSenseDecidesTheOutput(t *testing.T) {
+	defer func(j bool, s func() bool) { HasJack, jackSense = j, s }(HasJack, jackSense)
+	in := false
+	HasJack, jackSense = true, func() bool { return in }
+	if got := DetectOutput(); got != OutputSpeaker {
+		t.Errorf("nothing plugged in: %q, want the speaker", got)
+	}
+	in = true
+	if got := DetectOutput(); got != OutputHeadphone {
+		t.Errorf("headphones in: %q, want the headphones", got)
+	}
+	HasJack = false
+	if got := DetectOutput(); got != OutputSpeaker {
+		t.Errorf("no jack: %q, want the speaker", got)
 	}
 }

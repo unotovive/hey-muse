@@ -1,0 +1,220 @@
+//go:build !dot && !spot
+
+package display
+
+import (
+	"fmt"
+	"image"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/HuskerMinion/techo5/echod/internal/config"
+	"github.com/HuskerMinion/techo5/echod/internal/hardware/touch"
+	"github.com/HuskerMinion/techo5/echod/internal/lib/hass"
+)
+
+// The agenda leaves out today's events that are over, takes in the next month's, and puts each day
+// under its heading, all-day first.
+func TestAgendaRows(t *testing.T) {
+	_, v := calTestDisplay(t)
+	at := func(m time.Month, d, h int) time.Time { return time.Date(2026, m, d, h, 0, 0, 0, time.Local) }
+	v.events = append(v.events,
+		hass.Event{Calendar: "calendar.family", Summary: "Breakfast", Start: at(9, 26, 8), End: at(9, 26, 9)},
+		hass.Event{Calendar: "calendar.family", Summary: "Trip", Start: at(10, 2, 9), End: at(10, 2, 17)},
+		hass.Event{Calendar: "calendar.family", Summary: "Too far", Start: at(10, 30, 9), End: at(10, 30, 10)})
+	var got []string
+	for _, row := range agendaRows(v.events, v.now) {
+		if row.ev == nil {
+			got = append(got, agendaDayName(row.day, v.now))
+		} else {
+			got = append(got, row.ev.Summary)
+		}
+	}
+	want := []string{"Today", "Birthday", "Dentist", "Friday, October 2", "Trip"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("rows %q, want %q", got, want)
+	}
+}
+
+// Around the agenda by touch: an event opens its window, a day's heading that day's list and Done
+// there comes back, Month goes to the month, and a long agenda scrolls.
+func TestAgendaByTouch(t *testing.T) {
+	d, v := calTestDisplay(t)
+	d.calAgenda = true
+	draw := func() {
+		d.mu.Lock()
+		v.day, v.agenda, v.detail, v.scroll = d.calDay, d.calAgenda, d.calDetail, d.calScroll
+		d.mu.Unlock()
+		d.r.draw(scene{now: v.now, phase: "idle", showCalendar: true, cal: v})
+	}
+	tap := func(p image.Point) { d.calendarGesture(touch.Gesture{Kind: touch.Tap, X: p.X, Y: p.Y}) }
+
+	draw()
+	tap(hitOf(t, d.r, calEvent))
+	if d.calDetail == nil || d.calDetail.Summary != "Birthday" {
+		t.Fatalf("an event opened %+v", d.calDetail)
+	}
+	draw()
+	tap(hitOf(t, d.r, calClose))
+
+	draw()
+	tap(hitOf(t, d.r, calDay))
+	if d.calDay.Day() != 26 {
+		t.Fatalf("today's heading opened %v", d.calDay)
+	}
+	draw()
+	tap(hitOf(t, d.r, calBack))
+	if !d.calDay.IsZero() || !d.calAgenda {
+		t.Fatal("Done on the day did not come back to the agenda")
+	}
+
+	// A swipe sideways does not move the month behind it.
+	d.calendarGesture(touch.Gesture{Kind: touch.SwipeLeft})
+	if d.calMonth.Month() != time.September {
+		t.Errorf("a swipe on the agenda moved the month to %v", d.calMonth.Month())
+	}
+
+	for i := range 12 {
+		v.events = append(v.events, hass.Event{Calendar: "calendar.family", Summary: fmt.Sprint("Event ", i),
+			Start: v.now.AddDate(0, 0, i+1), End: v.now.AddDate(0, 0, i+1).Add(time.Hour)})
+	}
+	draw()
+	if d.r.calendarAgendaMax() == 0 {
+		t.Fatal("a long agenda cannot scroll")
+	}
+	d.calendarGesture(touch.Gesture{Kind: touch.SwipeUp})
+	if d.calScroll == 0 {
+		t.Error("a swipe up did not scroll the agenda")
+	}
+	for range 20 {
+		d.calendarGesture(touch.Gesture{Kind: touch.SwipeUp})
+	}
+	if d.calScroll != d.r.calendarAgendaMax() {
+		t.Errorf("scrolled to %d, past the end at %d", d.calScroll, d.r.calendarAgendaMax())
+	}
+
+	// A day opened from the scrolled agenda, and Done there, comes back to the same place.
+	scrolled := d.calScroll
+	draw()
+	tap(hitOf(t, d.r, calDay))
+	if d.calDay.IsZero() || d.calScroll != 0 {
+		t.Fatalf("a heading in the scrolled agenda opened %v at %d", d.calDay, d.calScroll)
+	}
+	draw()
+	tap(hitOf(t, d.r, calBack))
+	if d.calScroll != scrolled {
+		t.Errorf("Done came back to the agenda at %d, not where it was at %d", d.calScroll, scrolled)
+	}
+
+	draw()
+	tap(hitOf(t, d.r, calMonthView))
+	if d.calAgenda || d.calScroll != 0 {
+		t.Error("Month left the agenda up")
+	}
+}
+
+// The Dashboard's next events are a tap target of their own, apart from the date.
+func TestDashboardNextTap(t *testing.T) {
+	config.Use(filepath.Join(t.TempDir(), "state.json"))
+	at := time.Date(2026, 9, 16, 14, 7, 0, 0, time.Local)
+	facts := styleFactsFor("", at)
+	facts.kind, facts.chosen = styleDashboard, true
+	facts.next = []hass.Event{{Summary: "Dentist", Start: at.Add(time.Hour), End: at.Add(2 * time.Hour)}}
+	for _, size := range []image.Point{{showWide, showHigh}, {show8Wide, show8High}, {skylightWide, skylightHigh}} {
+		r := newRenderer(image.NewRGBA(image.Rect(0, 0, size.X, size.Y)))
+		r.draw(scene{now: at, phase: "idle", style: facts})
+		r.weatherMu.Lock()
+		next, date := r.nextAt, r.dateAt
+		r.weatherMu.Unlock()
+		if next.Empty() {
+			t.Fatalf("%v: the next events were not made a tap target", size)
+		}
+		if next.Overlaps(date) {
+			t.Errorf("%v: the next events %v overlap the date %v", size, next, date)
+		}
+		if !r.nextTapped(image.Pt((next.Min.X+next.Max.X)/2, (next.Min.Y+next.Max.Y)/2)) {
+			t.Errorf("%v: a tap on the next events missed", size)
+		}
+
+		// Another clock style has no next events to tap.
+		other := facts
+		other.kind = styleSun
+		r.draw(scene{now: at, phase: "idle", style: other})
+		if r.nextTapped(image.Pt((next.Min.X+next.Max.X)/2, (next.Min.Y+next.Max.Y)/2)) {
+			t.Errorf("%v: the next events stayed a tap target in another style", size)
+		}
+	}
+}
+
+// The Dashboard's next events say when: the day, "Today" or from tomorrow on the short weekday (never
+// "Tomorrow"), and apart the time, none for an all-day event; one under way is "Now". In the screen's
+// language: Spanish says "Hoy", "Ahora" and "Mié".
+func TestDashWhen(t *testing.T) {
+	config.Use(filepath.Join(t.TempDir(), "state.json"))
+	t.Cleanup(func() { _ = config.Set().Screen().Language("") })
+	now := time.Date(2026, 10, 6, 10, 0, 0, 0, time.Local) // a Tuesday
+	at := func(d, h int) time.Time { return time.Date(2026, 10, d, h, 0, 0, 0, time.Local) }
+	day := func(d int) hass.Event { return hass.Event{Start: at(d, 0), End: at(d+1, 0), AllDay: true} }
+	timed := func(d, h int) hass.Event { return hass.Event{Start: at(d, h), End: at(d, h+1)} }
+	hhm := func(t time.Time) string { return strings.TrimSpace(clockText(t)) }
+	for _, c := range []struct {
+		lang      string
+		e         hass.Event
+		day, time string
+	}{
+		{"", timed(6, 9), "Now", ""},
+		{"", timed(6, 15), "Today", hhm(at(6, 15))},
+		{"", day(6), "Today", ""},
+		{"", timed(7, 9), "Wed", hhm(at(7, 9))},
+		{"", day(7), "Wed", ""},
+		{"", timed(8, 15), "Thu", hhm(at(8, 15))},
+		{"", day(10), "Sat", ""},
+		{"es", timed(6, 9), "Ahora", ""},
+		{"es", timed(6, 15), "Hoy", hhm(at(6, 15))},
+		{"es", day(7), "Mié", ""},
+	} {
+		if err := config.Set().Screen().Language(c.lang); err != nil {
+			t.Fatal(err)
+		}
+		if d, h := dashWhen(c.e, now); d != c.day || h != c.time {
+			t.Errorf("%q %v: %q %q, want %q %q", c.lang, c.e.Start, d, h, c.day, c.time)
+		}
+	}
+}
+
+// The Agenda clock puts each day under its own heading: Tomorrow for tomorrow only, and the name and
+// date for each day after it. An event that started before today goes under Today with today's.
+func TestAgendaClockHeads(t *testing.T) {
+	now := time.Date(2026, 10, 15, 10, 0, 0, 0, time.Local) // a Thursday
+	at := func(d, h int) time.Time { return time.Date(2026, 10, d, h, 0, 0, 0, time.Local) }
+	ev := func(d, h int) hass.Event { return hass.Event{Start: at(d, h), End: at(d, h+1)} }
+	trip := hass.Event{Start: at(13, 0), End: at(17, 0), AllDay: true}
+	for _, c := range []struct {
+		events []hass.Event
+		want   []string
+	}{
+		{[]hass.Event{trip, ev(15, 14), ev(16, 9), ev(16, 18), ev(18, 9), ev(21, 9)},
+			[]string{"", "", "Tomorrow", "", "Sunday, October 18", "Wednesday, October 21"}},
+		// Only a day well ahead: its own heading, not Tomorrow.
+		{[]hass.Event{ev(18, 9)}, []string{"Sunday, October 18"}},
+		{[]hass.Event{{Start: at(17, 0), End: at(18, 0), AllDay: true}, ev(17, 9)}, []string{"Saturday, October 17", ""}},
+	} {
+		if got := agendaHeads(c.events, now, ""); fmt.Sprint(got) != fmt.Sprint(c.want) {
+			t.Errorf("headings %q, want %q", got, c.want)
+		}
+	}
+
+	// A week of events draws, the headings and all, without running off the bottom.
+	config.Use(filepath.Join(t.TempDir(), "state.json"))
+	facts := styleFactsFor("", now)
+	facts.kind, facts.chosen = styleAgenda, true
+	for d := 15; d < 22; d++ {
+		facts.next = append(facts.next, ev(d, 11), ev(d, 15))
+	}
+	for _, size := range []image.Point{{showWide, showHigh}, {show8Wide, show8High}, {skylightWide, skylightHigh}} {
+		r := newRenderer(image.NewRGBA(image.Rect(0, 0, size.X, size.Y)))
+		r.draw(scene{now: now, phase: "idle", style: facts})
+	}
+}

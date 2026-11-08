@@ -14,6 +14,10 @@ automation.
 > send the value that means "no opinion" (`0` for a number, an empty string for text) rather than
 > omitting it. Adding an argument to an existing action therefore breaks every automation already
 > calling it, which is why a new one arrives as a new action instead.
+>
+> That goes for the arguments marked *Can be empty* below as well: the action does without a value
+> for them, but they still have to be in the call, as `""` (or `0` for a number). Home Assistant
+> answers a call without one with `required key not provided`.
 
 ## Connect the device to Home Assistant
 
@@ -28,15 +32,20 @@ whatever paired the device, and isn't something you call from an automation afte
 > **Good to know**
 >
 > Several other actions depend on this being set first: `home_show_camera` and
-> `home_show_camera_sound`, `home_weather`, `home_cameras`' automatic camera list (when called with
-> no `cameras`), `home_slideshow`, and the Radio Browser stations in `home_radio`. They all fetch
-> in the background, so the action itself succeeds either way. Without the token they show or offer
-> nothing, and the camera actions open the view with `hass: no access configured` on it in place of
-> the picture.
+> `home_show_camera_sound`, `home_weather`, `home_cameras`' automatic camera list (All, when called
+> with `cameras` empty), `home_slideshow`, Home Assistant's Radio Browser lists on the Radio page, and the
+> player's star. They all fetch in the background, so the action itself succeeds either way. Without
+> the token they show or offer nothing, and the camera actions open the view with
+> `hass: no access configured` on it in place of the picture. The radio lists are the exception: the
+> device then asks radio-browser.info itself, when its place is set on the setup page.
 >
-> The URL must be Home Assistant's local IP address. The device calls it directly rather than
-> through Home Assistant's own connection to the device, it can't look up `.local` names like
-> `homeassistant.local`, and an external or Nabu Casa URL does not work.
+> The URL must be an address the device can reach on your network. The device calls it directly
+> rather than through Home Assistant's own connection to the device, so an address that only works
+> from outside your home, such as a Nabu Casa URL, does not work. An `https://` name that your local
+> DNS points at Home Assistant or a reverse proxy on the LAN works, as long as its certificate is
+> valid for that name. Its IP address works everywhere. A `.local` name like `homeassistant.local` works on a Show, a
+> Spot and the Skylight Calendar, which look it up themselves, but not on the Dot or the Echo 2nd gen,
+> and on a panel only where Android looks `.local` names up.
 
 ### url (Required)
 
@@ -63,8 +72,8 @@ data:
 In YAML, refer to this action as `esphome.<node>_leave_home_assistant`.
 
 For a device you're giving to someone else. The device forgets the URL and token set with
-`home_assistant`, replaces the encryption key Home Assistant connects with by a new random one, and
-restarts. Your Home Assistant can't connect to it again, and the device no longer calls your Home
+`home_assistant`, and realtime voice's key and Home Assistant token, replaces the encryption key Home
+Assistant connects with by a new random one, and restarts. Your Home Assistant can't connect to it again, and the device no longer calls your Home
 Assistant. Alarms, radio stations, Wi-Fi and its other settings stay.
 
 Afterward, delete the device from **Settings → Devices & services → ESPHome** in your Home Assistant.
@@ -86,6 +95,91 @@ data:
   confirm: leave
 ```
 
+## Reset the device for someone else
+
+In YAML, refer to this action as `esphome.<node>_reset_for_someone_else`.
+
+For a device you're giving to someone else, who will set it up from the start. The device forgets its
+Wi-Fi networks, name, room, Home Assistant's encryption key and its access to Home Assistant, puts
+every setting back to how a new install has it (alarms, timers and the phone book go too), deletes the
+old home's files, and restarts into first run. [setup.md](setup.md#giving-a-device-to-someone-else)
+lists everything it clears. It leaves your network at once, and it cannot be undone. A Dot or an
+Echo 2nd gen doesn't have this action yet: with no screen, it couldn't be given a new network
+afterward until Improv (setting up Wi-Fi over Bluetooth) is in.
+
+Afterward, delete the device from **Settings → Devices & services → ESPHome** in your Home Assistant.
+With no key, the next Home Assistant can add it with nothing typed.
+
+### confirm (Required)
+
+*string*
+
+Must be `reset`. Anything else changes nothing.
+
+```yaml
+action: esphome.office_reset_for_someone_else
+data:
+  confirm: reset
+```
+
+## Set the network address
+
+In YAML, refer to this action as `esphome.<node>_network_address`.
+
+Sets how the device gets its address on Wi-Fi: from the router (DHCP), or fixed. It is the
+**Connections → Network address** setting of the setup page, explained in
+[Setting it up](setup.md#9-a-fixed-address). The device answers first and changes its address two
+seconds later.
+
+A new fixed address is tried before it is kept: if another device answers for it, or the gateway does
+not answer from it, the device keeps the setting it had, and the setup page (and the device's log) says
+why. Calling it with the setting already in use, and in place, changes nothing; called while the device
+uses DHCP in its place, it tries the address again. Home Assistant follows the device to its new
+address by itself, about two minutes after the change. The device's IP address sensor shows the address
+in use. The action is on the Echo Show and the Echo Spot, not on the Echo Dot.
+
+Whoever can use the device's ESPHome API can call it, and so can set the gateway and the DNS servers the
+device uses, and with them where its traffic and its name lookups go: keep the API key to the Home
+Assistant you trust.
+
+### address (Required)
+
+*string*
+
+The address, like `192.168.1.50`, or with its prefix, like `192.168.1.50/24` (`/24` when left out).
+Empty switches back to DHCP, and the other two are then ignored.
+
+### gateway (Required)
+
+*string*
+
+The router, like `192.168.1.1`. It must be in the address's network. Empty when `address` is empty.
+
+### dns (Required)
+
+*string*
+
+Up to three DNS servers, separated by commas. Empty uses the gateway, and is ignored when `address`
+is empty. All three empty switches the device to DHCP.
+
+```yaml
+action: esphome.office_network_address
+data:
+  address: 192.168.1.50/24
+  gateway: 192.168.1.1
+  dns: ""
+```
+
+Back to DHCP:
+
+```yaml
+action: esphome.office_network_address
+data:
+  address: ""
+  gateway: ""
+  dns: ""
+```
+
 ## Set an alarm
 
 In YAML, refer to this action as `esphome.<node>_alarm_set`.
@@ -100,7 +194,7 @@ Assistant is down.
 
 A time of day: `7:30`, `07:30`, `19:30:00`, `7:30 pm`, `7:30pm`, `3 pm`, or `3pm`.
 
-### days (Optional)
+### days (Can be empty)
 
 *string*
 
@@ -108,7 +202,7 @@ Which days it repeats on. One of `once` (the default — rings once and turns it
 (or `every day`, `everyday`), `weekdays`, `weekends`, or a comma- or space-separated list of days,
 matched by prefix: `mon,wed,fri`, `tue thu`.
 
-### label (Optional)
+### label (Can be empty)
 
 *string*
 
@@ -141,13 +235,35 @@ data:
   label: Bedroom
 ```
 
+## Set a light-only alarm
+
+In YAML, refer to this action as `esphome.<node>_alarm_set_light_only`.
+
+The same as `alarm_set`, with the same `time`, `days` and `label`, for a wake light and nothing
+else: the light comes up before it as for any alarm with **Wake with light** (the device's default,
+or 30 minutes where that is off), and at its time there is no sound and nothing to dismiss. The night
+ends instead, as the **Night mode** switch turned off does, so the screen is back as by day until the
+night hours next start. The light, and **Wake light brightness** with it, stays at full for 30
+minutes after the alarm's time, then goes off; **Stop alarm or timer**, the stop word, the action
+button or a tap on the light's page turns it off sooner. On a Dot there is no screen: the light ring
+comes up, holds for 30 minutes, and that is all. It fires the `light_only`
+[alarm event](#alarm-events). Setting the same alarm again with `alarm_set` makes it ring again.
+**Light only** in an alarm's editor on the device, and on the setup page, does the same.
+
+```yaml
+action: esphome.office_alarm_set_light_only
+data:
+  time: "6:30 am"
+  days: weekdays
+```
+
 ## Alarm events
 
 Each step of an alarm fires `esphome.techo5_alarm` on Home Assistant's bus, with:
 
 | Field | |
 |---|---|
-| `event` | `ringing`, `silent` (a silent alarm went off), `snoozed`, or `stopped` (by a press, by voice, from Home Assistant, or after ringing its course) |
+| `event` | `ringing`, `silent` (a silent alarm went off), `light_only` (a light-only alarm's time came and the night ended), `snoozed`, or `stopped` (by a press, by voice, from Home Assistant, or after ringing its course) |
 | `id` | The alarm's id, the same for an alarm and its snoozes |
 | `label` | The alarm's label |
 | `due` | When it was due, like `2026-10-01T06:45:00-06:00` |
@@ -166,6 +282,157 @@ triggers:
       label: Bedroom
 actions:
   - action: script.good_morning
+```
+
+## Follow the wake light
+
+Two sensors show the wake light (Wake with light) as it is now, on every device:
+`sensor.kitchen_echo_wake_light_brightness`, from 0 to 100 percent, and
+`sensor.kitchen_echo_wake_light_color`, the light's color at full strength like `#ff9b1a`, empty while
+it is off. They change at most every 5 seconds while the light comes up, and at once when it comes on
+or goes off. To bring a room light up with it:
+
+```yaml
+triggers:
+  - trigger: state
+    entity_id: sensor.kitchen_echo_wake_light_brightness
+conditions:
+  - condition: numeric_state
+    entity_id: sensor.kitchen_echo_wake_light_brightness
+    above: 0
+actions:
+  - action: light.turn_on
+    target:
+      entity_id: light.bedroom
+    data:
+      brightness_pct: "{{ states('sensor.kitchen_echo_wake_light_brightness') | int }}"
+      rgb_color: >-
+        {% set c = states('sensor.kitchen_echo_wake_light_color') %}
+        {{ [c[1:3] | int(base=16), c[3:5] | int(base=16), c[5:7] | int(base=16)] }}
+```
+
+**Replace `kitchen_echo` with your device's own prefix, and `light.bedroom` with your light.**
+
+## Voice request events
+
+Each finished voice request (a turn: wake, listen, answer) fires `esphome.techo5_voice` on Home
+Assistant's bus, with:
+
+| Field | |
+|---|---|
+| `ended` | `answered`, `no_speech` (nothing said, or only what speech-to-text writes for noise), `canceled` (stopped, interrupted, cut off by another sound, or answered by another device), or `error` |
+| `reason` | Only when `ended` is `canceled`: `stopped` (the button, the stop word or Home Assistant ended it), `interrupted` (the wake word again, once it was thinking or answering), `cut_off` (another sound took the speaker from the reply), or `answered_elsewhere` (another device heard the wake word first, which is the nearest device feature working) |
+| `error` | Only when `ended` is `error`: Home Assistant's error code, like `stt-stream-failed`, or `timeout` when the pipeline took longer than the slot allows |
+| `trigger` | What opened it: `wake_word`, `button`, `follow_up` (listening again after a reply), or `home_assistant` (an announcement that asked for an answer) |
+| `wake_word` | The slot's wake word. It picked the pipeline, so it is there for a button or follow-up too |
+| `wake_score` | Only on a turn a wake word opened: the highest score the word reached on the device, as `Last wake score` shows it (for a wake Home Assistant confirmed, the device's score under the threshold). Logged beside `heard`, it shows how close mistaken wakes come to the threshold |
+| `slot` | The wake word slot, `1` or `2` |
+| `heard` | What speech-to-text heard, up to 1000 characters. Left out while the device's **Send voice text** is off |
+| `reply` | The reply's text, up to 1000 characters. Left out while **Send voice text** is off |
+| `listen_ms`, `think_ms`, `reply_ms` | How long each phase took, in milliseconds. A phase the turn never reached is left out |
+| `audio_seconds` | Seconds of recording kept for this turn, when one was |
+| `id` | The turn's id |
+| `version` | `1`; bumped if a field changes meaning |
+| `device` | The device's name |
+
+All values are text, as with every ESPHome event. No audio is sent. The device needs **Allow the
+device to perform Home Assistant actions** turned on, as for alarm events.
+
+```yaml
+triggers:
+  - trigger: event
+    event_type: esphome.techo5_voice
+    event_data:
+      ended: error
+actions:
+  - action: persistent_notification.create
+    data:
+      title: "Voice request failed on {{ trigger.event.data.device }}"
+      message: >-
+        Heard "{{ trigger.event.data.heard | default('') }}",
+        error {{ trigger.event.data.error }}.
+```
+
+Events do not show in the logbook by themselves. To keep a line there for each request, add an
+automation that triggers on `esphome.techo5_voice` with no `event_data` and runs `logbook.log` with
+`name: "{{ trigger.event.data.device }}"` and `message: "heard {{ trigger.event.data.heard | default('nothing') }}, {{ trigger.event.data.ended }}"`.
+
+Beside it, each request also fires `esphome.echolocal_turn`, the same request as EchoLocal reported
+it, for EchoLocal's Home Assistant integration. Home Assistant's recorder keeps both events in its
+database. If you don't use EchoLocal's integration, leave that one out in `configuration.yaml`:
+
+```yaml
+recorder:
+  exclude:
+    event_types:
+      - esphome.echolocal_turn
+```
+
+## Command word events
+
+Each time a command word acts (the [volume down word](setup.md#the-volume-down-word), or the [volume
+up or next song word](setup.md#the-volume-up-and-next-song-words)), it fires `esphome.techo5_command`
+on Home Assistant's bus, with:
+
+| Field | |
+|---|---|
+| `command` | What the word did: `volume_down`, `volume_up` or `next` |
+| `word` | The id of the model that heard it, as on the setup page |
+| `score` | How sure the model was when it acted, `0.50` to `1.00` |
+| `volume` | The volume step it went to, `0` to `30` (`volume_down` and `volume_up` only) |
+| `asked` | `next` only: `true` when the device passed the skip to the sender's controls (Music Assistant, or a phone over AirPlay or Bluetooth), `false` when there was nobody to ask. `true` doesn't promise a skip: a radio stream Music Assistant can't skip, or an AirPlay sender that gave the device no remote control, won't take it |
+| `device` | The device's name |
+
+The volume words have acted already: the event says so, for an automation or a dashboard to follow.
+All values are text, and the device needs **Allow the device to perform Home Assistant actions** turned
+on, as for alarm events.
+
+A `next` with `asked: false` is the one to act on: nobody was asked, so for music Home Assistant plays
+on the device a track at a time, skip on it. `asked: false` also comes for the device's own radio
+stations and for senders it can't ask, such as Spotify Connect, so the automation checks that its queue
+is what's playing first:
+
+```yaml
+triggers:
+  - trigger: event
+    event_type: esphome.techo5_command
+    event_data:
+      command: next
+      asked: "false"
+      device: Kitchen
+conditions:
+  - condition: state
+    entity_id: media_player.kitchen_queue
+    state: playing
+actions:
+  - action: media_player.media_next_track
+    target:
+      entity_id: media_player.kitchen_queue
+```
+
+**Replace `Kitchen` with your device's name, and `media_player.kitchen_queue` with the media player
+that plays the queue.**
+
+## Show an effect on the ring during a request
+
+In YAML, refer to this action as `esphome.<node>_voice_effect`.
+
+Puts an effect on the ring for the step the running voice request is in, for an automation to show
+what the request is waiting on: a slower speech-to-text taking over, a long answer. Nothing is saved:
+the next step, and the next request, show their own effects as ever. With no request running it does
+nothing.
+
+### effect (Required)
+
+*string*
+
+An effect the ring has, as the effect lists in Home Assistant name them, or `None` to turn the ring
+off for the step, or `Default` to put back the step's own effect. Any other name is refused.
+
+```yaml
+action: esphome.kitchen_echo_voice_effect
+data:
+  effect: Ice Comet
 ```
 
 ## Set a reminder
@@ -198,11 +465,11 @@ A time of day, in the same formats as `alarm_set`'s `time`, or a time from now: 
 happens once. It must be less than a day away: for tomorrow at the same time or later, give a time
 of day instead.
 
-### days (Optional)
+### days (Can be empty)
 
 *string*
 
-Same as `alarm_set`'s `days`. Leave it out, or use `once`, for a time from now. For a one-off on a particular day, give the day instead: `today`, `tomorrow`, or a date written
+Same as `alarm_set`'s `days`. Leave it empty, or use `once`, for a time from now. For a one-off on a particular day, give the day instead: `today`, `tomorrow`, or a date written
 `2026-09-29`. A day whose time has already gone by is refused.
 
 ### label (Required)
@@ -211,7 +478,7 @@ Same as `alarm_set`'s `days`. Leave it out, or use `once`, for a time from now. 
 
 What to say, such as `Take the medication`. A reminder with nothing to say is refused.
 
-### ring_on (Optional)
+### ring_on (Can be empty)
 
 *string*
 
@@ -383,7 +650,15 @@ Home Assistant's own voice commands know timers but not clock alarms, so "set an
 agent if you have one. Its volume command works, but it changes every speaker in the room's area,
 so in a room with a TV or another speaker, "volume down" can turn down the wrong one. These three
 automations answer those sentences on the TECHO5 device that heard them. Add each one in Settings >
-Automations & scenes > Create automation > Edit in YAML.
+Automations & scenes > Create automation > Edit in YAML. The time can come from speech-to-text as
+digits or as words ("6:30" or "six thirty"); both work.
+
+To make the alarm repeat, say the days too: "set an alarm for 7:30 am on weekdays", "Monday to Friday",
+"on weekends", "every day", "Mondays and Thursdays". Days can also be left out ("every day except
+Sunday"). A named day repeats every week, because a device alarm has no way to hold a one-off date.
+The importable [set an alarm by voice](../blueprints/automation/techo5/set_alarm_by_voice.yaml)
+blueprint is the maintained version of the first automation and reads all of these; the shorter copy
+below sets a one-time alarm.
 
 ```yaml
 alias: TECHO5 - set an alarm by voice
@@ -402,9 +677,22 @@ actions:
       spoken: "{{ (trigger.slots.when | default('')) | lower | replace('.', '') | trim }}"
       pm: "{{ 'pm' in spoken or 'p m' in spoken }}"
       am: "{{ 'am' in spoken or 'a m' in spoken }}"
-      nums: "{{ spoken | regex_findall('[0-9]{1,2}') }}"
-      h: "{{ nums[0] | int(-1) if nums else -1 }}"
-      m: "{{ nums[1] | int(0) if nums | count > 1 else 0 }}"
+      nums: >-
+        {%- set w = {'one':1,'two':2,'three':3,'four':4,'five':5,'six':6,'seven':7,'eight':8,'nine':9,'ten':10,'eleven':11,'twelve':12,'thirteen':13,'fourteen':14,'fifteen':15,'sixteen':16,'seventeen':17,'eighteen':18,'nineteen':19,'twenty':20,'thirty':30,'forty':40,'fifty':50,'oh':0,'o':0} -%}
+        {%- set ns = namespace(n=[], tens=false) -%}
+        {%- for t in spoken | regex_findall('[a-z]+|[0-9]+') -%}
+          {%- if t.isdigit() -%}{%- set ns.n = ns.n + [t | int] -%}{%- set ns.tens = false -%}
+          {%- elif t in w -%}
+            {%- set v = w[t] -%}
+            {%- if ns.tens and v > 0 and v < 10 -%}{%- set ns.n = ns.n[:-1] + [ns.n[-1] + v] -%}{%- set ns.tens = false -%}
+            {%- else -%}{%- set ns.n = ns.n + [v] -%}{%- set ns.tens = v in [0, 20, 30, 40, 50] -%}{%- endif -%}
+          {%- endif -%}
+        {%- endfor -%}
+        {{- ns.n -}}
+      # Speech-to-text can write 6:45 as "645": one number past 99 is the hour and the minutes.
+      n: "{{ [nums[0] // 100, nums[0] % 100] + nums[1:] if nums and nums[0] >= 100 else nums }}"
+      h: "{{ n[0] | int(-1) if n else -1 }}"
+      m: "{{ n[1] | int(0) if n | count > 1 else 0 }}"
       hh: "{{ h + 12 if pm and h < 12 else (0 if am and h == 12 else h) }}"
   - choose:
       - conditions: "{{ not techo5 }}"
@@ -452,9 +740,22 @@ actions:
       everything: "{{ 'all' in trigger.sentence | lower or 'alarms' in trigger.sentence | lower }}"
       pm: "{{ 'pm' in spoken or 'p m' in spoken }}"
       am: "{{ 'am' in spoken or 'a m' in spoken }}"
-      nums: "{{ spoken | regex_findall('[0-9]{1,2}') }}"
-      h: "{{ nums[0] | int(-1) if nums else -1 }}"
-      m: "{{ nums[1] | int(0) if nums | count > 1 else 0 }}"
+      nums: >-
+        {%- set w = {'one':1,'two':2,'three':3,'four':4,'five':5,'six':6,'seven':7,'eight':8,'nine':9,'ten':10,'eleven':11,'twelve':12,'thirteen':13,'fourteen':14,'fifteen':15,'sixteen':16,'seventeen':17,'eighteen':18,'nineteen':19,'twenty':20,'thirty':30,'forty':40,'fifty':50,'oh':0,'o':0} -%}
+        {%- set ns = namespace(n=[], tens=false) -%}
+        {%- for t in spoken | regex_findall('[a-z]+|[0-9]+') -%}
+          {%- if t.isdigit() -%}{%- set ns.n = ns.n + [t | int] -%}{%- set ns.tens = false -%}
+          {%- elif t in w -%}
+            {%- set v = w[t] -%}
+            {%- if ns.tens and v > 0 and v < 10 -%}{%- set ns.n = ns.n[:-1] + [ns.n[-1] + v] -%}{%- set ns.tens = false -%}
+            {%- else -%}{%- set ns.n = ns.n + [v] -%}{%- set ns.tens = v in [0, 20, 30, 40, 50] -%}{%- endif -%}
+          {%- endif -%}
+        {%- endfor -%}
+        {{- ns.n -}}
+      # Speech-to-text can write 6:45 as "645": one number past 99 is the hour and the minutes.
+      n: "{{ [nums[0] // 100, nums[0] % 100] + nums[1:] if nums and nums[0] >= 100 else nums }}"
+      h: "{{ n[0] | int(-1) if n else -1 }}"
+      m: "{{ n[1] | int(0) if n | count > 1 else 0 }}"
       hh: "{{ h + 12 if pm and h < 12 else (0 if am and h == 12 else h) }}"
       # With no AM or PM, "the 6 alarm" matches 6:00 AM and 6:00 PM.
       times: >-
@@ -581,7 +882,7 @@ Deletes every device alarm at the given time. Fails if none is found.
 
 Same formats as `alarm_set`'s `time`.
 
-### label (Optional)
+### label (Can be empty)
 
 *string*
 
@@ -601,6 +902,7 @@ In YAML, refer to this action as `esphome.<node>_alarm_delete_id`.
 
 Deletes exactly one device alarm or reminder, picked by the ID `alarms_list` gives it. Use this when two alarms
 share a time and you want only one of them gone. Fails if there is no alarm with that ID.
+It does not cancel timers: a timer's `id` from `alarms_list` goes to `timer_cancel` instead.
 
 ### id (Required)
 
@@ -612,6 +914,101 @@ An alarm's `id` from `alarms_list`.
 action: esphome.office_alarm_delete_id
 data:
   id: "{{ listing.alarms[0].id }}"
+```
+
+## Turn an alarm off or on
+
+In YAML, refer to these actions as `esphome.<node>_alarm_turn_off` and `esphome.<node>_alarm_turn_on`.
+
+Switches device alarms off or back on without deleting them, the same as the switch next to an
+alarm on the screen. An alarm that is off keeps its time, days and label and doesn't ring, and
+turning it off drops its snooze. Fails if no alarm matches. To switch one alarm by its `id`, use
+[`alarm_turn_off_id` and `alarm_turn_on_id`](#turn-an-alarm-off-or-on-by-its-id).
+
+### time
+
+*string*
+
+Same formats as `alarm_set`'s `time`. Every alarm at that time is switched (reminders are left alone).
+
+### label (Can be empty)
+
+*string*
+
+Only switch alarms at that time whose label matches (case-insensitive). Leave it blank for every
+alarm at that time.
+
+```yaml
+action: esphome.office_alarm_turn_off
+data:
+  time: "6:45 am"
+  label: Wake up
+```
+
+```yaml
+action: esphome.office_alarm_turn_on
+data:
+  time: "6:45 am"
+  label: ""
+```
+
+## Turn an alarm off or on by its id
+
+In YAML, refer to these actions as `esphome.<node>_alarm_turn_off_id` and
+`esphome.<node>_alarm_turn_on_id`.
+
+The same as [`alarm_turn_off` and `alarm_turn_on`](#turn-an-alarm-off-or-on), for the one alarm an
+`id` names. Fails if no alarm has that id.
+
+### id
+
+*string*
+
+An alarm's `id` from `alarms_list`.
+
+```yaml
+action: esphome.office_alarm_turn_on_id
+data:
+  id: "{{ listing.alarms[0].id }}"
+```
+
+## Turn every alarm off for a while
+
+The **Alarms on** switch (`switch.<node>_alarms_on`) turns all of a device's alarms off at once, for
+a trip, and back on when you're home. Each alarm keeps its own switch, so turning it back on brings
+back the ones that were on. While it's off, no alarm rings, including Home Assistant helpers the
+device follows, and snoozes are dropped. Reminders still go off. The same switch is at the top of
+Alarms & Timers on the screen when there's more than one alarm. Setting a new alarm, or switching one
+on, while it's off turns it back on, so the alarm you just asked for rings.
+
+```yaml
+# Leaving for a few days: no alarms on the bedroom device.
+- action: switch.turn_off
+  target:
+    entity_id: switch.bedroom_echo_alarms_on
+```
+
+## Do something before the next alarm
+
+The **Next scheduled alarm** sensor (`sensor.<node>_next_scheduled_alarm`) is when the next alarm is
+set for, as a timestamp. Unlike **Next alarm**, it doesn't follow a snooze, and it leaves out
+reminders. It's empty when no alarm is coming, or when **Alarms on** is off. A time trigger with an
+offset runs an automation before it:
+
+```yaml
+alias: Bedroom lights up before the alarm
+triggers:
+  - trigger: time
+    at:
+      entity_id: sensor.bedroom_echo_next_scheduled_alarm
+      offset: "-00:30:00"
+actions:
+  - action: light.turn_on
+    target:
+      entity_id: light.bedroom
+    data:
+      brightness_pct: 30
+      transition: 1800
 ```
 
 ## List alarms and timers
@@ -643,6 +1040,8 @@ alarms:
     next: "2026-09-24T06:45:00-05:00"
     reminder: false      # true for one set with reminder_set
     ring_on: []          # the other devices a reminder goes off on
+    silent: false        # true for one set with alarm_set_silent
+    light_only: false    # true for a wake light alone (alarm_set_light_only)
 snoozed: []              # each {label, at}
 followed: []             # each {entity, label, armed, next}
 timers:
@@ -670,7 +1069,7 @@ How long: `10 minutes`, `1 hour and 30 minutes`, `90 seconds`, `in 20 minutes`, 
 `00:10:00` (what Home Assistant's duration selector gives), `1:30` (hours and minutes), or a bare
 number, which is minutes. At most 24 hours.
 
-### label (Optional)
+### label (Can be empty)
 
 *string*
 
@@ -708,6 +1107,60 @@ data:
   id: "{{ started.id }}"
 ```
 
+## Pause or resume a timer
+
+In YAML, refer to these actions as `esphome.<node>_timer_pause` and `esphome.<node>_timer_resume`.
+
+Pause stops one of the device's own timers where it is; resume sets it counting again from there. A
+paused timer is listed as `running: false` in `alarms_list`, shows in the device's **Timers** sensor
+as `Bread paused (4:05 left)` after the running ones (as do Assist's timers paused by voice), and
+stays paused across a restart. A timer that has just run out is left to ring rather than paused.
+Pausing a paused timer, or resuming a running one, changes nothing. Timers set by voice through Home
+Assistant's Assist are paused and resumed by voice, and these actions refuse them.
+
+### id (Required)
+
+*string*
+
+A timer's `id`, from `timer_start`'s answer or `alarms_list`'s `timers`, or `all` for every timer of
+the device's own.
+
+```yaml
+# Pause the kitchen's timers while the doorbell camera is up.
+action: esphome.kitchen_timer_pause
+data:
+  id: all
+```
+
+## Add or take time off a timer
+
+In YAML, refer to these actions as `esphome.<node>_timer_add` and `esphome.<node>_timer_remove`.
+
+Gives one of the device's own timers more time, or less, whether it is running or paused. Taking off
+more than the timer has left is refused (cancel it instead), as is going past 24 hours or changing a
+timer that has just run out, which is left to ring. Assist's timers are changed by voice, as above.
+
+### id (Required)
+
+*string*
+
+A timer's `id`, from `timer_start`'s answer or `alarms_list`'s `timers`. These take one timer, not
+`all`.
+
+### duration (Required)
+
+*string*
+
+How much, written the way `timer_start` takes it: `5 minutes`, `1h30m`, `00:05:00` or a bare number
+of minutes.
+
+```yaml
+action: esphome.office_timer_add
+data:
+  id: "{{ started.id }}"
+  duration: 5 minutes
+```
+
 ## Follow Home Assistant helpers as alarms
 
 In YAML, refer to this action as `esphome.<node>_alarms_follow`.
@@ -741,30 +1194,72 @@ data:
   entities: input_datetime.wake=input_boolean.wake_armed,input_datetime.weekend_wake
 ```
 
+## Cameras from go2rtc
+
+In YAML, refer to this action as `esphome.<node>_home_go2rtc`.
+
+Reads the streams of a go2rtc server into the device's camera list, as cameras of their own named as
+go2rtc names them (`go2rtc:porch`), and answers how many there are. Called again, it reads the list
+again; with an empty address, it takes them away. See [Setting it up](setup.md#cameras-from-go2rtc).
+
+### address (Required)
+
+*string*
+
+The go2rtc server, as a host, host:port (go2rtc's own port, 1984, when none is given) or URL, with a
+user and password in it if go2rtc has them; empty to take the cameras away. Home Assistant's logbook
+and traces can keep an action's arguments, so give go2rtc a user of its own that can only view, or
+pass the address from a secret.
+
+```yaml
+action: esphome.kitchen_home_go2rtc
+data:
+  address: 192.168.x.y:1984
+response_variable: go2rtc
+```
+
 ## Choose which cameras the device shows
 
 In YAML, refer to this action as `esphome.<node>_home_cameras`.
 
-Sets the list of cameras offered on the device's Cameras page and by voice ("show the front door").
+Sets which of Home Assistant's cameras the device offers on its Cameras page, in the camera grid,
+on the setup page's Talk through cameras list and by voice ("show the front door"). There are three
+choices, also on the setup page under Connections → Home Assistant cameras:
 
-### cameras (Optional)
+- **None**: no Home Assistant camera at all.
+- **All**: every camera entity Home Assistant has, refreshed every 10 minutes. This is the default for
+  a device that was never set, and needs `home_assistant` to be set up first.
+- **These**: only the cameras listed, with the names given.
+
+A device that shares a Home Assistant with other homes should be set to None or a list: with All it
+offers every camera in that Home Assistant, the other homes' too. Cameras set up on the device itself
+(a Reolink recorder, go2rtc) and the device's own camera are offered whichever is chosen.
+
+### cameras (Can be empty)
 
 *string*
 
-A comma-separated list of `entity=Display Name` pairs:
+`none` (any case) for None, empty (`""`) for All, or a comma-separated list of
+`entity=Display Name` pairs for These:
 
 ```text
 camera.front_door=Front door,camera.deck=Deck
 ```
 
 The `=Display Name` half can be left off, in which case the entity ID is used with its `camera.`
-prefix stripped. Left out entirely, the device instead lists every camera entity Home Assistant
-has, refreshed every 10 minutes — this needs `home_assistant` to be set up first.
+prefix stripped.
 
 ```yaml
 action: esphome.office_home_cameras
 data:
   cameras: camera.front_door=Front door,camera.deck=Deck
+```
+
+```yaml
+# No Home Assistant cameras on this device.
+action: esphome.office_home_cameras
+data:
+  cameras: none
 ```
 
 ## Show a camera on screen
@@ -784,12 +1279,18 @@ room's music, so a Music Assistant group is not left.
 > Needs `home_assistant` set up first. This action fetches the camera's snapshot from Home
 > Assistant directly. Without it the action still succeeds, but the view shows
 > `hass: no access configured` in place of the picture.
+>
+> With the device's **Live camera video** switch on (off on a new device), a camera Home Assistant can
+> stream is shown as live video decoded on the device, from Home Assistant's stream or the camera's own
+> RTSP address; other cameras, and any whose stream fails, are shown from snapshots, a few a second. See
+> [Cameras](setup.md#4-cameras) for the details.
 
 ### entity (Required)
 
 *string*
 
-The camera entity to show. Does not need to be one of the cameras set with `home_cameras`.
+The camera entity to show. Does not need to be one of the cameras set with `home_cameras`: an
+automation can show any camera Home Assistant has, even on a device set to None.
 
 ### seconds (Required)
 
@@ -801,6 +1302,40 @@ How long to show it for. `0` means the default, 30 seconds.
 action: esphome.office_home_show_camera
 data:
   entity: camera.front_door
+  seconds: 60
+```
+
+## Show several cameras at once
+
+In YAML, refer to this action as `esphome.<node>_home_show_cameras`. On the Echo Show only.
+
+Puts up to six cameras on the screen at once, two or three across, each refreshed from its snapshot
+about once a second, or as often as fetching the others allows. A tap on one puts that camera up on
+its own, live where Live camera video is on; a tap on the strip at the top or the foot closes the
+grid. The cameras' own sound is not played in the grid. The same grid is the **All cameras** row at
+the top of the Cameras drawer, when there are two cameras or more.
+
+### cameras (Required)
+
+*string*
+
+The cameras' entity ids, comma separated, in the order they go in: left to right, then down. Empty for
+the first six of the device's list (`home_cameras`: None, All or These). Cameras named here are
+shown even when they are not on the device's list. The device's
+own camera is not shown in the grid, and only cameras are: Home Assistant's (`camera.`), a Reolink
+recorder's, and go2rtc's streams (`go2rtc:name`).
+
+### seconds (Required)
+
+*int*
+
+How long the grid stays up, an hour at most; 0 for 30 seconds.
+
+```yaml
+# Somebody at the door after dark: the door, the drive and the yard together.
+action: esphome.kitchen_home_show_cameras
+data:
+  cameras: camera.front_door, camera.driveway, camera.yard
   seconds: 60
 ```
 
@@ -816,8 +1351,11 @@ automation with no opinion about sound should keep calling `home_show_camera`.
 > **Good to know**
 >
 > Everything `home_show_camera` says applies, `home_assistant` included. The sound additionally
-> needs a camera Home Assistant can stream (it plays the camera's stream to this device and
-> converts it on the way, the same way it plays a radio station). A camera that cannot be streamed
+> needs a camera Home Assistant can stream. With **Live camera video** on it is decoded on the device,
+> from the camera's own RTSP address where one is set for talking through it, else from Home
+> Assistant's stream, about as far behind the camera as the picture; with it off, or when neither
+> brings sound, Home Assistant plays the camera's stream to this device and converts it on the way,
+> the same way it plays a radio station, some twenty seconds behind. A camera that cannot be streamed
 > simply stays silent, and the picture is unaffected.
 
 ### entity (Required)
@@ -856,6 +1394,476 @@ data:
   sound: "on"
 ```
 
+## Buttons on a camera's view
+
+In YAML, refer to this action as `esphome.<node>_home_camera_buttons`. On devices with a screen,
+not the Dot.
+
+Puts up to four buttons on one camera's view that each run a Home Assistant action, such as
+**Open gate** or **Unlock**. Each call sets that camera's whole set, in the order given, and replaces
+what it had. The same buttons are on the setup page under Connections → Camera buttons. See
+[Camera buttons](setup.md#camera-buttons).
+
+> **Good to know**
+>
+> Home Assistant runs the buttons' actions as the device's own, so they need **Allow the device to
+> perform Home Assistant actions** turned on for the device in its ESPHome integration's options.
+> Without it Home Assistant refuses them and says so only in its own log; a button whose device has
+> no Home Assistant connected says so on the button for a few seconds.
+>
+> Every button asks for a second tap: the first lights it up with "Tap again: …", and a second tap
+> within 4 seconds runs it. A tap on a button never closes the view or starts Talk.
+
+### camera (Required)
+
+*string*
+
+The camera's entity as the device's camera list has it: `camera.front_door` for one of Home
+Assistant's, `go2rtc:name` for a go2rtc stream, `reolink:0` for a camera on a Reolink recorder, or
+`local` for the device's own.
+
+### buttons (Can be empty)
+
+*string*
+
+The buttons, split by commas or new lines, each `Label=domain.service`, or
+`Label=domain.service:domain.object` to run the action on an entity. A label is one line of 24
+characters at most; the action and the entity are Home Assistant ids (lowercase letters, digits and
+underscores). A list with any bad button is refused whole, with the reason. Empty (`""`) takes the
+camera's buttons off.
+
+```yaml
+action: esphome.office_home_camera_buttons
+data:
+  camera: camera.front_door
+  buttons: Unlock=lock.unlock:lock.front_door, Open gate=script.open_gate
+```
+
+```yaml
+# No buttons on the front door's view.
+action: esphome.office_home_camera_buttons
+data:
+  camera: camera.front_door
+  buttons: ""
+```
+
+## Show a notification
+
+In YAML, refer to this action as `esphome.<node>_notify`.
+
+Puts a notification up on this device's screen: a card in the middle of the screen with a heading (an
+icon and a title, either optional) and a message of up to three lines. It can chime as it comes up and
+can be said aloud. It stays until somebody taps it or its time runs out (12 hours at most when no time
+is given).
+
+Every TECHO5 has its own `notify`, and a call shows on that device alone. To reach several devices,
+call each one's action; see [Notifying every device](#notifying-every-device).
+
+> **Good to know**
+>
+> Home Assistant requires every argument on every call. To leave one out, pass `""` (or `0` for
+> `seconds`). An automation that omits an argument fails before it reaches the device.
+>
+> `speak: "on"` needs **Allow the device to perform Home Assistant actions** turned on for the device
+> in Home Assistant's ESPHome integration (**Settings → Devices & services → ESPHome → the device →
+> Configure**), as reminders do. Without it the notification still shows and chimes; it just isn't said.
+>
+> `chime`, `speak` and `sound` take on and off the way Home Assistant sends them. An unquoted `off` in
+> YAML is a boolean and arrives as `False`; that works, and so does an unquoted `on` (`True`).
+>
+> A Dot has no screen: it chimes, says the words if asked to, fires the events, and shows nothing. With
+> no `seconds`, its notification ends (`expired`) once the chime and the words are done. Quiet hours
+> keep it quiet (a Dot has no night hours of its own).
+
+### Arguments
+
+| Argument | Type | Accepted values | Empty / `0` means |
+|---|---|---|---|
+| `message` | string | Any text. Up to 240 bytes; longer is cut short. New lines and tabs become spaces, other control characters are dropped. Three lines fit on a Show; more ends in "…". | Not allowed: the call fails with *the message is empty*. |
+| `title` | string | Any text. Up to 40 bytes; longer is cut short. Shown in capitals above the message. | No heading text. |
+| `icon` | string | A [Material Design Icons](https://pictogrammers.com/library/mdi/) name with its prefix, such as `mdi:washing-machine` or `mdi:bell-ring`. Shown left of the title. An unknown name shows no icon. | No icon. |
+| `chime` | string | `"on"`, `true`, `yes` or `1` to chime; `"off"`, `false`, `no` or `0` to come up without one. Any letter case; any other text chimes. | The usual chime. |
+| `speak` | string | `"on"`, `true`, `yes` or `1` to have the title and message said aloud after the chime; `"off"`, `false`, `no` or `0` to keep them to the screen. Any letter case; any other text leaves them unsaid. | Not said. |
+| `tag` | string | Any text you choose, carried back as `tag` on this notification's events so an automation can tell its notification from others. | No tag (`""` in the events). |
+| `seconds` | integer | How long it stays up, in seconds. At most a day (86400); anything longer is held to a day. | Until somebody taps it, but no longer than 12 hours, then it ends as `expired`. A negative number means the same. On a Dot, until its chime and words are done. |
+
+Emoji aren't drawn: none of the screen's fonts have them, so one shows as an empty box. Use `icon` instead.
+
+### What happens
+
+- **One at a time.** A new notification, of either kind, takes the place of the one up. The one it
+  replaced reports `replaced`.
+- **Sound.** The chime plays as it comes up, then the words if `speak` is `"on"`, joined as one
+  sentence: title `Doorbell` and message `Someone is here` are said as "Doorbell. Someone is here".
+  A chime that comes while the device is answering or announcing waits for it to finish (up to ten
+  seconds, then it is left out) rather than cutting it off. A camera's sound does not hold it back:
+  the chime plays over it at once.
+- **Night and quiet hours.** No chime, no words and no camera sound, whatever `chime`, `speak` and
+  `sound` say. At night a notification does not replace the night screen (on a Show, dark or the red clock; on a
+  Spot, dark or dimmed to its night level): it
+  waits, and shows after the first touch on the screen. That touch does nothing else. By day it lights
+  a dark screen, once per notification; the screen can still be turned off again by an empty room or
+  from Home Assistant while the notification is up.
+- **What it sits under and over.** A ringing alarm or timer, a call, a reminder, the setup page's
+  question and the PIN pad are shown over it. It is shown over the dashboard and the deck, and puts
+  the Spot's menu away.
+- **On a Spot** it takes the whole face: icon, title, message, and "tap to dismiss". A camera view
+  (`home_show_camera`) is shown over a text card nobody has read; the card shows when the view ends. A
+  picture notification replaces the card instead.
+
+### Reading it from across the room
+
+`esphome.<node>_notify_sized` is `notify` with one more argument, `size`. It does everything `notify`
+does; only the card changes.
+
+| `size` | What you get |
+|---|---|
+| `normal` (or `""`, or anything else) | The usual card: three lines of the message. |
+| `large` | A card over most of the screen, with the title and the message in much larger letters. The message wraps over as many lines as fit. |
+| `huge` | A card over nearly all of the screen. The message is set as large as it can be and still fit, in the middle of the card, so a short message such as "Server down" spans most of the screen's width. A longer one gets smaller letters, down to a limit, and ends in "…" past that. |
+
+`size` is a separate action, not a new argument on `notify`, because Home Assistant requires every
+argument on every call: a new argument on `notify` would stop every automation and blueprint that
+doesn't pass it. `notify` and `notify_picture` are unchanged.
+
+The usual card follows **Text size** (Settings, Look; also **Screen text size** in Home Assistant), as
+every word on the screen does. `large` and `huge` always take the largest letters that fit, so Text size
+makes no difference to them.
+
+```yaml
+action: esphome.bedroom_notify_sized
+data:
+  message: "Home server down"
+  title: "Warning"
+  icon: "mdi:server-off"
+  chime: ""
+  speak: ""
+  tag: ""
+  seconds: 0
+  size: huge
+```
+
+As in `notify`, an empty `chime` means the usual chime plays, an empty `speak` means nothing is said,
+and `seconds: 0` keeps it up until somebody taps it.
+
+On a Spot, `large` and `huge` give the message more of the round face and larger letters, and `huge`
+drops the icon. A Dot has no screen and ignores `size`.
+
+### The event
+
+Each notification fires an `esphome.techo5_notification` event on Home Assistant's bus: once as it
+comes up, and once more as it goes.
+
+| Field | |
+|---|---|
+| `event` | `shown` as it comes up; then `dismissed` (somebody tapped it, or its picture's camera page was closed), `expired` (its time ran out) or `replaced` (a newer notification, or a camera put up over its picture, took its place) |
+| `id` | The notification's own, unique on its device: the numbers count up from a random start each time the device starts, so one from before a restart is very unlikely to come again. Pair it with `device` |
+| `tag` | The `tag` the call passed, `""` for none |
+| `kind` | `text` for `notify`, `picture` for `notify_picture` |
+| `title` | The title as shown (clipped), `""` for none |
+| `message` | The message as shown (clipped), `""` for none |
+| `device` | The device's own name, as set on the device (`Kitchen`), not the node in the action's name (`kitchen`). A name given to the device in Home Assistant's own settings is not seen by the device, so the event still carries the device's own |
+
+### Examples
+
+```yaml
+# The washer is done: a card with an icon, the usual chime, for 10 minutes.
+action: esphome.kitchen_notify
+data:
+  message: "The washing machine is done"
+  title: "Washer"
+  icon: "mdi:washing-machine"
+  chime: ""
+  speak: ""
+  tag: "washer"
+  seconds: 600
+```
+
+```yaml
+# Said aloud as well as shown: "Garage. The garage door has been open for 10 minutes".
+action: esphome.kitchen_notify
+data:
+  message: "The garage door has been open for 10 minutes"
+  title: "Garage"
+  icon: "mdi:garage-open"
+  chime: ""
+  speak: "on"
+  tag: "garage"
+  seconds: 300
+```
+
+```yaml
+# A quiet note: no chime, no words, no title, up for an hour.
+action: esphome.office_notify
+data:
+  message: "Trash goes out tonight"
+  title: ""
+  icon: "mdi:trash-can"
+  chime: "off"
+  speak: ""
+  tag: "trash"
+  seconds: 3600
+```
+
+### Notifying every device
+
+There is no "all devices" action. Each device shows what it is sent, so a script that calls every
+device's action does it, and an automation calls the script once. (To say words on every other
+device at once, see [Announce to the house](#announce-to-the-house); a Dot chimes there rather than
+speaking the text.)
+
+```yaml
+script:
+  notify_techo5s:
+    fields:
+      message: {}
+      title: {}
+      icon: {}
+    sequence:
+      - parallel:
+          - action: esphome.kitchen_notify
+            data: {message: "{{ message }}", title: "{{ title | default('') }}", icon: "{{ icon | default('') }}", chime: "", speak: "", tag: "", seconds: 0}
+          - action: esphome.office_notify
+            data: {message: "{{ message }}", title: "{{ title | default('') }}", icon: "{{ icon | default('') }}", chime: "", speak: "", tag: "", seconds: 0}
+```
+
+### Following up
+
+```yaml
+# Somebody saw the washer card and tapped it away: nothing more to do. Nobody did in its 10 minutes:
+# tell a phone. (A card with no seconds ends as expired after 12 hours at most.) The tag and the
+# device pick out this card, so a notification on another device does not match.
+alias: Washer card missed
+triggers:
+  - trigger: event
+    event_type: esphome.techo5_notification
+    event_data:
+      event: expired
+      tag: washer
+      device: Kitchen
+actions:
+  - action: notify.mobile_app_phone
+    data:
+      message: "The washer finished and nobody saw it ({{ trigger.event.data.device }})"
+```
+
+## Show a picture notification
+
+In YAML, refer to this action as `esphome.<node>_notify_picture`. For larger words over the picture, use
+`esphome.<node>_notify_picture_sized`, which takes the same arguments and then `size`
+(`normal`, `large` or `huge`), set out under [Reading it from across the room](#reading-it-from-across-the-room).
+On a Show the caption bar grows to hold the larger message, up to a third of the screen for `large` and
+more than half for `huge`; the picture shows above it. On a Spot, `size` has no effect on a picture
+notification.
+
+Puts a picture up full screen on this device, with a notification's words over it: a camera's live
+view for a doorbell, a snapshot an automation saved, or any picture Home Assistant or another web
+server serves. It uses the camera page, so a tap anywhere closes it, and it stays until then or until
+its time runs out. It chimes, speaks, replaces and reports exactly as `notify` does (see
+[Show a notification](#show-a-notification)), with `kind: picture` in its event. It takes `chime`, `speak`, `sound`, `tag` and `seconds` as set out below.
+
+> **Good to know**
+>
+> **Set up `home_assistant` first.** A camera, an image entity and a Home Assistant path are fetched
+> by the device itself, from Home Assistant's REST API, with the URL and long-lived access token that
+> [Connect the device to Home Assistant](#connect-the-device-to-home-assistant)
+> (`esphome.<node>_home_assistant`) stores. The ESPHome connection Home Assistant uses to reach the
+> device carries no token the other way. Until that action has been called on the device, the
+> notification still comes up, with its words, but with `hass: no access configured` in place of the
+> picture. Only an `http(s)://` address on another server works without it.
+>
+> Home Assistant requires every argument on every call. To leave one out, pass `""` (or `0` for
+> `seconds`).
+>
+> A camera's own sound is decided by `sound`, as on `home_show_camera_sound`: it plays over whatever
+> the device is playing, the Mute/Unmute control on the page silences it, and words said with
+> `speak: "on"` take the speaker for as long as they last and hand it back. A camera already up with
+> its sound keeps it.
+>
+> A still picture does not take the page from a camera somebody is watching (one put up with
+> `home_show_camera`, or from the screen): it waits for that view to end and comes up then, if its
+> time has not run out meanwhile. A camera picture of the camera already up puts its words over that
+> view without cutting its time short, and is not held back at night, since the camera was up anyway.
+>
+> `speak: "on"` needs **Allow the device to perform Home Assistant actions**, as for `notify`.
+>
+> A Dot has no screen. It checks the picture the same way, chimes, speaks if asked, fires the events,
+> and shows nothing.
+
+### Arguments
+
+| Argument | Type | Accepted values | Empty / `0` means |
+|---|---|---|---|
+| `message` | string | Any text, up to 240 bytes; one line under the title on a Show, clipped to the screen's width, and up to two lines on a Spot. New lines and tabs become spaces. | No message line. |
+| `title` | string | Any text, up to 40 bytes. Shown small, in capitals, above the message. On a Spot it replaces the camera's name at the top. | No title. A camera or image entity is then named on the page as Home Assistant names it (its friendly name). |
+| `picture` | string | One of the four kinds below. Anything else fails the call with *not a camera, an image entity, a path on Home Assistant or an http(s) address*, and nothing is shown. | Not allowed. |
+| `chime` | string | `"on"`, `true`, `yes` or `1` to chime; `"off"`, `false`, `no` or `0` to come up without one. Any letter case; any other text chimes. | The usual chime. |
+| `speak` | string | `"on"`, `true`, `yes` or `1` to have the title and message said aloud after the chime; `"off"`, `false`, `no` or `0` to keep them to the screen. Any letter case; any other text leaves them unsaid. | Not said. A picture with no words never says anything. |
+| `sound` | string | A camera's own audio, as `home_show_camera_sound` takes it: `"on"` (or `true`, `yes`, `1`) to play it, `"off"` (or `false`, `no`, `0`) to keep it silent. Any other text uses the device's setting. Only a camera Home Assistant can stream has any; a still and a Reolink camera ignore it. Never at night or in quiet hours. | The device's own **Camera sound** setting, off on a new device. |
+| `tag` | string | Any text you choose, carried back as `tag` on this notification's events. | No tag (`""` in the events). |
+| `seconds` | integer | How long it stays up, in seconds, counted from when the picture arrives (a camera that is slow to start loses none of it). At most a day. | With `0` or a negative number: a live camera stays 30 seconds, as `home_show_camera` treats `0`; a still stays until somebody taps it, with "tap to close" and no countdown, but no longer than 12 hours, then `expired`; on a Dot, until its chime and words are done. |
+
+With neither a `title` nor a `message`, it is **the picture alone**: no name, clock or caption over it,
+only "tap to close" at its foot.
+
+The kinds of `picture`:
+
+| `picture` | Example | Shown as | Fetched from | Needs `home_assistant` |
+|---|---|---|---|---|
+| A camera entity | `camera.front_door` | Live: frames one after another while it is up | `/api/camera_proxy/<entity>` on Home Assistant | Yes |
+| An image entity | `image.doorbell_snapshot` | A still, fetched once | `/api/image_proxy/<entity>` on Home Assistant | Yes |
+| A path on Home Assistant | `/local/snapshots/door.jpg` | A still, fetched once | Home Assistant, with the token. `/local/` is Home Assistant's `config/www` folder | Yes |
+| An `http://` or `https://` address | `http://192.168.1.10:8123/local/door.jpg`, `https://example.com/porch.jpg` | A still, fetched once | Home Assistant's own address (the one `home_assistant` stores) is fetched with the token, as a path. Any other host is fetched without it, under the video player's rule (the same one, in `lib/netguard`): anything that is not `http` or `https` is refused, and so are loopback, link-local, multicast and this device's own addresses, judged on the address actually connected to, after DNS and after every redirect. A camera or NAS that needs a login must carry it in the address | Only for Home Assistant's own address |
+
+A still that is up already, by the same `picture`, stays on the screen when the next notification
+comes over it while the picture is fetched again, so a run of notifications over one picture doesn't
+flicker, and a picture that changes behind one address (an image entity's newest snapshot, or a file
+saved over the last) still shows its newest version.
+
+A still is JPEG or PNG, at most 8 MB and about 12 megapixels, and is scaled to fit the screen. A picture
+that cannot be fetched (not found, not a picture, too big, no `home_assistant`) still comes up with its
+words, and the reason where the picture would be. A login in an address
+(`user:pass@`), its query and its fragment are never shown on the screen or written to a log: they are
+taken off first, even in an error.
+
+### Examples
+
+```yaml
+# A camera: the doorbell, live, with words and said aloud, for a minute.
+action: esphome.kitchen_notify_picture
+data:
+  message: "Someone is at the front door"
+  title: "Doorbell"
+  picture: camera.front_door
+  chime: ""
+  speak: "on"
+  sound: ""
+  tag: "doorbell"
+  seconds: 60
+```
+
+```yaml
+# The doorbell with its own sound: whoever is at the door is heard in the room, whatever the device's
+# Camera sound setting says.
+action: esphome.kitchen_notify_picture
+data:
+  message: "Someone is at the front door"
+  title: "Doorbell"
+  picture: camera.front_door
+  chime: ""
+  speak: ""
+  sound: "on"
+  tag: "doorbell"
+  seconds: 60
+```
+
+```yaml
+# The camera alone: no words, no chime, for the default 30 seconds (a live camera given 0).
+action: esphome.kitchen_notify_picture
+data:
+  message: ""
+  title: ""
+  picture: camera.driveway
+  chime: "off"
+  speak: ""
+  sound: ""
+  tag: "driveway"
+  seconds: 0
+```
+
+```yaml
+# An image entity: a doorbell's last snapshot (many doorbell integrations provide one).
+action: esphome.office_notify_picture
+data:
+  message: "A package was left at the door"
+  title: "Delivery"
+  picture: image.front_door_doorbell_snapshot
+  chime: ""
+  speak: ""
+  sound: ""
+  tag: "delivery"
+  seconds: 120
+```
+
+```yaml
+# A snapshot saved to Home Assistant's www folder, shown by its path. The automation saves it first
+# (camera.snapshot writes config/www/snapshots/porch.jpg, which Home Assistant serves as
+# /local/snapshots/porch.jpg).
+- action: camera.snapshot
+  target:
+    entity_id: camera.porch
+  data:
+    filename: /config/www/snapshots/porch.jpg
+- action: esphome.kitchen_notify_picture
+  data:
+    message: "Motion on the porch"
+    title: "Porch"
+    picture: /local/snapshots/porch.jpg
+    chime: ""
+    speak: ""
+    sound: ""
+    tag: "porch"
+    seconds: 45
+```
+
+```yaml
+# A picture on another server, fetched without Home Assistant's token. Anything the server needs to
+# let the device in has to be in the address.
+action: esphome.kitchen_notify_picture
+data:
+  message: "Tonight's radar"
+  title: "Weather"
+  picture: "https://example.com/radar/latest.png"
+  chime: "off"
+  speak: ""
+  sound: ""
+  tag: "radar"
+  seconds: 300
+```
+
+A whole doorbell automation, which tells a phone when nobody answered:
+
+```yaml
+alias: Doorbell on the kitchen Show
+triggers:
+  - trigger: state
+    entity_id: binary_sensor.front_door_doorbell
+    to: "on"
+actions:
+  - action: esphome.kitchen_notify_picture
+    data:
+      message: "Someone is at the front door"
+      title: "Doorbell"
+      picture: camera.front_door
+      chime: ""
+      speak: "on"
+      sound: ""
+      tag: "doorbell"
+      seconds: 60
+  # Wait for it to go: tapped away (dismissed), not (expired), or taken over by a newer notification
+  # (replaced), which is somebody else's doing and not an unanswered door. Waiting for any event would
+  # catch its "shown" first. The tag and the device pick out this notification, not another one's.
+  - wait_for_trigger:
+      - trigger: event
+        event_type: esphome.techo5_notification
+        event_data: {tag: doorbell, device: Kitchen, event: dismissed}
+      - trigger: event
+        event_type: esphome.techo5_notification
+        event_data: {tag: doorbell, device: Kitchen, event: expired}
+      - trigger: event
+        event_type: esphome.techo5_notification
+        event_data: {tag: doorbell, device: Kitchen, event: replaced}
+    timeout: "00:02:00"
+  - if:
+      - condition: template
+        # Only a door nobody answered: tapped away or replaced is not.
+        value_template: "{{ wait.trigger is none or wait.trigger.event.data.event == 'expired' }}"
+    then:
+      - action: notify.mobile_app_phone
+        data:
+          message: "Nobody answered the door"
+```
+
 ## Choose the calendars shown
 
 In YAML, refer to this action as `esphome.<node>_calendar_sources`.
@@ -878,17 +1886,93 @@ data:
   calendars: calendar.family, calendar.work
 ```
 
+**Reading them back.** Two text sensors in the device's diagnostic entities, **Calendars shown** and
+**Calendars that pop up**, list the calendar entities now chosen, separated by commas, whichever way
+they were set (the screen, the setup page or these actions). They read `none` for an empty list, and a
+list too long for a state (255 characters) is cut at a whole entity and ends with `+N more`. The pop-up
+sensor lists every shown calendar while none is picked. They are read-only.
+
 ## Show the calendar
 
 In YAML, refer to this action as `esphome.<node>_calendar_show`.
 
-Opens the calendar page on a Show, on this month, as a tap on the date under the clock does. The page
+Opens the calendar page on a Show, as a tap on the date under the clock does: on this month, or on
+the view its **Opens on** setting names. The page
 shows the month with each day's events on it; a tap on a day lists its events, and a tap on an event
-opens its details. It closes after two minutes untouched, or with Done. Fails on a device that shows
-no calendar (choose one with `calendar_sources`, or Settings, General, Calendars). No arguments.
+opens its details. It closes after two minutes untouched, or with Done. At night it lights a screen
+the night has put out, at the night light's level (or at half brightness with no night light), and
+shows over the red night clock; the night comes back once the page closes. A screen somebody turned
+off stays off: the action still works, and the page is there if the screen is turned on before it
+closes. Fails on a device that shows no calendar (choose one with `calendar_sources`, or Settings,
+General, Calendars). No arguments.
 
 ```yaml
 action: esphome.office_calendar_show
+```
+
+## Choose the to-do lists shown
+
+In YAML, refer to this action as `esphome.<node>_todo_lists`.
+
+Chooses which of Home Assistant's to-do and shopping lists this device shows, on the To-do tab of its
+drawer. Each device keeps its own: the kitchen can show the shopping list and a desk the chores.
+Screen devices only (the Show, the Skylight and the Panel app show the tab). Any `todo.` entity works:
+the Shopping List integration, Local To-do, Google Tasks, Todoist. Off until a list is chosen. Needs
+`home_assistant` set up first. A tap on an item on the tab marks it done in Home Assistant.
+
+With the voice assistant that answers without Home Assistant, the lists chosen here are also the ones
+it adds to and reads out ("add milk to the shopping list"). With Home Assistant's Assist as the voice
+assistant you don't need this for that: Assist handles its lists itself.
+
+### lists (Required)
+
+*string*
+
+To-do list entities, separated by commas, in the order to show them. Empty shows none, and takes the
+To-do tab away.
+
+```yaml
+action: esphome.kitchen_todo_lists
+data:
+  lists: todo.shopping_list, todo.chores
+```
+
+## Show the to-do lists
+
+In YAML, refer to this action as `esphome.<node>_todo_show`.
+
+Opens the drawer on its To-do tab on a Show, Skylight or Panel app, as a swipe in from the right
+edge and a tap on the tab do. A tap on the screen outside the drawer, or its close button, puts it
+away. At night it lights a screen the night has put out, at the night light's level (or at half
+brightness with no night light), and the drawer shows over the red night clock until it is closed. A
+screen somebody turned off stays off. Fails on a device that has no list chosen (choose them with
+`todo_lists`, or on the setup page's Weather & Calendar tab). No arguments.
+
+```yaml
+action: esphome.kitchen_todo_show
+```
+
+## Show the forecast or the rain map
+
+In YAML, refer to these actions as `esphome.<node>_weather_show` and `esphome.<node>_radar_show`.
+
+`weather_show` opens the forecast page on a Show, as a tap on the weather on the home screen does;
+`radar_show` opens the rain map, as the page's Radar button does. The button turns between the two,
+a tap anywhere else puts the page away, and it closes on its own after 30 seconds. Either one takes
+the place of an open weather alert page, and of the calendar. At night it lights a screen the night
+has put out, at the night light's level (or at half brightness with no night light), and shows over
+the red night clock; the night comes back once the page closes. A screen somebody turned off stays
+off: the action still works, and the page is there if the screen is turned on before it closes. Fails
+on a device set to no weather (choose a source with `home_weather`, the "Weather source" select, or
+Settings, General, Weather). No arguments.
+
+```yaml
+action: esphome.office_weather_show
+```
+
+```yaml
+# A storm warning: the rain map up on the kitchen Show.
+action: esphome.kitchen_radar_show
 ```
 
 ## Choose the calendars that pop up
@@ -917,8 +2001,8 @@ data:
 
 In YAML, refer to this action as `esphome.<node>_screen_night_hours`.
 
-Sets when the night starts and ends on a Show: the hours the screen goes dark, or down to its night
-light, by itself. Any times, to the minute, and the night may cross midnight. The same can be set on
+Sets when the night starts and ends on a Show or a Spot: the hours the screen goes dark, or down to
+its night light or night clock, by itself. Any times, to the minute, and the night may cross midnight. The same can be set on
 the screen (Settings, Display, Night hours, Custom) and with the **Night hours**, **Night starts**
 and **Night ends** selects, which offer quarter hours.
 
@@ -932,7 +2016,8 @@ When the night starts, in 24-hour time: `19:00`.
 
 *string*
 
-When it ends: `09:30`. Both empty turns the night off.
+When it ends: `09:30`. Both empty turns the night off (on a Spot too: it does not go back to 10 PM to
+7 AM).
 
 ```yaml
 action: esphome.office_screen_night_hours
@@ -941,9 +2026,38 @@ data:
   end: "09:30"
 ```
 
+## Set the weekend's night hours
+
+In YAML, refer to this action as `esphome.<node>_screen_weekend_night_hours`.
+
+Gives the weekend its own night hours on a Show or a Spot: the nights that end on a Saturday or a
+Sunday morning, so Friday's and Saturday's nights. A night that crosses midnight starts the evening
+before, so `23:30` to `09:30` starts Friday at 11:30 PM and ends Saturday at 9:30 AM; Sunday evening
+is a weeknight's again. The same can be set with the **Weekend night starts** and **Weekend night
+ends** selects.
+
+### start (Required)
+
+*string*
+
+When the weekend's night starts, in 24-hour time: `23:30`.
+
+### end (Required)
+
+*string*
+
+When it ends: `09:30`. Both empty makes the weekend's nights the same as every other night.
+
+```yaml
+action: esphome.office_screen_weekend_night_hours
+data:
+  start: "23:30"
+  end: "09:30"
+```
+
 ### Turning the night on from an automation
 
-A Show also has a **Night mode** switch, on while it is night. Turn it on or off from an automation,
+A Show or a Spot also has a **Night mode** switch, on while it is night. Turn it on or off from an automation,
 a "house to sleep" scene for example, to start or end the night now. With night hours set, the switch
 holds until the hours next start or end the night, then the hours take over again. To leave the night
 to Home Assistant entirely, set **Night hours** to **Controlled by Home Assistant**: the hours are then
@@ -977,7 +2091,7 @@ In YAML, refer to this action as `esphome.<node>_dashboard_path`.
 Which dashboard the screen shows, as its path in Home Assistant's address bar. The device's
 **Dashboard to show** list sets the same thing, and is usually easier. See [Dashboards](dashboards.md).
 
-### path (Optional)
+### path (Can be empty)
 
 `lovelace/0`, `dashboard-kitchen/lights`, `energy`, … Empty is the Rooms dashboard when drawn, and
 the default dashboard when streamed.
@@ -1072,6 +2186,56 @@ action: esphome.office_stop_video
 data: {}
 ```
 
+## Name what plays next
+
+In YAML, refer to this action as `esphome.<node>_media_title`.
+
+Names the next `media_player.play_media` on the device's media player, for the player screen and the
+**Now playing** sensors. Home Assistant's `play_media` sends only the address, so without it the screen
+names the device's own playback as the radio, with the last station's song, or not at all. A recording
+off an answering machine, say, then shows as "Message from Alex", "today 14:12", "Answering machine".
+
+- It names only the next `play_media` that is not an announcement, once: the one after it has no name
+  again. A station, a phone over Bluetooth or Music Assistant starting first drops the name unused.
+- The name waits 60 seconds for its `play_media`, so call this right before it. One that comes later
+  is not named, nor is anything after it.
+- The name stays for as long as that track is on the player, paused too (`media_player.media_stop`
+  pauses), and goes when it ends, is stopped for good or something else plays.
+- Without it, `play_media` is named as before.
+
+### title (Required)
+
+*string*
+
+The name, shown large. `""` names nothing and drops a name given before.
+
+### subtitle (Can be empty)
+
+*string*
+
+A second line under it, such as when it was recorded.
+
+### source (Can be empty)
+
+*string*
+
+Where it comes from, shown where "Radio" or "Bluetooth" would be. `""` shows the screen's own word for
+it ("Playback"); the **Now playing source** sensor reads `Playback`.
+
+```yaml
+- action: esphome.office_media_title
+  data:
+    title: "Message from Alex"
+    subtitle: "today 14:12"
+    source: "Answering machine"
+- action: media_player.play_media
+  target:
+    entity_id: media_player.office
+  data:
+    media_content_id: "media-source://media_source/local/message.wav"
+    media_content_type: music
+```
+
 ## Choose the weather shown on the idle screen
 
 In YAML, refer to this action as `esphome.<node>_home_weather`.
@@ -1079,7 +2243,7 @@ In YAML, refer to this action as `esphome.<node>_home_weather`.
 Sets which weather forecast the device's clock/idle screen shows. Screen devices only. Needs
 `home_assistant` set up first, or no forecast will show.
 
-### entity (Optional)
+### entity (Can be empty)
 
 *string*
 
@@ -1101,7 +2265,9 @@ Sets the glance strip: Home Assistant entities shown as chips (a pill with the e
 short line) along the foot of the clock page, each only while it has something to say. The Echo Show
 only; the Spot and the Dot don't have it. The list persists and the device follows the entities itself, so a chip comes and goes with its
 entity's state and nothing has to be sent again. A value that leaves the chips as they were
-does not redraw the screen.
+does not redraw the screen. The text size of the chips is the Glance chip size setting, on the screen
+and in Home Assistant: Automatic, Small or Tiny. While the music strip is up the chips are hidden,
+unless Chips while music plays is set to Above the strip.
 
 What each entity shows:
 
@@ -1143,47 +2309,62 @@ In YAML, refer to this action as `esphome.<node>_home_radio`.
 Configures the device's Radio page: which stations it lists, what plays them, and what shows as
 "now playing". Screen devices only; the change takes effect the next time the device reconnects.
 
+Sample scripts, for stream addresses, Radio Browser and TuneIn stations, are under
+[Radio](install.md#radio) in the install guide.
+
 > **Good to know**
 >
-> Favorites (`stations`) play through a Home Assistant script over the device's normal API
-> connection, not through `home_assistant`. The Radio Browser stations near your home, shown
-> alongside your favorites, do use `home_assistant` — without it, that part of the list is empty.
+> - Favorites (`stations`) play through the script in `service`, which the device calls over its
+>   ESPHome connection, not through `home_assistant`. That needs **Allow the device to perform Home
+>   Assistant actions** turned on in the device's ESPHome entry (Configure). Without it, picking a
+>   favorite does nothing, and nothing on the device says why.
+> - The Radio Browser stations near your home, shown alongside your favorites, come through
+>   `home_assistant`. Without it, the device asks radio-browser.info itself, for stations near the
+>   place set on its setup page, and plays them itself.
+> - Call this once. The device keeps the wiring, and follows the entities from then on; call it again
+>   only to change something. Every argument goes in the call, as `""` for the ones you leave out.
+> - The device only reads `now`. Your play script, or an automation, has to set it to the station's
+>   name each time one starts. When the device cannot name a stream itself, which is most of the
+>   time, it is the name shown while a station plays and the name the player's star saves.
+> - The star on the player calls a script named `script.radio_favorite_add_station`, with one field,
+>   `station`, through `home_assistant`. There is an example under [Radio](install.md#radio) in the
+>   install guide.
 
-### stations (Optional)
+### stations (Can be empty)
 
 *string*
 
 A comma-separated list of `input_select` entities, each one a station or preset to offer on the
 Radio page. Up to 20.
 
-### now (Optional)
+### now (Can be empty)
 
 *string*
 
 An entity whose state names whatever is currently playing, shown on the Radio page and the idle
 screen while it's live.
 
-### service (Optional)
+### service (Can be empty)
 
 *string*
 
 The script or action that actually plays a station when one is picked on the device.
 
-### field (Optional)
+### field (Can be empty)
 
 *string*
 
 The name of the argument `service` expects the chosen station in. Defaults to `station` if left
 blank.
 
-### speaker_field (Optional)
+### speaker_field (Can be empty)
 
 *string*
 
 The name of the argument `service` expects this device's media player in. Defaults to `speaker` if
 left blank.
 
-### speaker (Optional)
+### speaker (Can be empty)
 
 *string*
 
@@ -1200,6 +2381,77 @@ data:
   speaker_field: speaker
   speaker: media_player.office
 ```
+
+## Name the station that plays next
+
+In YAML, refer to this action as `esphome.<node>_media_station`.
+
+Tells the device that the next `media_player.play_media`, within a minute, is a radio station, by
+its name. Home Assistant sends every stream through its own converter, which keeps neither the
+station's address nor its name, so a station started by a voice command or an automation shows as
+"Radio" with no logo. Named this way, it shows as one tapped on the Radio page does: the station's
+name and logo, and the song where the station tells it.
+
+- The name is looked up on Radio Browser, as for a tapped station, so give the name the station goes
+  by there.
+- It names only the next `play_media`; one that comes more than a minute later is not named.
+- `""` drops a name not yet used.
+
+### name (Required)
+
+*string*
+
+The station's name.
+
+```yaml
+- action: esphome.office_media_station
+  data:
+    name: "SWR3"
+- action: media_player.play_media
+  target: { entity_id: media_player.office }
+  data:
+    media_content_id: "media-source://radio_browser/<stationuuid>"
+    media_content_type: music
+```
+
+## Play rain sounds by voice
+
+The device has no sounds of its own to fall asleep to. What it does is leave "play the sounds of
+rain" alone, so the sentence isn't taken as a weather question, and name a sound file on the
+now-playing page. The sound itself comes from Home Assistant. This automation plays a free online
+rain stream on the TECHO5 device that heard the sentence, so there is no file to host. Add it in
+Settings > Automations & scenes > Create automation > Edit in YAML.
+
+```yaml
+alias: TECHO5 - rain sounds by voice
+triggers:
+  - trigger: conversation
+    command:
+      - "play [the] sound[s] of rain"
+      - "play rain [sounds]"
+actions:
+  - variables:
+      speaker: >-
+        {{ device_entities(trigger.device_id) | select('match', 'media_player\.') | first
+           if trigger.device_id is not none else '' }}
+  - if: "{{ not speaker }}"
+    then:
+      - set_conversation_response: "Say that to the speaker you want the rain on."
+      - stop: No speaker heard it
+  - action: media_player.play_media
+    target:
+      entity_id: "{{ speaker }}"
+    data:
+      media_content_type: music
+      media_content_id: https://maggie.torontocast.com:2020/stream/natureradiorain
+  - set_conversation_response: "Playing rain."
+mode: single
+```
+
+"Stop" ends it like any other music. To play a recording of your own instead, put the file in
+Home Assistant's `www` folder (inside its config folder) and use
+`http://<home-assistant-address>:8123/local/<file>.mp3` as `media_content_id`; the now-playing
+page shows the file's name. A long recording works best, since a file stops when it ends.
 
 ## Center the rain map and weather alerts somewhere else
 
@@ -1250,6 +2502,30 @@ data:
   source: "media-source://media_source/local/Photos"
 ```
 
+The source that is already showing, given again, reads it again: the device gathers its photos afresh
+(subfolders too, unless **Include subfolders** is off) and shows the next photo from the new list
+within half a minute, without clearing the source first. The photo up stays on the screen until the
+next one is ready, so the screen does not go dark in between. This works the same for a Home
+Assistant folder, an Immich album or library, and the device's own photos. Use it after something
+outside fills or changes the folder; on its own the device reads the list again every hour.
+A slideshow in order carries on from the photo up when it is still in the folder. Given again while
+the photo the last re-read brought up is still showing, the folder is read again but that photo
+keeps its time, so a script that asks after each photo it copies in changes the photo once, not each
+time.
+
+An automation that reads the folder again once a script has put new photos in it and said so over
+MQTT:
+
+```yaml
+triggers:
+  - trigger: mqtt
+    topic: photos/ready
+actions:
+  - action: esphome.office_home_slideshow
+    data:
+      source: "media-source://media_source/local/Photos"
+```
+
 ## List saved voice recordings
 
 In YAML, refer to this action as `esphome.<node>_recordings`.
@@ -1281,7 +2557,7 @@ there are and call again for each one. This action answers with data; call it wi
 
 One of the recording IDs `recordings` returned.
 
-### page (Optional)
+### page (Can be 0)
 
 *integer*
 
@@ -1293,6 +2569,110 @@ data:
   id: "{{ recent.ids[0] }}"
   page: 0
 response_variable: clip
+```
+
+## List saved wake word clips
+
+In YAML, refer to this action as `esphome.<node>_wake_clips`.
+
+Returns the wake word clips kept on the device, newest first, with what the detector made of each.
+Clips are only kept while the device's **Keep wake clips** switch is on (off by default; see
+[Wake word clips](setup.md#wake-word-clips)); while it is off, this action and `wake_clip_audio`
+answer with an error. Each entry has:
+
+- `id`: what to pass to `wake_clip_audio`.
+- `kind`: `wake` (a wake not taken as a mistake within 30 seconds), `mistake`, `noise` or `nearmiss`.
+- `at`: when, in UTC.
+- `slot`: which assistant's wake word, 1 or 2.
+- `model`: the wake word model's ID.
+- `score`: the highest score the word reached.
+- `cutoff`: the threshold it was judged against.
+
+The answer lists 50 clips at a time; `pages` says how many pages there are and `total` how many clips.
+This action answers with data; call it with a `response_variable`.
+
+### kind (Required)
+
+*string*
+
+Only this kind of clip: `wake`, `mistake`, `noise` or `nearmiss` (`near miss`, as **Wake clips by
+kind** writes it, works too). An empty string lists every kind.
+
+### page (Required)
+
+*integer*
+
+Which page of the list, starting at 0.
+
+```yaml
+action: esphome.office_wake_clips
+data:
+  kind: "mistake"
+  page: 0
+response_variable: clips
+```
+
+## Fetch a saved wake word clip
+
+In YAML, refer to this action as `esphome.<node>_wake_clip_audio`.
+
+Fetches one wake word clip as base64-encoded WAV (16 kHz mono 16-bit), by an ID from `wake_clips`.
+The answer has the same shape as `turn_audio`'s: a clip is about 128 KB, so it comes back in pages,
+and the response says how many there are. This action answers with data; call it with a
+`response_variable`.
+
+### id (Required)
+
+*string*
+
+One of the clip IDs `wake_clips` returned.
+
+### page (Required)
+
+*integer*
+
+Which page of the audio to fetch, starting at 0.
+
+```yaml
+action: esphome.office_wake_clip_audio
+data:
+  id: "{{ clips.clips[0].id }}"
+  page: 0
+response_variable: audio
+```
+
+## Set the camera stream's login
+
+In YAML, refer to this action as `esphome.<node>_camera_credentials`.
+
+Sets the user name and password a recorder uses for [this device's camera
+stream](setup.md#recording-this-devices-camera) (RTSP and ONVIF), by the same rules as the setup page.
+A new login lets go of whoever is watching with the old one.
+
+> **Good to know**
+>
+> It works only once **Camera login from Home Assistant** (a switch of the device's, under its
+> configuration) is on; it is off by default. Like `ssh_keys`, it is also refused unless Home
+> Assistant's *ESPHome* link to the device has a real encryption key set, so the password never
+> crosses the network in the clear.
+
+### username (Can be empty)
+
+*string*
+
+One line, with no quotes and no colon. Empty is `camera`.
+
+### password (Can be empty)
+
+*string*
+
+12 characters or more, one line, with no quotes. Empty keeps the password set now.
+
+```yaml
+action: esphome.office_camera_credentials
+data:
+  username: frigate
+  password: a-long-password-here
 ```
 
 ## Set the SSH authorized keys
@@ -1326,15 +2706,113 @@ data:
     ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample you@your-pc
 ```
 
+## Join a tailnet
+
+In YAML, refer to this action as `esphome.<node>_tailscale_login`.
+
+Joins the device to your Tailscale network with an auth key, and turns its **Tailscale** switch on.
+The key is handed to Tailscale once and not kept: after that the device rejoins by itself. It waits
+up to 30 seconds to see the device connect, so a key that's used up or expired is an error here
+rather than a device that quietly never joins. Echo Shows, the Echo Spot and the Skylight only. See
+[Tailscale: reaching a device from away](tailscale.md).
+
+> **Good to know**
+>
+> This needs an API encryption key: it's refused unless Home Assistant's *ESPHome* link to the device
+> already has a real encryption key set, since otherwise the key would cross the network in the clear.
+
+### auth_key (Required)
+
+*string*
+
+An auth key from the Tailscale admin console (`tskey-auth-…`), pre-approved and tagged `tag:techo5`.
+
+```yaml
+action: esphome.office_tailscale_login
+data:
+  auth_key: tskey-auth-example
+```
+
+## Join a Headscale tailnet
+
+In YAML, refer to this action as `esphome.<node>_headscale_login`.
+
+Joins the device to the tailnet of your own Headscale server with a pre-auth key, and turns its
+**Tailscale** switch on. A device that was on Tailscale's tailnet leaves it first. Otherwise it works
+as [`tailscale_login`](#join-a-tailnet) does: the key isn't kept, and it waits up to 30 seconds to see
+the device connect. Echo Shows, the Echo Spot and the Skylight only. See
+[Your own Headscale](tailscale.md#your-own-headscale).
+
+> **Good to know**
+>
+> This needs an API encryption key: it's refused unless Home Assistant's *ESPHome* link to the device
+> already has a real encryption key set, since otherwise the key would cross the network in the clear.
+
+### auth_key (Required)
+
+*string*
+
+A pre-auth key from your Headscale server (`headscale preauthkeys create`).
+
+### server_url (Required)
+
+*string*
+
+Your Headscale server's address, as its `server_url` says, such as `https://headscale.example.com`.
+
+```yaml
+action: esphome.office_headscale_login
+data:
+  auth_key: hskey-auth-example
+  server_url: https://headscale.example.com
+```
+
+## Join a NetBird network
+
+In YAML, refer to this action as `esphome.<node>_netbird_login`.
+
+Joins the device to your NetBird network with a setup key, and turns its **NetBird** switch on. The
+first time, the device downloads NetBird's client first (about 14 MB): the action then answers that it's
+downloading, and you run it again once the **NetBird status** sensor says *Needs a setup key*. The key is
+handed to NetBird once and not kept: after that the device rejoins by itself. It waits up to 30 seconds
+to see the device connect, so a key that's used up or expired is an error here. Echo Shows, the Echo Spot and
+the Skylight only. See [NetBird: reaching a device from away](netbird.md).
+
+> **Good to know**
+>
+> This needs an API encryption key: it's refused unless Home Assistant's *ESPHome* link to the device
+> already has a real encryption key set, since otherwise the key would cross the network in the clear.
+
+### setup_key (Required)
+
+*string*
+
+A setup key from your NetBird dashboard.
+
+### management_url (Required)
+
+*string*
+
+Your own management server's URL, such as `https://netbird.example.com`. Empty for NetBird's own. Use
+`https://`: with `http://` the setup key crosses the network unencrypted.
+
+```yaml
+action: esphome.office_netbird_login
+data:
+  setup_key: A1B2C3D4-0000-0000-0000-000000000000
+  management_url: ""
+```
+
 ## Set the settings lock's PIN
 
 In YAML, refer to this action as `esphome.<node>_settings_lock_pin`.
 
-Sets the PIN the device asks for before its settings screen opens (Show and Spot). Everything else on
-the device works without it: the clock, music, the voice assistant, calls. The **Settings lock**
-switch shows whether a PIN is set; turning it off removes the PIN, which is the way back in if it is
-forgotten. The PIN can also be set on the device (Settings → Privacy & Security → Settings lock) and
-on the setup page.
+Sets the PIN the device asks for before its settings change (Show and Spot). Everything else on the
+device works without it: the clock, music, the voice assistant, calls, and the everyday settings
+(alarms and timers, the volume, the brightness; see [the settings lock](setup.md#8-settings-lock)).
+The **Settings lock** switch shows whether a PIN is set; turning it off removes the PIN, which is
+the way back in if it is forgotten. The PIN can also be set on the device (Settings → Privacy &
+Security → Settings lock) and on the setup page.
 
 > **Good to know**
 >
@@ -1413,6 +2891,40 @@ data:
   number: "15551234567"
 ```
 
+## Place a call to someone by name
+
+In YAML, refer to this action as `esphome.<node>_phone_call_named`.
+
+The same as [Place a call](#place-a-call), with the name of whom it calls: the screen and the **Phone
+call** sensor show the name with the number ("Alex (15551234567)"), as they show a caller whose name the
+network passes on. Without a name, a call shows only the number it dials. The `esphome.techo5_phone`
+events carry the name the same way. For an automation or an assistant that knows whom it is calling
+from somewhere else (a contact list of its own, a FRITZ!Box's phone book), so the device's own phone
+book isn't needed.
+
+It is an action of its own rather than a second argument to `phone_call`, because Home Assistant
+requires every argument of a device's action: a new one would have broken every automation that calls
+`phone_call` with a number alone.
+
+### number (Required)
+
+*string*
+
+As for `phone_call`.
+
+### name (Required)
+
+*string*
+
+Whom the call is to, up to 40 characters. `""` shows the number alone, as `phone_call` does.
+
+```yaml
+action: esphome.office_phone_call_named
+data:
+  number: "15551234567"
+  name: "Alex"
+```
+
 ## Call another device in the house
 
 In YAML, refer to this action as `esphome.<node>_intercom_call`.
@@ -1446,29 +2958,32 @@ data:
   device: Kitchen
 ```
 
-## Set the screen's contact list
+## Set the phone book
 
 In YAML, refer to this action as `esphome.<node>_phone_contacts`.
 
-Sets the contacts a device with a screen offers to call without a voice command, up to 12. The
-numbers are kept on the device in their own owner-only file, not in Home Assistant.
+Replaces the device's phone book, up to 12 contacts: the screen's Call list, and the names "call Mom"
+said to the device calls ([phone.md](phone.md#calling-a-contact-by-voice)). The setup page sets the same
+list. The numbers are kept on the device in their own owner-only file, not in Home Assistant.
 
 ### contacts (Required)
 
 *string*
 
-A comma-, newline-, or semicolon-separated list of `Name=number` pairs:
+A comma-, newline-, or semicolon-separated list of `Name=number` pairs. Other names for a contact,
+which voice can use and the screen does not show, go after the first, each after a `|`:
 
 ```text
-Alex=15551234567, Sam=15557654321, Kitchen=106
+Mom|Mother=15551234567, Sam=15557654321, Kitchen=106
 ```
 
-An empty value clears the list.
+A name can be used only once in the whole list, whatever its capitals; a list with one used twice is
+refused. An empty value clears the list.
 
 ```yaml
 action: esphome.office_phone_contacts
 data:
-  contacts: "Alex=15551234567, Kitchen=106"
+  contacts: "Mom|Mother=15551234567, Kitchen=106"
 ```
 
 ## Answer a call
@@ -1521,18 +3036,19 @@ and silence.
 > action is a way to start one rather than a route the audio takes. They keep working with Home
 > Assistant switched off; this action is simply not available then.
 >
-> Every device needs the same **house word** set on its setup page. A device with no word set
-> neither sends announcements nor takes them, and this action will say so in the log rather than
-> failing.
+> Every device needs the same **house word** set on its setup page, capitals included: the word is
+> case-sensitive. A device with no word set neither sends announcements nor takes them, and this
+> action will say so in the log rather than failing. A device that refuses announcements for having
+> a different word is named on the sender's setup page, next to the house word.
 >
 > Quiet hours are respected: inside them an announcement is shown and not sounded. Alarms, timers
 > and calls are not announcements and are not affected.
 
-### text (Optional)
+### text (Can be empty)
 
 *string*
 
-What to say. Leave it out, or pass an empty string, to record instead.
+What to say. Pass an empty string to record instead.
 
 ```yaml
 action: esphome.office_announce_house
@@ -1545,4 +3061,35 @@ data:
 action: esphome.office_announce_house
 data:
   text: ""
+```
+
+## Copy settings to other devices
+
+In YAML, refer to this action as `esphome.<node>_copy_settings`.
+
+Copies this device's settings to other devices, once, with no link: the way to make a change on one
+device and send it to the others. Settings sharing has to be on, on this device and on each device
+that is to take them ([Sharing settings](setup.md#sharing-settings-with-the-other-devices)). A device
+that keeps a setting its own, has sharing off or has no such setting is left alone, and the log says
+which. A copy counts as the latest change where it lands, and is passed on to the setting's links
+there.
+
+### settings (Required)
+
+*string*
+
+The settings, by their entities' object IDs (`screen_theme` for `select.office_screen_theme`),
+separated by commas, or `all` for every setting that can be shared.
+
+### devices (Required)
+
+*string*
+
+The devices, by name, separated by commas, or `all` for every other device on the network now.
+
+```yaml
+action: esphome.office_copy_settings
+data:
+  settings: screen_theme, screen_clock_style, night_volume
+  devices: Kitchen, Bedroom
 ```

@@ -12,9 +12,11 @@ import (
 	"time"
 
 	"github.com/HuskerMinion/techo5/echod/internal/android/prop"
+	"github.com/HuskerMinion/techo5/echod/internal/asp"
 	"github.com/HuskerMinion/techo5/echod/internal/component"
 	"github.com/HuskerMinion/techo5/echod/internal/config"
 	"github.com/HuskerMinion/techo5/echod/internal/hardware/privacy"
+	"github.com/HuskerMinion/techo5/echod/internal/layout"
 	"github.com/HuskerMinion/techo5/echod/internal/lib/alsa"
 	"github.com/HuskerMinion/techo5/echod/internal/lib/audio"
 	"github.com/HuskerMinion/techo5/echod/internal/lib/denoise"
@@ -28,11 +30,12 @@ const (
 	Rate = 16000
 	Bits = 24
 
-	Card = 0
-
 	period  = FrameSamples
 	periods = 8
 )
+
+// Card is the sound card, the speaker's (speaker.Card): found by its id on a board that names one.
+var Card = alsa.CardByID(layout.SoundCard())
 
 // FrameSamples is the frame size handed to listeners, 20 ms at 16 kHz.
 const FrameSamples = Rate / 50
@@ -48,12 +51,24 @@ type Source struct {
 	// The hardware, taken by Start and let go by Close. Nil in between: the handle outlives the
 	// device so that a restart can take it again without every listener being rebuilt.
 	devMu sync.Mutex
-	pcm   *alsa.Capture
+	pcm   capture
 
-	mu        sync.Mutex
-	listeners map[int]*listener
-	raw       map[int]chan []byte
-	next      int
+	mu sync.Mutex
+
+	// Resident External session: synchronized with final shared mono publish.
+	aspParent        context.Context
+	aspCurrent       *aspAttempt
+	aspSelected      config.ASPMode
+	aspActive        config.ASPMode
+	aspLaunchWanted  bool
+	aspStopped       bool
+	aspJobs          sync.WaitGroup
+	aspOpen          func(context.Context, asp.Descriptor) (aspProcess, error)
+	aspActiveChanged func(config.ASPMode)
+	aspNotify        chan struct{} // wakes notifyASPActive; made with the first change
+	listeners        map[int]*listener
+	raw              map[int]chan []byte
+	next             int
 
 	// dropped counts frames a listener was too slow to take. It matters more than it looks: the
 	// wake model is streaming, so a missing frame corrupts its state rather than just losing audio.
@@ -85,6 +100,11 @@ type Source struct {
 	wasDenoising bool
 	denoising    atomic.Bool
 
+	// noise measures the room for the ambient noise sensor, while that is on.
+	noise noiseMeter
+	// standout measures how far speech stands out from the room, while something has asked for it.
+	standout standout
+
 	// Which way the loudest sound is, as a beam, or -1 until something asks. finder belongs to the
 	// reader; wantFacing is how anything else asks it to look.
 	finder     *Beamformer
@@ -115,7 +135,12 @@ func (s *Source) Mixing() config.Mixing {
 func New() *Source {
 	mixer, mixing := NewMixer(config.Get().Microphone.Mixing)
 	s := &Source{
-		listeners: map[int]*listener{},
+		listeners:   map[int]*listener{},
+		aspSelected: config.ASPBuiltin,
+		aspActive:   config.ASPBuiltin,
+		aspOpen: func(ctx context.Context, d asp.Descriptor) (aspProcess, error) {
+			return asp.Start(ctx, d)
+		},
 		raw:       map[int]chan []byte{},
 		mixer:     mixer,
 		mixing:    mixing,
@@ -153,7 +178,16 @@ func Get() *Source {
 func (s *Source) Name() string { return "capture" }
 
 // Start takes the capture device, off Android if it got there first, the same way the speaker does.
-func (s *Source) Start(context.Context) error {
+func (s *Source) Start(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	stopped := s.aspStopped
+	s.mu.Unlock()
+	if stopped {
+		return context.Canceled
+	}
 	// Before the device is opened, so that a unit whose mute is the daemon's own is already cutting
 	// when the first frame arrives. The mute feature restores the same value later in the Device
 	// phase; this is only about the frames captured before it gets there. See privacy.Seed.
@@ -175,6 +209,15 @@ func (s *Source) Start(context.Context) error {
 	}()
 
 	for range acquireAttempts {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		s.mu.Lock()
+		stopped := s.aspStopped
+		s.mu.Unlock()
+		if stopped {
+			return context.Canceled
+		}
 		time.Sleep(acquireRetry)
 
 		err = s.open()
@@ -198,30 +241,37 @@ func Acquire() (*Source, error) {
 	return s, nil
 }
 
+// capture is the hardware as the reader sees it: whole frames of Channels at Rate in S24_3LE, the
+// microphones and then the loopback. On every board but one that is a single capture device as it
+// comes (openPlain); see openDevice in the device files.
+type capture interface {
+	Read(buf []byte) (int, error)
+	Close() error
+}
+
 func (s *Source) open() error {
-	pcm, err := alsa.Open(Card, CaptureDevice, alsa.Config{
-		Channels:   Channels,
-		Rate:       Rate,
-		Format:     alsa.FormatS24_3LE,
-		Bits:       Bits,
-		PeriodSize: period,
-		Periods:    periods,
-	})
+	pcm, err := openDevice()
 	if err != nil {
 		return fmt.Errorf("mic: opening capture: %w", err)
 	}
 
+	s.mu.Lock()
+	if s.aspStopped {
+		s.mu.Unlock()
+		_ = pcm.Close()
+		return context.Canceled
+	}
 	s.devMu.Lock()
 	s.pcm = pcm
 	s.devMu.Unlock()
+	s.mu.Unlock()
 
-	routeInputs()
-	applyGain(config.Get().Microphone.Gain)
+	afterOpen()
 	return nil
 }
 
 // device is the hardware, or nil when it is not held.
-func (s *Source) device() *alsa.Capture {
+func (s *Source) device() capture {
 	s.devMu.Lock()
 	defer s.devMu.Unlock()
 	return s.pcm
@@ -237,13 +287,17 @@ type listener struct {
 // Listen returns a channel of mono frames and a function that stops the subscription. The name is
 // what a dropped frame is reported against.
 func (s *Source) Listen(name string) (<-chan []int16, func()) {
-	l := &listener{name: name, ch: make(chan []int16, 8)}
-
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.listenLocked(name)
+}
+
+// listenLocked registers a listener with mu held, including while history is copied.
+func (s *Source) listenLocked(name string) (<-chan []int16, func()) {
+	l := &listener{name: name, ch: make(chan []int16, 8)}
 	id := s.next
 	s.next++
 	s.listeners[id] = l
-	s.mu.Unlock()
 
 	return l.ch, func() {
 		s.mu.Lock()
@@ -330,8 +384,33 @@ func (s *Source) Run(ctx context.Context) error {
 		default:
 		}
 
-		n, err := pcm.Read(raw)
+		// The optional native tap is synchronous and finishes IPC before next Read.
+		// Startup itself is asynchronous: stock frames continue while READY waits.
+		s.mu.Lock()
+		wantNative := !s.aspStopped && s.aspSelected == config.ASPExternal &&
+			(s.aspLaunchWanted || s.aspCurrent != nil)
+		s.mu.Unlock()
+		var external *aspResponse
+		var visit func(NativeBlock)
+		if wantNative {
+			_, paired := pcm.(captureReadWithNative)
+			_, plain := pcm.(interface{ Config() alsa.Config })
+			if !paired && !plain {
+				s.failNative(errors.New("native capture unavailable on backend"))
+			} else {
+				visit = func(b NativeBlock) { external = s.captureNative(b) }
+			}
+		}
+		// One SoftwareCut policy decision at the shared native/stock boundary.
+		n, cut, err := readCaptured(pcm, raw, privacy.SoftwareCut, visit)
 		if err != nil {
+			// An invalid native descriptor must fail only External, not stock.
+			// readCaptured returns an already valid stock frame if n > 0.
+			if visit != nil && n > 0 && errors.Is(err, errNativeGeometry) {
+				s.failNative(err)
+				s.broadcastSelected(raw[:n], cut, nil)
+				continue
+			}
 			if errors.Is(err, alsa.ErrOverrun) {
 				if overruns++; overruns == 1 || overruns%100 == 0 {
 					slog.Warn("capture overrun", "times", overruns)
@@ -345,7 +424,7 @@ func (s *Source) Run(ctx context.Context) error {
 			}
 			return err
 		}
-		s.broadcast(raw[:n])
+		s.broadcastSelected(raw[:n], cut, external)
 	}
 }
 
@@ -371,12 +450,21 @@ func (s *Source) reportDrops() {
 // broadcast hands the frame to every listener, dropping it for any that is behind. The mono mix is
 // only computed when something wants it.
 func (s *Source) broadcast(raw []byte) {
+	s.broadcastWithCut(raw, privacy.SoftwareCut())
+}
+
+// broadcastWithCut shares the capture block's single SoftwareCut decision.
+func (s *Source) broadcastWithCut(raw []byte, cut bool) {
+	s.broadcastSelected(raw, cut, nil)
+}
+
+func (s *Source) broadcastSelected(raw []byte, cut bool, external *aspResponse) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	// A software-only mute cuts here, before anything reads the frame: what is not handed on cannot
 	// be heard, kept or streamed.
-	if privacy.SoftwareCut() {
+	if cut {
 		clear(raw)
 	}
 
@@ -412,6 +500,11 @@ func (s *Source) broadcast(raw []byte) {
 	// how far behind a listener may fall, which is the thing this is fixing.
 	frame = append([]int16(nil), frame...)
 
+	// Before the noise reduction and the leveling, which would take the room out and put gain back on.
+	s.noise.add(raw, frame)
+	// Before the noise reduction, which would lower the floor it is measured against.
+	s.standout.add(frame, s.leveler.leastNow())
+
 	s.findFacing(mics)
 
 	// After the echo canceller, so the estimator is not asked to learn the speaker as part of the
@@ -442,6 +535,9 @@ func (s *Source) broadcast(raw []byte) {
 		}
 	}
 	s.wasLeveling = on
+	// Stock DSP and sensors above always process stock data; one final
+	// synchronized selection governs all history, wake, STT and mono listeners.
+	frame = s.aspFrameLocked(external, frame)
 	s.remember(frame)
 	spectrum.Mic.Push(frame)
 
@@ -470,7 +566,12 @@ func (s *Source) broadcast(raw []byte) {
 }
 
 // Dropped is how many frames a listener has missed.
-func (s *Source) Dropped() uint64 { return s.dropped.Load() }
+func (s *Source) Dropped() uint64 {
+	if s == nil {
+		return 0
+	}
+	return s.dropped.Load()
+}
 
 // Close lets the device go. The Source stays usable and its listeners stay subscribed: Start can take
 // the hardware again, which is how a restart works.
@@ -497,4 +598,21 @@ func Mono(raw []byte) []int16 {
 		out[i] = int16(audio.DecodeS24LE3(raw[o:o+3]) >> 8)
 	}
 	return out
+}
+
+func captureDevice() (int, int, alsa.Config, error) {
+	cfg := alsa.Config{Channels: Channels, Rate: Rate, Format: alsa.FormatS24_3LE,
+		Bits: Bits, PeriodSize: period, Periods: periods}
+	if layout.Board == "cronos" {
+		card, device, found, err := alsa.FindPCM("mt8163cronos", "Microphones", true)
+		if err != nil {
+			return 0, 0, cfg, fmt.Errorf("mic: selecting capture: %w", err)
+		}
+		if found {
+			// Match the FPGA's complete ring; application frames remain 20 ms.
+			cfg.PeriodSize, cfg.Periods = 257, 10
+			return card, device, cfg, nil
+		}
+	}
+	return Card, CaptureDevice, cfg, nil
 }

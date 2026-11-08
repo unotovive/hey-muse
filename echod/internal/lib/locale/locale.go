@@ -1,5 +1,5 @@
 // Package locale writes the dates and weather words the screen shows in the screen's language: the
-// clock's day and date, the forecast's day names, and what the sky is doing. Six languages, the ones
+// clock's day and date, the forecast's day names, and what the sky is doing. Eight languages, the ones
 // the screen's Language setting offers; anything else, empty included, is English.
 //
 // Only those words. The rest of the screen's own text - its settings, its buttons - is English.
@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -26,10 +27,10 @@ var langs = map[string]*words{
 		months:      [12]string{"1月", "2月", "3月", "4月", "5月", "6月", "7月", "8月", "9月", "10月", "11月", "12月"},
 		shortMonths: [12]string{"1月", "2月", "3月", "4月", "5月", "6月", "7月", "8月", "9月", "10月", "11月", "12月"},
 		sky: map[string]string{
-			"clear-night": "晴れ", "sunny": "晴れ", "partlycloudy": "晴れ時々曇り", "cloudy": "曇り",
-			"rainy": "雨", "pouring": "強い雨", "snowy": "雪", "snowy-rainy": "みぞれ",
-			"lightning": "雷", "lightning-rainy": "雷雨", "fog": "霧", "hail": "ひょう",
-			"windy": "強風", "windy-variant": "強風", "exceptional": "不明",
+			"clear-night": "晴れ", "cloudy": "曇り", "exceptional": "荒天", "fog": "霧", "hail": "ひょう",
+			"lightning": "雷", "lightning-rainy": "雷雨", "partlycloudy": "晴れ時々曇り",
+			"pouring": "大雨", "rainy": "雨", "snowy": "雪", "snowy-rainy": "みぞれ",
+			"sunny": "晴れ", "windy": "強風", "windy-variant": "強風",
 		},
 	},
 	"de": {
@@ -68,6 +69,18 @@ var langs = map[string]*words{
 			"sunny": "Ensoleillé", "windy": "Venteux", "windy-variant": "Venteux",
 		},
 	},
+	"gl": {
+		days:        [7]string{"domingo", "luns", "martes", "mércores", "xoves", "venres", "sábado"},
+		shortDays:   [7]string{"dom", "lun", "mar", "mér", "xov", "ven", "sáb"},
+		months:      [12]string{"xaneiro", "febreiro", "marzo", "abril", "maio", "xuño", "xullo", "agosto", "setembro", "outubro", "novembro", "decembro"},
+		shortMonths: [12]string{"xan", "feb", "mar", "abr", "maio", "xuñ", "xul", "ago", "set", "out", "nov", "dec"},
+		sky: map[string]string{
+			"clear-night": "Despexado", "cloudy": "Anubrado", "exceptional": "Extremo", "fog": "Néboa", "hail": "Sarabia",
+			"lightning": "Raios", "lightning-rainy": "Treboadas", "partlycloudy": "Parcialmente anubrado",
+			"pouring": "Choiva intensa", "rainy": "Choiva", "snowy": "Neve", "snowy-rainy": "Auganeve",
+			"sunny": "Soleado", "windy": "Ventoso", "windy-variant": "Ventoso",
+		},
+	},
 	"it": {
 		days:        [7]string{"domenica", "lunedì", "martedì", "mercoledì", "giovedì", "venerdì", "sabato"},
 		shortDays:   [7]string{"dom", "lun", "mar", "mer", "gio", "ven", "sab"},
@@ -92,6 +105,42 @@ var langs = map[string]*words{
 			"sunny": "Zonnig", "windy": "Winderig", "windy-variant": "Winderig",
 		},
 	},
+	"pt": {
+		days:        [7]string{"domingo", "segunda-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sábado"},
+		shortDays:   [7]string{"dom", "seg", "ter", "qua", "qui", "sex", "sáb"},
+		months:      [12]string{"janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"},
+		shortMonths: [12]string{"jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"},
+		sky: map[string]string{
+			"clear-night": "Céu limpo", "cloudy": "Nublado", "exceptional": "Excepcional", "fog": "Neblina", "hail": "Granizo",
+			"lightning": "Relâmpagos", "lightning-rainy": "Tempestade", "partlycloudy": "Parcialmente nublado",
+			"pouring": "Chuva forte", "rainy": "Chuva", "snowy": "Neve", "snowy-rainy": "Chuva com neve",
+			"sunny": "Ensolarado", "windy": "Ventoso", "windy-variant": "Ventoso",
+		},
+	},
+	"ru": {
+		days:        [7]string{"воскресенье", "понедельник", "вторник", "среда", "четверг", "пятница", "суббота"},
+		shortDays:   [7]string{"вс", "пн", "вт", "ср", "чт", "пт", "сб"},
+		months:      [12]string{"января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"},
+		shortMonths: [12]string{"янв", "фев", "мар", "апр", "мая", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"},
+		sky: map[string]string{
+			"clear-night": "Ясно", "cloudy": "Облачно", "exceptional": "Опасная погода", "fog": "Туман", "hail": "Град",
+			"lightning": "Молния", "lightning-rainy": "Гроза", "partlycloudy": "Переменная облачность",
+			"pouring": "Ливень", "rainy": "Дождь", "snowy": "Снег", "snowy-rainy": "Мокрый снег",
+			"sunny": "Солнечно", "windy": "Ветрено", "windy-variant": "Ветрено",
+		},
+	},
+	"tr": {
+		days:        [7]string{"Pazar", "Pazartesi", "Salı", "Çarşamba", "Perşembe", "Cuma", "Cumartesi"},
+		shortDays:   [7]string{"Paz", "Pzt", "Sal", "Çar", "Per", "Cum", "Cmt"},
+		months:      [12]string{"Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran", "Temmuz", "Ağustos", "Eylül", "Ekim", "Kasım", "Aralık"},
+		shortMonths: [12]string{"Oca", "Şub", "Mar", "Nis", "May", "Haz", "Tem", "Ağu", "Eyl", "Eki", "Kas", "Ara"},
+		sky: map[string]string{
+			"clear-night": "Açık", "cloudy": "Bulutlu", "exceptional": "Şiddetli", "fog": "Sisli", "hail": "Dolu",
+			"lightning": "Şimşek", "lightning-rainy": "Fırtına", "partlycloudy": "Parçalı bulutlu",
+			"pouring": "Şiddetli yağmur", "rainy": "Yağmurlu", "snowy": "Karlı", "snowy-rainy": "Karla karışık yağmur",
+			"sunny": "Güneşli", "windy": "Rüzgârlı", "windy-variant": "Rüzgârlı",
+		},
+	},
 }
 
 // phrases are the few words written beside a date: today, as the forecast heads its first day, and
@@ -100,21 +149,36 @@ var langs = map[string]*words{
 // And the words of the clock styles that list a day: the Agenda's (today, tomorrow, an event under way
 // or all day, a calendar with nothing on it) and the World clock's (a place a day ahead or behind).
 var phrases = map[string]map[string]string{
+	"ja": {"here": "現在地", "today": "今日", "alarm": "アラーム", "snoozed": "スヌーズ終了", "tomorrow": "明日", "yesterday": "昨日",
+		"now": "現在", "allday": "終日", "nothing": "予定はありません", "nothingtoday": "今日の予定はありません",
+		"nothingelse": "今日の予定は以上です", "upcoming": "今後の予定", "nothingsoon": "今後の予定はありません"},
 	"de": {"here": "Hier", "today": "Heute", "alarm": "Wecker", "snoozed": "Schlummern bis", "tomorrow": "Morgen", "yesterday": "Gestern",
 		"now": "Jetzt", "allday": "Ganztägig", "nothing": "Keine Termine", "nothingtoday": "Heute nichts",
-		"nothingelse": "Heute nichts mehr"},
+		"nothingelse": "Heute nichts mehr", "upcoming": "DEMNÄCHST", "nothingsoon": "Nichts geplant"},
 	"es": {"here": "Aquí", "today": "Hoy", "alarm": "Alarma", "snoozed": "Pospuesta hasta", "tomorrow": "Mañana", "yesterday": "Ayer",
 		"now": "Ahora", "allday": "Todo el día", "nothing": "Nada en el calendario", "nothingtoday": "Nada hoy",
-		"nothingelse": "Nada más hoy"},
+		"nothingelse": "Nada más hoy", "upcoming": "PRÓXIMOS", "nothingsoon": "Nada próximo"},
 	"fr": {"here": "Ici", "today": "Aujourd'hui", "alarm": "Réveil", "snoozed": "Reporté à", "tomorrow": "Demain", "yesterday": "Hier",
 		"now": "Maintenant", "allday": "Toute la journée", "nothing": "Rien au calendrier",
-		"nothingtoday": "Rien aujourd'hui", "nothingelse": "Plus rien aujourd'hui"},
+		"nothingtoday": "Rien aujourd'hui", "nothingelse": "Plus rien aujourd'hui", "upcoming": "À VENIR", "nothingsoon": "Rien de prévu"},
+	"gl": {"here": "Aquí", "today": "Hoxe", "alarm": "Alarma", "snoozed": "Aprazada ata as", "tomorrow": "Mañá", "yesterday": "Onte",
+		"now": "Agora", "allday": "Todo o día", "nothing": "Nada no calendario", "nothingtoday": "Nada hoxe",
+		"nothingelse": "Nada máis hoxe", "upcoming": "PRÓXIMOS", "nothingsoon": "Nada próximo"},
 	"it": {"here": "Qui", "today": "Oggi", "alarm": "Sveglia", "snoozed": "Posticipata alle", "tomorrow": "Domani", "yesterday": "Ieri",
 		"now": "Ora", "allday": "Tutto il giorno", "nothing": "Niente in calendario", "nothingtoday": "Niente oggi",
-		"nothingelse": "Nient'altro oggi"},
+		"nothingelse": "Nient'altro oggi", "upcoming": "PROSSIMI", "nothingsoon": "Niente in programma"},
 	"nl": {"here": "Hier", "today": "Vandaag", "alarm": "Wekker", "snoozed": "Sluimeren tot", "tomorrow": "Morgen", "yesterday": "Gisteren",
 		"now": "Nu", "allday": "Hele dag", "nothing": "Niets in de agenda", "nothingtoday": "Niets vandaag",
-		"nothingelse": "Verder niets vandaag"},
+		"nothingelse": "Verder niets vandaag", "upcoming": "BINNENKORT", "nothingsoon": "Niets gepland"},
+	"pt": {"here": "Aqui", "today": "Hoje", "alarm": "Alarme", "snoozed": "Adiado até", "tomorrow": "Amanhã", "yesterday": "Ontem",
+		"now": "Agora", "allday": "Dia inteiro", "nothing": "Nada na agenda", "nothingtoday": "Nada hoje",
+		"nothingelse": "Nada mais hoje", "upcoming": "PRÓXIMOS", "nothingsoon": "Nada previsto"},
+	"ru": {"here": "Здесь", "today": "Сегодня", "alarm": "Будильник", "snoozed": "Отложен до", "tomorrow": "Завтра", "yesterday": "Вчера",
+		"now": "Сейчас", "allday": "Весь день", "nothing": "В календаре пусто", "nothingtoday": "Сегодня ничего",
+		"nothingelse": "Больше ничего сегодня", "upcoming": "СКОРО", "nothingsoon": "Ничего не запланировано"},
+	"tr": {"here": "Burada", "today": "Bugün", "alarm": "Alarm", "snoozed": "Ertelendi", "tomorrow": "Yarın", "yesterday": "Dün",
+		"now": "Şimdi", "allday": "Tüm gün", "nothing": "Takvimde bir şey yok", "nothingtoday": "Bugün bir şey yok",
+		"nothingelse": "Bugün başka bir şey yok", "upcoming": "YAKLAŞAN", "nothingsoon": "Yaklaşan bir şey yok"},
 }
 
 // Here is the World clock's own place.
@@ -134,6 +198,10 @@ func NothingOn(lang string) string    { return phrase(lang, "nothing", "Nothing 
 func NothingToday(lang string) string { return phrase(lang, "nothingtoday", "Nothing today") }
 func NothingElse(lang string) string  { return phrase(lang, "nothingelse", "Nothing else today") }
 
+// Upcoming heads the Dashboard style's list of events; NothingSoon is that list with nothing in it.
+func Upcoming(lang string) string    { return phrase(lang, "upcoming", "NEXT") }
+func NothingSoon(lang string) string { return phrase(lang, "nothingsoon", "Nothing coming up") }
+
 // Today is "Today", as the forecast heads its first day.
 func Today(lang string) string { return phrase(lang, "today", "Today") }
 
@@ -146,10 +214,7 @@ func Alarm(lang string, snoozed bool) string {
 }
 
 func phrase(lang, key, english string) string {
-	if s, ok := phrases[lang][key]; ok {
-		return s
-	}
-	return english
+	return translated(lang, key, phrases, english)
 }
 
 // english is the condition words where Home Assistant's own word will not do as it is.
@@ -169,9 +234,24 @@ func up(s string) string {
 
 func day(t time.Time) string { return strconv.Itoa(t.Day()) }
 
+// MonthYear is a calendar's month heading in the screen language.
+func MonthYear(t time.Time, lang string) string {
+	if lang == "ja" {
+		return t.Format("2006年1月")
+	}
+	if w, ok := langs[lang]; ok {
+		return up(w.months[t.Month()-1]) + " " + strconv.Itoa(t.Year())
+	}
+	return t.Format("January 2006")
+}
+
 // LongDate is the clock's date: "Monday, January 2", "Montag, 2. Januar", "Lunes, 2 de enero",
-// "Lundi 2 janvier", "Lunedì 2 gennaio", "Maandag 2 januari".
+// "Lundi 2 janvier", "Lunedì 2 gennaio", "Maandag 2 januari", "Понедельник, 2 января",
+// "Segunda-feira, 2 de janeiro".
 func LongDate(t time.Time, lang string) string {
+	if lang == "ja" {
+		return t.Format("1月2日") + "（" + langs["ja"].days[t.Weekday()] + "）"
+	}
 	w, ok := langs[lang]
 	if !ok {
 		return t.Format("Monday, January 2")
@@ -180,14 +260,19 @@ func LongDate(t time.Time, lang string) string {
 	switch lang {
 	case "de":
 		return up(d) + ", " + day(t) + ". " + m
-	case "es":
+	case "es", "gl", "pt":
 		return up(d) + ", " + day(t) + " de " + m
+	case "ru", "tr":
+		return up(d) + ", " + day(t) + " " + m
 	}
 	return up(d) + " " + day(t) + " " + m
 }
 
 // ShortDate is the date where there is less room: "Mon, Jan 2", "Mo., 2. Jan.", "Lun, 2 ene".
 func ShortDate(t time.Time, lang string) string {
+	if lang == "ja" {
+		return t.Format("1/2") + "（" + langs["ja"].shortDays[t.Weekday()] + "）"
+	}
 	w, ok := langs[lang]
 	if !ok {
 		return t.Format("Mon, Jan 2")
@@ -196,7 +281,7 @@ func ShortDate(t time.Time, lang string) string {
 	switch lang {
 	case "de":
 		return up(d) + "., " + day(t) + ". " + m
-	case "es":
+	case "es", "gl", "pt", "ru", "tr":
 		return up(d) + ", " + day(t) + " " + m
 	}
 	return up(d) + " " + day(t) + " " + m
@@ -220,6 +305,9 @@ func ShortWeekday(t time.Time, lang string) string {
 
 // MonthDay is the date without the day's name: "January 2", "2. Januar", "2 de enero".
 func MonthDay(t time.Time, lang string) string {
+	if lang == "ja" {
+		return t.Format("1月2日")
+	}
 	w, ok := langs[lang]
 	if !ok {
 		return t.Format("January 2")
@@ -228,14 +316,33 @@ func MonthDay(t time.Time, lang string) string {
 	switch lang {
 	case "de":
 		return day(t) + ". " + m
-	case "es":
+	case "es", "gl", "pt":
 		return day(t) + " de " + m
 	}
 	return day(t) + " " + m
 }
 
+// PhotoDate is the day a photo was taken, with its year: "January 2, 2019", "2. Januar 2019",
+// "2 de enero de 2019", "2 января 2019".
+func PhotoDate(t time.Time, lang string) string {
+	if lang == "ja" {
+		return t.Format("2006年1月2日")
+	}
+	y := strconv.Itoa(t.Year())
+	if _, ok := langs[lang]; !ok {
+		return MonthDay(t, lang) + ", " + y
+	}
+	if lang == "es" || lang == "gl" || lang == "pt" {
+		return MonthDay(t, lang) + " de " + y
+	}
+	return MonthDay(t, lang) + " " + y
+}
+
 // DayAndNumber is the shortest date, a day's name and its number: "Mon 2", "Mo 2", "Lun 2".
 func DayAndNumber(t time.Time, lang string) string {
+	if lang == "ja" {
+		return day(t) + "日（" + ShortWeekday(t, lang) + "）"
+	}
 	return ShortWeekday(t, lang) + " " + day(t)
 }
 
@@ -261,4 +368,21 @@ func Sky(cond, lang string) string {
 	}
 	// "sunny", "cloudy", "rainy", "pouring", "fog", "hail", "snowy", "windy", "lightning"…
 	return up(cond)
+}
+
+// Upper is s in capitals as lang writes them. Turkish capitalizes i as a dotted İ (and ı as I), which
+// strings.ToUpper does not know: "Pazartesi" is PAZARTESİ, not PAZARTESI.
+func Upper(lang, s string) string {
+	if lang == "tr" {
+		return strings.ToUpperSpecial(unicode.TurkishCase, s)
+	}
+	return strings.ToUpper(s)
+}
+
+// UpperRune is Upper for one letter.
+func UpperRune(lang string, r rune) rune {
+	if lang == "tr" {
+		return unicode.TurkishCase.ToUpper(r)
+	}
+	return unicode.ToUpper(r)
 }

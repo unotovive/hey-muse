@@ -11,11 +11,9 @@ package timezone
 
 import (
 	"context"
-	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
@@ -61,6 +59,7 @@ func (z *Zone) Handle(ctx context.Context, c *esphome.Conn, msg proto.Message) e
 			slog.Debug("asking home assistant for the time", "err", err)
 		}
 	case *api.GetTimeResponse:
+		takeTime(m.GetEpochSeconds()) // the clock, when NTP cannot set it (clock.go)
 		if z.SetHere() {
 			return nil // chosen on the device; Home Assistant does not override that
 		}
@@ -110,49 +109,6 @@ func (z *Zone) Follow() error {
 	return nil
 }
 
-// Regions are the groups the zone database is arranged in — America, Europe, Asia and the rest —
-// for a screen that cannot list six hundred zones at once. Empty when the image carries no database.
-func Regions() []string {
-	entries, err := os.ReadDir(zoneinfo)
-	if err != nil {
-		return nil
-	}
-	var out []string
-	for _, e := range entries {
-		if e.IsDir() && e.Name() != "posix" && e.Name() != "right" {
-			out = append(out, e.Name())
-		}
-	}
-	sort.Strings(out)
-	return out
-}
-
-// Zones are the zones in one region, by the name they are known by ("Denver", not
-// "America/Denver"). A region with zones of its own inside it lists those too, as "Indiana/Knox".
-func Zones(region string) []string {
-	if !valid(region) {
-		return nil
-	}
-	var out []string
-	root := filepath.Join(zoneinfo, region)
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return err
-		}
-		name, err := filepath.Rel(root, path)
-		if err != nil {
-			return nil
-		}
-		out = append(out, filepath.ToSlash(name))
-		return nil
-	})
-	if err != nil {
-		return nil
-	}
-	sort.Strings(out)
-	return out
-}
-
 // apply makes zone the device's zone: a POSIX rule, or a zone name this image has. Nothing is written
 // when it is the saved zone already, or when it is neither.
 func (z *Zone) apply(zone string) error {
@@ -171,23 +127,26 @@ func (z *Zone) apply(zone string) error {
 
 	var loc *time.Location
 	if valid(zone) {
-		if _, err := os.Stat(filepath.Join(zoneinfo, zone)); err == nil {
-			l, err := time.LoadLocation(zone)
-			if err != nil {
-				return err
-			}
-			if err := os.Symlink(filepath.Join(zoneinfo, zone), tmp); err != nil {
-				return err
-			}
-			loc = l
-		}
-	}
-	if loc == nil {
-		l, err := loadRule(zone)
+		l, err := fromDatabase(zone, tmp)
 		if err != nil {
 			return err
 		}
-		if err := os.WriteFile(tmp, tzif(zone), 0o644); err != nil {
+		loc = l
+	}
+	if loc == nil {
+		// A rule, or a name this image has no file for. A common zone's name stands in for its rule;
+		// the name is still what is saved, so the zone reads as itself everywhere it is shown.
+		rule := zone
+		if r, ok := commonRules[zone]; ok {
+			rule = r
+		} else if isName(zone) && !HasDatabase() {
+			return errNoDatabase
+		}
+		l, err := loadRule(rule)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(tmp, tzif(rule), 0o644); err != nil {
 			return err
 		}
 		loc = l
@@ -216,6 +175,10 @@ func (z *Zone) apply(zone string) error {
 	update.Restart("time zone " + zone)
 	return nil
 }
+
+// isName is a zone name rather than a rule: names have a slash, and a rule only has one inside a
+// daylight saving part, after a comma ("CET-1CEST,M3.5.0,M10.5.0/3").
+func isName(zone string) bool { return strings.Contains(zone, "/") && !strings.Contains(zone, ",") }
 
 // valid is a plausible IANA name: letters, digits and _+-/ only, no dot segments, so it cannot walk
 // out of the zoneinfo directory.

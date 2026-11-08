@@ -6,7 +6,8 @@ microphones (with echo cancellation) and speaker. Calls between your own devices
 so one device can call another in the house.
 
 It is off until it has a login, and it never dials anything on its own: every call is placed by you,
-from Home Assistant, a voice command you set up, or by answering one.
+from Home Assistant, the screen, "call" and a name from its phone book, a voice command you set up, or
+by answering one.
 
 > **Not an emergency phone.** Whether a call to an emergency number works, and whether it reaches
 > the right place, depends entirely on your provider and the address registered with it. Set your
@@ -45,32 +46,271 @@ again gets a home's address blocked by most providers.
 The login is kept on the device in its own owner-only file, never in the settings Home Assistant or
 diagnostics can read, and never in an image or a release.
 
+### A SIP server at home (FRITZ!Box)
+
+A SIP server on the home network, such as a FRITZ!Box's own registrar for its IP phones, usually
+offers no TLS. For one of those, turn on **Phone without encryption** (a configuration switch of the
+device, off by default): the device then signs in over plain UDP on port 5060, and calls go without
+SRTP. Turning it on or off signs the device in again at once, which ends a call in progress. While it is off, the device signs in
+with TLS and encrypts calls as before; leave it off for a provider on the internet.
+
+On a FRITZ!Box: **Telefonie → Telefoniegeräte → Neues Gerät einrichten → Telefon (mit und ohne
+Anrufbeantworter) → LAN/WLAN (IP-Telefon)**. Give it a name, and note the username and password it
+asks for. Then:
+
+```yaml
+action: esphome.<device>_phone_account
+data:
+  server: fritz.box          # or the FRITZ!Box's address, e.g. 192.168.178.1
+  username: "<the IP phone's username>"
+  password: "<the IP phone's password>"
+```
+
+Its internal numbers (`**610`, `**620` …) and outside numbers both work, as from any IP phone on the
+box.
+
+> **Without encryption,** the call's audio and the SIP login cross the network unencrypted, and so
+> does the password's digest. Keep it to a SIP server on your own network. With a provider on the
+> internet, leave it off.
+
 ## Using it
 
 | | |
 |---|---|
-| **Place a call** | `esphome.<device>_phone_call` with `number`: a phone number (`15551234567`) or another account's extension. Spaces, dashes and a leading `+` are dropped. |
-| **Answer** | The action button on a Dot, a tap on a Show or Spot, the **Answer call** button in Home Assistant, or `esphome.<device>_phone_answer`. |
-| **Decline or hang up** | The same button again, a sideways swipe on the Spot, **Decline** / **Hang up** on the Show, the **Hang up** button, or `esphome.<device>_phone_hangup`. |
+| **Place a call** | `esphome.<device>_phone_call` with `number`: a phone number (`15551234567`) or another account's extension. Spaces, dashes and a leading `+` are dropped. The screen shows the number. |
+| **Place a call to someone by name** | `esphome.<device>_phone_call_named` with `number` and `name`: the same call, and the screen and the **Phone call** sensor show "Alex (15551234567)". For an automation or assistant with a contact list of its own. A call placed by voice from the phone book (below) shows the contact's name the same way. |
+| **While it rings out** | Whatever the far end's network sends before the answer is played: its ringing tone, or an announcement such as "the number you have dialed is not available". A network that only says the far end is ringing gets the device's own ringing tone (425 Hz, a second on, four off). |
+| **Answer** | The action button on a Dot, a tap on a Show or Spot, the **Answer call** button in Home Assistant, `esphome.<device>_phone_answer`, or by voice with **Wake word during calls** on (below). |
+| **Decline or hang up** | The same button again, a sideways swipe on the Spot, **Decline** / **Hang up** on the Show, the **Hang up** button, `esphome.<device>_phone_hangup`, the hang-up word, or by voice with **Wake word during calls** on (below). |
 | **Say something into a call** | `assist_satellite.announce` on the same device while a call is up: the message plays in the room and goes into the call. |
 
-### Contacts on a screen
+### The call on the screen
 
-A device with a screen can call without a voice command: the Spot's dial has **Call**, listing the
-contacts Home Assistant gives it, up to 12:
+On a Show, a call has a page of its own over everything while it rings, is placed or is up: who it is
+with, how long it has lasted, and **Decline** / **Answer** or **Hang up**. **Call screen** in Settings,
+Display (or the **Call screen** select in Home Assistant) keeps the page that was showing instead, for a
+call being placed or up:
+
+- **Full screen**: the call's page, as before. The default.
+- **Hang-up button**: a red round button with a handset in the bottom left corner, where the home
+  screen's green **Call button** is. A tap on it hangs up.
+- **Hang-up button and details**: the same button, with who the call is with and how long it has lasted
+  beside it ("Someone's at the door" in place of the time when the doorbell is pressed).
+
+Everything else is the page as it would be without the call, and is used as usual: a dashboard, the
+clock and its photos, a notification's card. A call ringing keeps its page, so answering and declining
+stay where they are, and so does a Drop In, which says on the whole screen that somebody is listening.
+While a timer or an alarm rings, a browser or a video asks to be let in, or the settings lock asks for
+its PIN, the call's page comes back, since their answers are where the button is. The Spot keeps its
+call page.
+
+### Echo on a call
+
+If the other party hears themselves faintly, set **Microphone echo canceller in calls** (the device's
+microphone settings in Home Assistant, under **Microphone echo canceller**) to **WebRTC**. For the
+length of each call the device then runs WebRTC's echo canceller, whose suppressor takes out what the
+built-in one leaves, and goes back to the one chosen in **Microphone echo canceller** after. The
+built-in one stays the default the rest of the time because the wake word is heard better with it;
+during a call, with WebRTC's, the hang-up word and **Wake word during calls** may be caught less
+reliably. It is **Same as outside calls** until chosen, and offered only where the device's image has
+the WebRTC helper.
+
+### The phone book
+
+Each device keeps a phone book of up to 12 contacts. The screen's **Call** list shows them (the Show's
+drawer, the Spot's dial), and "call Mom" said to the device calls them (below). Set it on the setup
+page (**Sound & Voice**, **Phone book**), one contact to a line:
+
+```text
+Mom|Mother = 15551234567
+Alex = 15557654321
+Front Desk = 106
+```
+
+or from Home Assistant, with the same list on one line:
 
 ```yaml
 action: esphome.<device>_phone_contacts
 data:
-  contacts: "Alex=15551234567, Sam=15557654321, Kitchen=106"
+  contacts: "Mom|Mother=15551234567, Alex=15557654321, Front Desk=106"
 ```
 
-An empty `contacts` clears the list. Like the login, the numbers are kept in their own owner-only file
-on the device.
+- A name, `=`, and the number or extension. Spaces, dashes and a leading `+` in the number are dropped.
+- Other names for the same contact go after the first, each after a `|`. The first is the one the
+  screen shows; voice can use any of them.
+- A name can be used only once in the whole book, other names included, whatever its capitals. A list
+  with one used twice is refused, and nothing is saved.
+- An empty list clears the book. The action and the setup page replace the whole book each time.
+
+Like the login, the book is kept in its own owner-only file on the device. Saving it puts no number in
+a Home Assistant entity or the device's log, only how many contacts there are. A call placed to one
+shows its number as any call does, in the **Phone call** sensor and the call's events.
+
+### Calling a contact by voice
+
+Say the wake word and "call" and a name in the phone book, and the device places the call itself:
+
+- "Call Mom", "phone Alex", "ring Mom", "dial Alex", "call up Mom", "call the Front Desk"
+- "Give Mom a call"
+- With "please", "hey", "can you", "could you" or "would you" before it, and "please", "now", "for me"
+  or "on the phone" after it: "Can you call Mother for me, please?"
+
+The name has to be a contact's, or one of its other names, exactly: "call Tom" does not call Mom, and
+"call Mom's cell" calls nobody. Anything else in the sentence and it is left to Home Assistant, as
+usual. "The" before a name is optional.
+
+The device says "Calling Mom." and shows the call's page, then waits 3 seconds after the words before
+it dials. To call it off in that time, say the stop word (or the hang-up word), press the action
+button, tap **Hang up** on the screen, or press **Hang up** in Home Assistant. Nothing is dialed, and
+no `dialing` event fires, until the wait is over.
+
+- It is handled on the device: Home Assistant's own answer to the sentence is not played.
+- Home Assistant says the words, so the device needs **Allow the device to perform Home Assistant
+  actions** turned on. A call whose "Calling Mom." is never said is not placed: nobody heard whom it
+  would call.
+- The phone has to be signed in. With an account that is not signed in, the device says "The phone
+  isn't signed in." With no phone account at all, the sentence goes to Home Assistant.
+- It does not apply in a follow-up or in a conversation Home Assistant started, where what you say is
+  an answer, or while an alarm or timer rings, or during a call. Nor with realtime voice, whose model
+  answers from your voice.
+- **Call contacts by voice** (the switch in Home Assistant, or the checkbox under the phone book on the
+  setup page) turns it off and leaves these sentences to Home Assistant. It is on by default. It can't be
+  changed through the device's remote API or by restoring settings from a file.
+
+**With a Home Assistant automation for calls.** The device answers a sentence that names a contact in
+its phone book before Home Assistant can, so an automation for the same names (the one below, or the
+[call by voice blueprint](../blueprints/automation/techo5/call_by_voice.yaml)) does not get to place
+the call: its answer is not played, and its own call is refused while the device's is under way. Use
+one or the other for a name. The blueprint is still what calls another device in the house (`call the
+kitchen` with Kitchen a device, not a contact) and names that are not in the phone book; keep a contact
+from having a device's name, or "call the kitchen" dials the contact.
 
 While a call rings or is up, the wake word is ignored (the far end talking through the speaker is not
-someone in the room), and music and other sounds pause for it. A ringing call lights the Show's and
+someone in the room), unless **Wake word during calls** is on (below). Music and other sounds pause
+for a call. A ringing call lights the Show's and
 the Spot's screen and pulses the Dot's ring green.
+
+### Calling a contact on a wake word
+
+A wake word can call a contact in the phone book instead of starting the assistant: say it, and the
+call is placed at once, with no sentence after it and nothing asked of Home Assistant. One use is a
+voice service or an intercom reached by a SIP extension. Choose it on the setup page, **Sound &
+Voice**, **Call on a wake word**, or in Home Assistant with **Call on wake word** on the wake word's
+assistant sub-device: one contact for each wake word, or **Off**. It is off until chosen. Home
+Assistant is offered the contacts' names, never their numbers, and a phone book with other names
+reconnects it so its list follows.
+
+**The room is heard in the call from the moment it is answered**, as in any call. The call's page, its
+sound, the encryption setting and **Hang up** are the same as for any other call.
+
+- It applies only while the phone is free. While a call rings, is being placed or is up, the wake word
+  does what it always does then: it is ignored, or with **Wake word during calls** on it starts the
+  assistant, so the call can still be hung up by voice. A second call can't be started this way.
+- With several devices, only the one that heard the word best calls ([the nearest
+  device answers](setup.md#the-nearest-device-answers)), and only a device that can place the call now takes part.
+- The first wake word over a ringing alarm or timer only stops it. Say it again to call.
+- The button that starts the assistant by hand (**Wake** in Home Assistant, or on the device) still
+  starts the assistant.
+- Home Assistant's own wake word engine does not listen for a wake word chosen to call, as for one
+  chosen for realtime voice: the device's own engine hears it.
+- When the call can't be placed, nothing else answers instead. The device logs why, and
+  `esphome.techo5_phone` fires `not_placed` with a `reason`: `no_phone` (no account), `not_signed_in`,
+  `line_busy`, `busy` (the assistant is answering), `muted`, `unknown_contact` (the contact is no
+  longer in the phone book) or `dial_failed`.
+- A wake word chosen for realtime voice can't call, and one chosen to call can't be chosen for realtime
+  voice: clear one first.
+- The choice is the device's own, as realtime voice is: a settings file never carries it, and
+  restoring one leaves each wake word's choice as it was on the device. The device's remote API can
+  read it but not change it.
+
+### A hang-up word
+
+Choose a word in **Hang-up word** (the device's microphone settings in Home Assistant) and saying it
+during a call hangs the call up, or declines one ringing here. It is heard on the device, so it works
+with Home Assistant down. It is **None**, off, until chosen. The list has **Stop**, which has the stop
+word do it, and every wake word the device has but the ones chosen as wake words, so one of your own
+("hang up", say) can do it, added the way a wake word of your own is (setup.md).
+
+- A call being placed is never ended this way, only one ringing here or one that is up. The
+  exception is a call by voice that has not been dialed yet (above), which the word calls off.
+- It is not acted on while the other party is talking, or for a moment after: their voice comes out
+  of the speaker. Wait for a gap. Talking means louder than the background noise their end sends, so
+  a quiet room or a line's hiss doesn't hold the word back.
+- A talk through a camera is not ended this way, and neither is a call while the device is making a
+  sound of its own (an announcement, the assistant's answer, a chime): the word in it is the device's.
+- With **Stop**, an alarm or timer ringing during the call is stopped first, and the next "stop" hangs
+  up. "Stop" comes up in conversation, so it can hang up by mistake; a word of your own that does not
+  come up is less likely to. It is heard at **Stop word threshold**, and does nothing with the stop word
+  turned off (that threshold at its top).
+- Another word is listened for only while a call rings or is up, or while a call by voice waits to
+  be dialed, at **Hang-up word threshold**, a wake word's 0.85 until set. Higher hears it less often,
+  by mistake or not.
+- During a call the stop word and the hang-up word are held to their full threshold, without the
+  allowance words get while the speaker plays; the stop word gets it back over a ring.
+- A word of your own chosen here can't be removed on the setup page or by **Purge cache** while it is
+  the hang-up word, and the setting can't be changed through the device's remote API or by restoring
+  settings from a file.
+
+### Answering and hanging up by voice
+
+Turn on **Wake word during calls** and the wake word opens a turn while a call rings here or is up, as
+it does at any other time. What it does is Home Assistant's: an automation like the one below answers
+or hangs up the call on the device that heard it. The call carries on while you speak, both ways.
+
+- A wake word heard while the other party was talking, or for a moment after, is ignored: their voice
+  comes out of the speaker. Wait for a gap.
+- A call being placed (still ringing out) is ended with the button, not by voice.
+- The device on the call answers a wake word another device nearby heard about as well, but not one
+  another device heard clearly better, which was somebody talking to that one.
+- While the turn listens, the other party is not played in the room, so they cannot speak into it.
+  They are heard again once it has heard you.
+- A call ringing here keeps ringing once the turn is over, if it has not been answered.
+- The stop word does not open a turn during a call: it stops an alarm or timer, or hangs up if it is
+  the hang-up word. In a turn opened during a call it cancels the turn and leaves the call up.
+
+Two more switches decide how the turn sounds:
+
+| | |
+|---|---|
+| **Assistant replies go into calls** | The assistant's answer is sent to the other party as well as played in the room. Off, only the room hears it, and the other party hears a moment of quiet. Either way the room's microphones are not sent while the answer plays, so it does not reach them a second time through the speaker. Announcements go into the call either way, over the room. |
+| **Hear the call under the assistant** | The other party keeps playing, quieter, under the chime and the answer. Off, they are not heard in the room until the answer is over. |
+
+All three are off unless chosen. Home Assistant's own wake word engine (**Wake word on Home Assistant**)
+stays off during a call: only the device's own wake word is heard then.
+
+```yaml
+alias: TECHO5 - answer or hang up a call by voice
+mode: parallel
+triggers:
+  - trigger: conversation
+    command:
+      - "answer [the] [phone] [call]"
+      - "pick up"
+    id: answer
+  - trigger: conversation
+    command:
+      - "hang up"
+      - "end [the] call"
+    id: hangup
+conditions:
+  - "{{ device_entities(trigger.device_id) | select('search', '^sensor[.].*_phone$') | list | count > 0 }}"
+actions:
+  - action: "esphome.{{ device_attr(trigger.device_id, 'name') | slugify }}_phone_{{ trigger.id }}"
+  - set_conversation_response: ""
+```
+
+The condition passes only for a TECHO5 device with a phone, as the automations in actions.md check
+theirs, so a request from another satellite does not reach for an action it does not have. The empty
+response keeps the assistant from talking over the call it just answered, or into the room after
+hanging up.
+
+### Both at once
+
+The hang-up word and **Wake word during calls** can both be on. A word of your own such as "hang up",
+heard in a turn, cancels the turn and hangs up, so "Okay Nabu, hang up" ends the call on the device
+whether the word or Home Assistant hears it first. While the assistant's answer is playing the hang-up
+word is not acted on, so an answer that says it does not end the call. "Stop" in a turn only cancels
+the turn.
 
 ## Events
 
@@ -78,12 +318,13 @@ Each step of a call fires `esphome.techo5_phone` on Home Assistant's bus, with:
 
 | Field | |
 |---|---|
-| `event` | `dialing`, `ringing`, `answered`, `not_answered`, `declined`, `missed`, `ended` |
+| `event` | `dialing`, `ringing`, `answered`, `not_answered`, `declined`, `missed`, `ended`, `not_placed` |
 | `device` | The device's name |
 | `peer` | The other party: a number, an extension, or a caller ID name and number |
 | `direction` | `incoming` or `outgoing` |
 | `kind` | `phone`, or `intercom` for a call between two devices in the house |
 | `by`, `seconds` | On `ended`: who hung up (`device` or `far end`) and how long the call lasted |
+| `reason` | On `not_placed`: why a [wake word's call](#calling-a-contact-on-a-wake-word) was not placed |
 
 The device needs **Allow the device to perform Home Assistant actions** turned on in its ESPHome
 integration options for events to arrive.
@@ -91,7 +332,8 @@ integration options for events to arrive.
 ## Example automations
 
 Replace the names and numbers with your own. These keep your contacts in Home Assistant, not on the
-devices.
+devices. For names in a device's own phone book, the device places the call itself (above), before an
+automation for them can.
 
 ### "Call Alex" from whichever device heard it
 
@@ -113,6 +355,7 @@ actions:
       - set_conversation_response: "I don't have a number for {{ trigger.slots.who }}."
       - stop: unknown
   - action: "esphome.{{ device_attr(trigger.device_id, 'name') | slugify }}_phone_call"
+    continue_on_error: true
     data:
       number: "{{ number }}"
   - set_conversation_response: "Calling {{ trigger.slots.who }}."
@@ -219,6 +462,10 @@ crosses the network. Devices from before that change still send it as it is, so 
 together: a device on the older release also turns away announcements from an updated one. On a Dot,
 which has no screen, both are the Home Assistant switches, and the action button answers and hangs up.
 
+To listen to a room from a phone's browser instead, without a call, there is the baby monitor
+([setup.md](setup.md#the-baby-monitor)): a switch, off by default, and a private link; the device shows
+on its screen, or its ring, while anyone listens.
+
 ## How it works
 
 - `echod/internal/feature/phone`: the component. SIP and RTP through
@@ -226,6 +473,10 @@ which has no screen, both are the Home Assistant switches, and the action button
   G.711 at 8 kHz. The microphones' output after echo cancellation is filtered and halved to 8 kHz on
   the way out; the far end is doubled back to 16 kHz and played as the speaker's voice, which makes it
   the echo canceller's reference like any other sound.
+- With **Microphone echo canceller in calls** set apart from **Microphone echo canceller**, the call
+  switches the canceller as its audio starts and back as it ends, logged as `phone: echo canceller for
+  the call` and `phone: echo canceller after the call`; an intercom call up beside a phone call
+  switches it back only after both.
 - The speaker is held for the call. An announcement takes it for as long as it plays and the call
   takes it back; if the speaker falls more than 300 ms behind the network, the backlog is dropped so
   the call stays live.

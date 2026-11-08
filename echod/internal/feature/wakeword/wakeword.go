@@ -35,25 +35,31 @@ const Slots = 2
 // conversation's to decide, so this only says which slot.
 var Requested hook.Hook[int]
 
+// CancelRequested is the Cancel request button: Wake's way back. What a request is, and whether one
+// is running, is the conversation's to know.
+var CancelRequested hook.Hook[struct{}]
+
 type WakeWord struct {
-	slots []slot
+	slots  []slot
+	cancel *esphome.Button
 }
 
 type slot struct {
 	wake *esphome.Button
 
-	threshold    *esphome.Number
-	tone         *esphome.Select
-	effect       *esphome.Select
-	thinking     *esphome.Select
-	replying     *esphome.Select
-	delivery     *esphome.Select
-	buffer       *esphome.Number
-	followUp     *esphome.Number
-	followUps    *esphome.Number
-	followUpTone *esphome.Select
-	maxListen    *esphome.Number
-	maxThink     *esphome.Number
+	threshold        *esphome.Number
+	playingThreshold *esphome.Number
+	tone             *esphome.Select
+	effect           *esphome.Select
+	thinking         *esphome.Select
+	replying         *esphome.Select
+	delivery         *esphome.Select
+	buffer           *esphome.Number
+	followUp         *esphome.Number
+	followUps        *esphome.Number
+	followUpTone     *esphome.Select
+	maxListen        *esphome.Number
+	maxThink         *esphome.Number
 }
 
 var (
@@ -63,12 +69,27 @@ var (
 
 func Get() *WakeWord {
 	once.Do(func() {
-		shared = &WakeWord{}
+		shared = &WakeWord{cancel: newCancel()}
 		for i := range Slots {
 			shared.slots = append(shared.slots, newSlot(i))
 		}
 	})
 	return shared
+}
+
+// newCancel builds the Cancel request button. One for the device rather than one per assistant,
+// since only one request runs at a time, and on the device itself, beside the Assist satellite
+// whose state says whether there is anything to cancel: Home Assistant can start a request (Wake)
+// but has no action of its own to end one.
+func newCancel() *esphome.Button {
+	return &esphome.Button{
+		Base: esphome.Base{
+			ObjectID: "cancel_request",
+			Name:     "Cancel request",
+			Icon:     "mdi:account-voice-off",
+		},
+		OnPress: func() { CancelRequested.Emit(struct{}{}) },
+	}
 }
 
 // newSlot builds one slot's entities. The name leads with the assistant so that everything belonging
@@ -92,7 +113,17 @@ func newSlot(n int) slot {
 		threshold: &esphome.Number{
 			Base: esphome.Base{
 				ObjectID: fmt.Sprintf("wake_threshold_%d", n+1),
-				Name:     "Wake word sensitivity",
+				Name:     "Wake word threshold",
+				Icon:     "mdi:tune",
+				Category: esphome.CategoryConfig,
+			},
+			Min: 0.5, Max: 0.99, Step: 0.01,
+			Mode: esphome.NumberBox,
+		},
+		playingThreshold: &esphome.Number{
+			Base: esphome.Base{
+				ObjectID: fmt.Sprintf("wake_playing_threshold_%d", n+1),
+				Name:     "Wake word threshold (playing)",
 				Icon:     "mdi:tune",
 				Category: esphome.CategoryConfig,
 			},
@@ -203,9 +234,9 @@ func newSlot(n int) slot {
 		},
 	}
 
-	// All thirteen on a page of their own.
+	// All the slot settings on an assistant page of their own.
 	for _, b := range []*esphome.Base{
-		&s.wake.Base, &s.threshold.Base, &s.tone.Base, &s.effect.Base,
+		&s.wake.Base, &s.threshold.Base, &s.playingThreshold.Base, &s.tone.Base, &s.effect.Base,
 		&s.thinking.Base, &s.replying.Base, &s.delivery.Base,
 		&s.buffer.Base, &s.followUp.Base, &s.followUps.Base, &s.followUpTone.Base,
 		&s.maxListen.Base, &s.maxThink.Base,
@@ -217,8 +248,18 @@ func newSlot(n int) slot {
 		s.threshold.Set(v)
 		if err := config.Set().Wake(n).Threshold(float64(v)); err != nil {
 			slog.Error("saving the wake threshold failed", "slot", n+1, "err", err)
+		} else if config.Get().Wake.Slot(n).PlayingThreshold == 0 {
+			// Older configurations continue to use the 0.10 allowance until explicitly tuned.
+			s.playingThreshold.Set(float32(config.Get().Wake.Slot(n).PlayingThresholdAt()))
 		}
-		slog.Info("wake sensitivity", "slot", n+1, "cutoff", v)
+		slog.Info("wake threshold", "slot", n+1, "cutoff", v)
+	}
+	s.playingThreshold.OnCommand = func(v float32) {
+		s.playingThreshold.Set(v)
+		if err := config.Set().Wake(n).PlayingThreshold(float64(v)); err != nil {
+			slog.Error("saving the playing wake threshold failed", "slot", n+1, "err", err)
+		}
+		slog.Info("wake threshold while playing", "slot", n+1, "cutoff", v)
 	}
 	s.tone.OnCommand = func(label string) {
 		tone, ok := config.ByLabel(speaker.WakeTones(), label)
@@ -295,7 +336,7 @@ func newSlot(n int) slot {
 
 // deliveries is how a reply can arrive, in the order it is offered.
 func deliveries() []config.Delivery {
-	return []config.Delivery{config.DeliveryWhole, config.DeliveryStream}
+	return []config.Delivery{config.DeliveryWhole, config.DeliveryStream, config.DeliveryEarly}
 }
 
 // followUpToneFor is what the select's label means as a setting: Default is the wake word's own tone,
@@ -316,10 +357,17 @@ func followUpToneLabel(tone config.Tone) string {
 	return tone.Label()
 }
 
-// SetThreshold sets slot n's wake word sensitivity as Home Assistant would, for the screen.
+// SetThreshold sets slot n's wake word threshold as Home Assistant would, for the screen.
 func (w *WakeWord) SetThreshold(n int, v float64) {
 	if n >= 0 && n < len(w.slots) {
 		w.slots[n].threshold.OnCommand(float32(v))
+	}
+}
+
+// SetPlayingThreshold sets the threshold used while echo cancellation is active, for the screen.
+func (w *WakeWord) SetPlayingThreshold(n int, v float64) {
+	if n >= 0 && n < len(w.slots) {
+		w.slots[n].playingThreshold.OnCommand(float32(v))
 	}
 }
 
@@ -364,10 +412,14 @@ func (w *WakeWord) SetFollowUps(n, count int) {
 func (w *WakeWord) Name() string { return "wake word settings" }
 
 func (w *WakeWord) Entities() []esphome.Entity {
-	var ents []esphome.Entity
+	ents := []esphome.Entity{w.cancel}
 	for _, s := range w.slots {
-		ents = append(ents, s.wake, s.threshold, s.tone, s.effect, s.thinking, s.replying,
-			s.delivery, s.buffer, s.followUp, s.followUps, s.followUpTone, s.maxListen, s.maxThink)
+		ents = append(ents, s.wake, s.threshold, s.playingThreshold, s.tone)
+		// What the ring shows for each phase, where there is a ring to show it (#325).
+		if led.HasRing {
+			ents = append(ents, s.effect, s.thinking, s.replying)
+		}
+		ents = append(ents, s.delivery, s.buffer, s.followUp, s.followUps, s.followUpTone, s.maxListen, s.maxThink)
 	}
 	return ents
 }
@@ -376,6 +428,7 @@ func (w *WakeWord) Restore(c config.Config) {
 	for i, s := range w.slots {
 		saved := c.Wake.Slot(i)
 		s.threshold.Set(float32(saved.Threshold))
+		s.playingThreshold.Set(float32(saved.PlayingThresholdAt()))
 		s.tone.Set(saved.Tone.Label())
 
 		component.RestoreEffect(s.effect, saved.Effect, nil,

@@ -65,7 +65,12 @@ func Rewire() {
 // driver already believes in would leave the hardware where the reset put it, muted (a unit stayed
 // deaf after the button released the latch until this was written the long way, 2026-09-20).
 func routeInputs() {
-	m, err := alsa.OpenMixer(Card)
+	card, _, _, err := captureDevice()
+	if err != nil {
+		slog.Error("selecting microphone mixer failed", "err", err)
+		return
+	}
+	m, err := alsa.OpenMixer(card)
 	if err != nil {
 		slog.Error("opening the mixer failed", "err", err)
 		return
@@ -86,12 +91,25 @@ func routeInputs() {
 // applyGain sets the analog gain on every ADC. A microphone that cannot be turned up is worth a log
 // and nothing more: the array still works, quietly.
 func applyGain(db int) {
-	m, err := alsa.OpenMixer(Card)
+	if !hasMixer {
+		return // a panel: the app's microphone has no converter of ours to turn up
+	}
+	card, _, _, err := captureDevice()
+	if err != nil {
+		slog.Error("selecting microphone mixer failed", "err", err)
+		return
+	}
+	m, err := alsa.OpenMixer(card)
 	if err != nil {
 		slog.Error("opening the mixer failed", "err", err)
 		return
 	}
 	defer m.Close()
+
+	// A board whose converter has gain controls of another shape sets them itself.
+	if setBoardGain(m, db) {
+		return
+	}
 
 	steps := min(max(float64(db)/pgaStepDB, 0), pgaMax)
 	for _, adc := range adcs {

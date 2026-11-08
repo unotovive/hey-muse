@@ -52,7 +52,11 @@ func Get() *Light {
 func build() *Light {
 	l := &Light{
 		light: &esphome.Light{
-			Base:                esphome.Base{ObjectID: "ring", Name: "LED ring", DeviceID: component.DeviceRing},
+			// A configuration entity, as Voice PE has its ring: Home Assistant then leaves it out of what
+			// Assist can switch by default, so "lights on" in its room does not light the ring too. It can
+			// still be exposed in Home Assistant, and an install that had it exposed keeps that.
+			Base: esphome.Base{ObjectID: "ring", Name: "LED ring", DeviceID: component.DeviceRing,
+				Category: esphome.CategoryConfig},
 			SupportedColorModes: []esphome.ColorMode{esphome.ColorModeRGB},
 
 			// None comes first, because an effect list with no way out of it is a light that can be
@@ -92,6 +96,9 @@ func build() *Light {
 func (l *Light) Name() string { return "ring light" }
 
 func (l *Light) Entities() []esphome.Entity {
+	if !led.HasRing {
+		return nil
+	}
 	out := []esphome.Entity{l.light}
 	for _, s := range l.segs {
 		out = append(out, s)
@@ -111,7 +118,9 @@ func (l *Light) Base() led.Color { return colorOf(l.light.Get()) }
 func (l *Light) Restore(c config.Config) {
 	saved := c.Ring.Light
 
-	if !saved.On {
+	if !saved.On || !led.HasRing {
+		// Off, or no ring: a light saved on before the control was taken away from a device with no
+		// ring would animate nothing for as long as the device is up.
 		slog.Info("restored", "what", "ring light", "on", false)
 		return
 	}

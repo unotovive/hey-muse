@@ -3,6 +3,7 @@ package sendspin
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"log/slog"
 	"math"
 	"sync/atomic"
@@ -53,7 +54,20 @@ type session struct {
 	// lastTS is the newest chunk's timestamp, kept to measure what a new stream overlaps.
 	lastTS int64
 	opened bool
-	muted  bool
+
+	// muted and level are the device's own mute and level, as the player last applied them, whoever
+	// changed them: Music Assistant, Home Assistant, a button or a voice request. They are atomics
+	// because the hooks that set them run on whoever made the change.
+	muted atomic.Bool
+	level atomic.Int32
+
+	// changed hands a change of level or mute to the session's own sender (tell), so the network write
+	// is never made on the caller's goroutine: a button press or a night volume change is not held up
+	// by a slow link. It holds one: a burst of changes sends only the newest.
+	changed chan struct{}
+
+	// converged is set once the clock filter has converged, and stays set: available in client/state.
+	converged atomic.Bool
 
 	// meta is the track the server last described, and what a message that only changes part of it
 	// is merged onto.
@@ -138,7 +152,7 @@ func newSession(conn *websocket.Conn, o *out, bg *speaker.Arbiter, name string, 
 	}, conn)
 
 	return &session{client: client, clock: ssync.NewClockSync(), out: o, bg: bg, report: report,
-		releaseAsked: make(chan struct{}, 1)}
+		releaseAsked: make(chan struct{}, 1), changed: make(chan struct{}, 1)}
 }
 
 // bufferCapacity caps how far ahead the server may send, which is the stall the room can ride out. The
@@ -164,6 +178,17 @@ func (s *session) run(ctx context.Context) error {
 	// can arrive after the cancel.
 	cancelTransport := media.Get().OnTransport.Listen(s.asks)
 	defer cancelTransport()
+	// The same goes for the level. Without this the server only heard of a level it had set itself, so
+	// a change from Home Assistant, the buttons or a voice request left Music Assistant's slider where
+	// it was (techo5-athena#3).
+	p := media.Get()
+	s.level.Store(int32(p.Volume()))
+	s.muted.Store(p.Muted())
+	cancelLevel := p.OnLevel.Listen(s.levelMoved)
+	defer cancelLevel()
+	cancelMute := p.OnMute.Listen(s.muteMoved)
+	defer cancelMute()
+	safe.Go("sendspin state", func() { s.tell(ctx) })
 
 	// A picture left from an earlier connection is not this server's: it sends its own current one
 	// as soon as the artwork stream starts.
@@ -175,7 +200,7 @@ func (s *session) run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			s.client.SendGoodbye("user_request")
+			s.leave(ctx)
 			return nil
 
 		case <-s.client.Done():
@@ -361,6 +386,8 @@ func (s *session) grouped(g protocol.GroupUpdate) {
 			if playing, _ := media.Get().RemotePlaying(); playing && s.askedFor() != "pause" {
 				media.Get().HoldRemote()
 				media.Get().RemoteState("paused")
+				// Or its queue was emptied, which looks the same from here; Home Assistant can say.
+				home.CheckEmptied()
 			}
 		}
 		s.asked.Store("")
@@ -619,7 +646,6 @@ func (s *session) told(cmd protocol.PlayerCommand) {
 	case "volume":
 		s.out.setVolume(cmd.Volume)
 	case "mute":
-		s.muted = cmd.Mute
 		s.out.setMuted(cmd.Mute)
 	}
 	s.reported()
@@ -627,29 +653,123 @@ func (s *session) told(cmd protocol.PlayerCommand) {
 
 // reported echoes what took effect. The server has no other way to learn a command landed, and the
 // protocol carries no position, so this is the whole of what we say back.
+//
+// It goes out as its own client/state rather than through SendState, because sendspin-go v1.8.2's
+// PlayerState has no timing fields and the spec has made them required: Music Assistant's aiosendspin
+// logs a player without them as legacy ("omitted required player timing fields") and can be set to
+// refuse one. The delay is sent under both names it has had: static_delay_ms in aiosendspin 9.1.1,
+// the newest release, and output_delay_ms since the spec renamed it (spec PR #164, in aiosendspin's
+// main branch but not yet released). A server ignores a field it does not know.
+//
+// The delay is 0 and the command to set it is not offered. It is for a chain beyond the device's own
+// port, which a Show does not have; its own latency is compensated here (out.position), as the spec
+// asks. And it can only move a player earlier, so it could never have fixed a Show playing early.
+//
+// available is false until the clock filter has converged, as the spec requires: a player that says it
+// can play before its clock is good would be scheduled against a wrong offset. The clock loop says it
+// again once it has (noteClock).
 func (s *session) reported() {
-	if err := s.client.Send("client/state", clientState{Player: playerState{
-		State:  "synchronized",
-		Volume: config.Get().Speaker.Volume * 100 / speaker.VolumeSteps,
-		Muted:  s.muted,
-	}}); err != nil {
+	s.state(config.Get().Speaker.Volume)
+}
+
+// levelMoved and muteMoved note what the player has just applied and wake the sender. The step comes
+// from the hook rather than the settings, which are saved only after the hook has run.
+func (s *session) levelMoved(step int) {
+	s.level.Store(int32(step))
+	s.poke()
+}
+
+func (s *session) muteMoved(muted bool) {
+	s.muted.Store(muted)
+	s.poke()
+}
+
+func (s *session) poke() {
+	if !s.live.Load() {
+		return
+	}
+	select {
+	case s.changed <- struct{}{}:
+	default: // one is waiting already, and it sends the newest
+	}
+}
+
+// tell sends the newest level and mute each time one changes, until the connection ends.
+func (s *session) tell(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.client.Done():
+			return
+		case <-s.changed:
+			s.state(int(s.level.Load()))
+		}
+	}
+}
+
+// state sends client/state with the level at step, of speaker.VolumeSteps.
+func (s *session) state(step int) {
+	available := s.converged.Load()
+	state := "synchronized"
+	if !available {
+		state = "error"
+	}
+	if err := s.client.Send("client/state", clientState{
+		Available: available,
+		Player: playerState{
+			State:              state,
+			Volume:             step * 100 / speaker.VolumeSteps,
+			Muted:              s.muted.Load(),
+			StaticDelayMs:      0,
+			OutputDelayMs:      0,
+			RequiredLeadTimeMs: requiredLeadTimeMs,
+			MinBufferMs:        minBufferMs,
+		},
+	}); err != nil {
 		slog.Debug("sendspin client state", "err", err)
 	}
 }
+
+// What the player asks the server for, in the spec's client/state terms. Not measured: the output
+// latency (Player.Latency, at most a full ring: 64 ms on a Show 5 or a Spot, about 85 on a Dot) and a decoder
+// starting from cold sit well inside the lead, and the buffer is Wi-Fi jitter with room to spare. The
+// room can hold 30 s (bufferSeconds), so these are floors, not caps.
+const (
+	requiredLeadTimeMs = 300
+	minBufferMs        = 200
+)
 
 // clientState and playerState are the library's ClientStateMessage and PlayerState without its
 // omitempty, which leaves out a false muted and a zero volume. A player that lists the volume and mute
 // commands has to say both every time: without muted, an unmute never reached the server, which kept
 // the true it last heard, and Music Assistant took that back with the next state, so the device read
-// muted again while it played.
+// muted again while it played. They also carry the fields sendspin-go does not have yet: available is
+// the spec's replacement for player.state (state stays for a server that predates it), and the delay
+// and lead fields say where this player's audio really leaves the speaker.
 type clientState struct {
-	Player playerState `json:"player"`
+	Available bool        `json:"available"`
+	Player    playerState `json:"player"`
 }
 
 type playerState struct {
-	State  string `json:"state"`
-	Volume int    `json:"volume"`
-	Muted  bool   `json:"muted"`
+	State              string `json:"state,omitempty"`
+	Volume             int    `json:"volume"`
+	Muted              bool   `json:"muted"`
+	StaticDelayMs      int    `json:"static_delay_ms"`
+	OutputDelayMs      int    `json:"output_delay_ms"`
+	RequiredLeadTimeMs int    `json:"required_lead_time_ms"`
+	MinBufferMs        int    `json:"min_buffer_ms"`
+}
+
+// noteClock tells the server the player is available the first time the clock filter is past lost,
+// right after a round. It latches: CheckQuality reads lost again whenever 5 s pass without a round,
+// and rounds are syncEvery apart, so following it would take the player away between every two
+// rounds (seen on a Show: the server stopped streaming to it).
+func (s *session) noteClock() {
+	if s.clock.CheckQuality() != ssync.QualityLost && !s.converged.Swap(true) {
+		s.reported()
+	}
 }
 
 // synced keeps the clock filter fed. It owns TimeSyncResp: nothing else may read that channel, or the
@@ -660,6 +780,7 @@ func (s *session) synced(ctx context.Context) {
 
 	for {
 		s.measure(ctx)
+		s.noteClock()
 
 		select {
 		case <-ctx.Done():
@@ -731,6 +852,31 @@ func (s *session) finish() {
 	// that would have carried a command to it has gone with the connection, so a play or a pause belongs
 	// to this player's stream again.
 	media.Get().RemoteGone()
+}
+
+// errSwitchedOff ends the sessions when the Sendspin switch is turned off (Player.switchOff): the
+// one stop the device does not come back from.
+var errSwitchedOff = errors.New("sendspin: switched off")
+
+// goodbyeFor is the client/goodbye reason for a session ctx ended. Music Assistant dials a device
+// set up by address again only after "restart"; after any other goodbye, "user_request" among them,
+// it stops dialing for good (aiosendspin's should_retry_server_initiated_connection). A connection
+// that drops with no goodbye at all it takes for a restart. A device that restarted, was updated or
+// rebooted said "user_request" and was then left out of Music Assistant until Music Assistant itself
+// was restarted. So the daemon stopping is "restart", since the device comes back, and only the
+// switch turned off is "user_request".
+func goodbyeFor(ctx context.Context) string {
+	if errors.Is(context.Cause(ctx), errSwitchedOff) {
+		return "user_request"
+	}
+	return "restart"
+}
+
+// leave says goodbye for the reason ctx ended (goodbyeFor).
+func (s *session) leave(ctx context.Context) {
+	if err := s.client.SendGoodbye(goodbyeFor(ctx)); err != nil {
+		slog.Debug("sendspin: saying goodbye", "err", err)
+	}
 }
 
 func micros() int64 { return time.Now().UnixMicro() }

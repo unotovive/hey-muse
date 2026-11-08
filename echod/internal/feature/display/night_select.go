@@ -1,9 +1,8 @@
-//go:build !dot && !spot
+//go:build !dot
 
 package display
 
 import (
-	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -98,36 +97,32 @@ func nightHoursSelect(d *Display) *esphome.Select {
 // holds until it is turned again.
 func nightNow(now time.Time) bool {
 	sc := config.Get().Screen
-	hours := !sc.NightByHA && config.InWindow(sc.Night, now)
+	hours := !sc.NightByHA && config.InNights(nightHoursSet(), sc.NightWeekend, now)
 	if sc.NightOverride != "on" && sc.NightOverride != "off" {
 		return hours
 	}
 	if !sc.NightByHA {
 		at := time.Unix(sc.NightOverrideAt, 0)
-		if now.Before(at) || now.Sub(at) > 24*time.Hour || !now.Before(nextNightChange(sc.Night, at)) {
+		if now.Before(at) || now.Sub(at) > 24*time.Hour || !now.Before(nextNightChange(nightHoursSet(), sc.NightWeekend, at)) {
 			return hours // the hours have started or ended the night since the switch was turned
 		}
 	}
 	return sc.NightOverride == "on"
 }
 
-// nextNightChange is the first time after at that the hours start or end the night; a day on when
-// there are no hours.
-func nextNightChange(window string, at time.Time) time.Time {
-	from, to, ok := config.ParseWindow(window)
-	if !ok {
-		return at.Add(24 * time.Hour)
-	}
+// nextNightChange is the first time after at that the hours, the weekend's among them, start or end the
+// night; a day on when there are no hours. By the clock on the wall, as the hours are: midnight plus a
+// duration is an hour off on the two days a year the clocks change.
+func nextNightChange(nights, weekend string, at time.Time) time.Time {
 	next := at.Add(48 * time.Hour)
-	for d := range 2 {
-		for _, m := range []int{from, to} {
-			// By the clock on the wall, as the hours are: midnight plus a duration is an hour off on the
-			// two days a year the clocks change.
-			t := time.Date(at.Year(), at.Month(), at.Day()+d, m/60, m%60, 0, 0, at.Location())
-			if t.After(at) && t.Before(next) {
-				next = t
-			}
+	found := false
+	for _, t := range config.NightChanges(nights, weekend, at) {
+		if t.After(at) && t.Before(next) {
+			next, found = t, true
 		}
+	}
+	if !found {
+		return at.Add(24 * time.Hour)
 	}
 	return next
 }
@@ -152,10 +147,26 @@ func nightModeSwitch(d *Display) *esphome.Switch {
 			return
 		}
 		slog.Info("screen: night mode", "on", on)
+		if on {
+			d.startNightNow()
+		}
 		d.showNightMode(nightNow(time.Now()))
 		d.wake()
 	}
 	return sw
+}
+
+// nightIdle is how long the panel stays lit after a finger or a turn during the night.
+const nightIdle = 90 * time.Second
+
+// startNightNow is the night asked for: the grace a touch or a turn gives the screen before the night
+// takes it (nightIdle) is for a night that begins while somebody is using it, not for one somebody
+// just turned on. An automation turning the night on from a tap on this screen's own dashboard (a
+// light's tile, say) would otherwise see that tap hold the night back.
+func (d *Display) startNightNow() {
+	d.mu.Lock()
+	d.touchedAt, d.viewAt = time.Time{}, time.Time{}
+	d.mu.Unlock()
 }
 
 // showNightMode keeps the Night mode switch saying whether it is night, which the hours change on
@@ -227,6 +238,81 @@ func nightEndSelect(d *Display, start bool) *esphome.Select {
 	return s
 }
 
+// sameAsNights is the weekend's choice of nights like every other.
+const sameAsNights = "Same as other nights"
+
+// weekendEndSelect is Weekend night starts or Weekend night ends: one end of the nights that end on a
+// Saturday or a Sunday morning (config.NightBefore), or the same as every other night.
+func weekendEndSelect(d *Display, start bool) *esphome.Select {
+	id, name, icon := "screen_weekend_night_end", "Weekend night ends", "mdi:weather-sunset-up"
+	if start {
+		id, name, icon = "screen_weekend_night_start", "Weekend night starts", "mdi:weather-sunset-down"
+	}
+	s := &esphome.Select{
+		Base:    esphome.Base{ObjectID: id, Name: name, Icon: icon, Category: esphome.CategoryConfig},
+		Options: append([]string{sameAsNights}, quarters...),
+	}
+	s.OnCommand = func(v string) {
+		if v == sameAsNights {
+			d.setWeekendNight("")
+			return
+		}
+		m, ok := quarterMinutes(v)
+		if !ok {
+			return
+		}
+		from, to := weekendOrNights()
+		if start {
+			from = m
+		} else {
+			to = m
+		}
+		if from == to {
+			slog.Warn("weekend night hours: the start and the end are the same time; not changed", "at", v)
+			d.nightHoursChanged()
+			return
+		}
+		d.setWeekendNight(config.FormatWindow(from, to))
+	}
+	return s
+}
+
+// weekendOrNights is the weekend's hours, or the other nights' when it has none of its own, as the end
+// to keep when only one end is being changed.
+func weekendOrNights() (from, to int) {
+	if f, t, ok := nightWindow(config.Get().Screen.NightWeekend); ok {
+		return f, t
+	}
+	return nightOrDefault()
+}
+
+// setWeekendNight saves the weekend's night hours, empty for the same as every other night.
+func (d *Display) setWeekendNight(v string) {
+	if err := config.Set().Screen().NightWeekend(v); err != nil {
+		slog.Error("saving the weekend night hours failed", "err", err)
+		return
+	}
+	slog.Info("screen: weekend night hours", "hours", cmpOr(v, "as other nights"))
+	d.nightHoursChanged()
+	d.wake()
+}
+
+// setWeekendNightHours is the action: the weekend's nights from start to end; both empty is the same as
+// every other night.
+func (d *Display) setWeekendNightHours(start, end string) error {
+	start, end = strings.TrimSpace(start), strings.TrimSpace(end)
+	if start == "" && end == "" {
+		d.setWeekendNight("")
+		return nil
+	}
+	from, to, ok := config.ParseWindow(start + "-" + end)
+	if !ok {
+		return fmt.Errorf("weekend night hours: %q to %q is not two different times like 23:30 and 09:30", start, end)
+	}
+	d.setWeekendNight(config.FormatWindow(from, to))
+	return nil
+}
+
 // quarterMinutes reads "19:30" back into minutes since midnight.
 func quarterMinutes(v string) (int, bool) {
 	for i, q := range quarters {
@@ -240,7 +326,7 @@ func quarterMinutes(v string) (int, bool) {
 // nightOrDefault is the night set, or 22:00 to 06:00 for a device with none, as the end to keep
 // when only one end is being changed.
 func nightOrDefault() (from, to int) {
-	if f, t, ok := nightWindow(config.Get().Screen.Night); ok {
+	if f, t, ok := nightWindow(nightHoursSet()); ok {
 		return f, t
 	}
 	return 22 * 60, 6 * 60
@@ -263,33 +349,11 @@ func (d *Display) setNight(v string) {
 	d.wake()
 }
 
-// Actions: screen_night_hours sets the night to any start and end, "19:00" and "09:30"; both empty is
-// no night.
-func (d *Display) Actions() []*esphome.Action {
-	return []*esphome.Action{{
-		Name: "screen_night_hours",
-		Args: []esphome.Arg{{Name: "start", Type: esphome.ArgString}, {Name: "end", Type: esphome.ArgString}},
-		Run:  func(c esphome.Call) (any, error) { return nil, d.setNightHours(c.String("start"), c.String("end")) },
-	}, {
-		Name: "calendar_popup_sources",
-		Args: []esphome.Arg{{Name: "calendars", Type: esphome.ArgString}},
-		Run:  func(c esphome.Call) (any, error) { return nil, setPopupCalendars(c.String("calendars")) },
-	}, {
-		Name: "calendar_show",
-		Run: func(esphome.Call) (any, error) {
-			if !d.OpenCalendar() {
-				return nil, errors.New("calendar: this device shows no calendar; choose one with calendar_sources")
-			}
-			return nil, nil
-		},
-	}}
-}
-
 // setNightHours is the action: the night from start to end, "19:00" and "09:30"; both empty is none.
 func (d *Display) setNightHours(start, end string) error {
 	start, end = strings.TrimSpace(start), strings.TrimSpace(end)
 	if start == "" && end == "" {
-		d.setNight("")
+		d.setNight(nightNever)
 		return nil
 	}
 	from, to, ok := config.ParseWindow(start + "-" + end)
@@ -359,15 +423,20 @@ func (d *Display) setNightStyle(i int) {
 
 // setAtNight saves the choice, shows it in Home Assistant, and lets the night take it up at once.
 func (d *Display) setAtNight(i int) {
-	if err := config.Set().Screen().AtNight(i >= 1, i == 2); err != nil {
+	if i < 0 || i >= len(atNightChoices) {
+		return
+	}
+	c := atNightChoices[i]
+	if err := config.Set().Screen().AtNightDark(c.light, c.red, c.dark); err != nil {
 		slog.Error("saving the night setting failed", "err", err)
 		return
 	}
 	if d.atNight != nil {
 		d.atNight.Set(atNightOptions[i])
 	}
-	if i == 0 {
-		// Back to going dark: a glow still up would otherwise stay for the rest of the night.
+	if !c.light {
+		// Back to going dark, or on the Spot to dimming: a glow still up would otherwise stay for the
+		// rest of the night.
 		d.mu.Lock()
 		glowing := d.nightGlow
 		d.nightGlow = false
@@ -375,13 +444,15 @@ func (d *Display) setAtNight(i int) {
 		if glowing {
 			d.relight(true)
 		}
+	} else if c.red {
+		d.nightClockSoon()
 	}
 	d.wake()
 }
 
 // nightHoursChanged shows the hours chosen, on the screen or here, in Home Assistant.
 func (d *Display) nightHoursChanged() {
-	v := config.Get().Screen.Night
+	v := nightHoursSet()
 	if d.nightHours != nil {
 		d.nightHours.Set(nightHoursLabel(v))
 	}
@@ -393,36 +464,16 @@ func (d *Display) nightHoursChanged() {
 		d.nightStart.Set(quarterText(from - from%15))
 		d.nightEnd.Set(quarterText(to - to%15))
 	}
-}
-
-// glowSteps is the night light's scale, 1 to 10, as backlight out of screen.BacklightMax: tight at the
-// bottom, where one step is the difference between a glow and a light in a dark room.
-var glowSteps = [...]int{1, 2, 3, 4, 6, 8, 10, 13, 16, 20}
-
-// glowSetting is the night light's brightness on its 1 to 10 scale: the one set, or the panel's own.
-// The Show 5 starts where the night light began; the Show 8's panel lights a dark room far more at the
-// same backlight, so it starts lower.
-func (d *Display) glowSetting() int {
-	d.mu.Lock()
-	wide := d.wide
-	d.mu.Unlock()
-	return glowFor(wide)
-}
-
-// glowFor is glowSetting for a panel already known, for callers holding mu.
-func glowFor(wide bool) int {
-	if v := config.Get().Screen.NightLightLevel; v > 0 {
-		return v
+	if d.weekendStart != nil {
+		from, to, ok := nightWindow(config.Get().Screen.NightWeekend)
+		if !ok {
+			d.weekendStart.Set(sameAsNights)
+			d.weekendEnd.Set(sameAsNights)
+		} else {
+			d.weekendStart.Set(quarterText(from - from%15))
+			d.weekendEnd.Set(quarterText(to - to%15))
+		}
 	}
-	if wide {
-		return 3
-	}
-	return 6
-}
-
-// glowBacklight is the backlight the night light shows at on the panel. Wants mu, for wide.
-func (d *Display) glowBacklight() int {
-	return glowSteps[min(max(glowFor(d.wide), 1), len(glowSteps))-1]
 }
 
 func glowNumber(d *Display) *esphome.Number {

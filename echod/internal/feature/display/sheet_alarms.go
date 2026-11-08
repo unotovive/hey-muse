@@ -7,13 +7,13 @@ import (
 	"log/slog"
 	"strings"
 	"time"
-	"unicode"
 	"unicode/utf8"
 
 	"github.com/HuskerMinion/techo5/echod/internal/config"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/alarm"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/ring"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/timer"
+	"github.com/HuskerMinion/techo5/echod/internal/lib/locale"
 )
 
 // The settings screen's Alarms & Timers card: the alarms, then how they ring. A tap on an alarm opens
@@ -27,17 +27,17 @@ func alarmsCard(sv sheetView) cardView {
 		return alarmEditorCard(sv, *sv.draft)
 	}
 	v := cardView{
-		title: categoryTitles[catAlarms], blurb: categoryBlurbs[catAlarms],
-		actions: []headerAction{{id: "add", label: "+ Add alarm", style: btnPrimary}},
+		title: tr(categoryTitleKeys[catAlarms]), blurb: tr(categoryBlurbKeys[catAlarms]),
+		actions: []headerAction{{id: "add", label: tr("ui_add_alarm"), style: btnPrimary}},
 	}
 	for _, row := range alarmRows(sv.alarms) {
 		switch {
 		case row.snoozed != nil:
-			v.rows = append(v.rows, settingRow{id: "snoozed", label: "Snoozed until " + clockText(row.snoozed.At),
-				sub: cmpOr(row.snoozed.Label, "Alarm"), bold: true, kind: ctlButton, button: "Cancel"})
+			v.rows = append(v.rows, settingRow{id: "snoozed", label: fmt.Sprintf(tr("ui_snoozed_until_s"), clockText(row.snoozed.At)),
+				sub: cmpOr(row.snoozed.Label, tr("alarm")), bold: true, kind: ctlButton, button: tr("cancel")})
 		case row.local != nil:
 			a := row.local
-			sub := capitalize(a.When())
+			sub := capitalize(alarmWhen(*a))
 			if a.Label != "" {
 				sub += " · " + a.Label
 			}
@@ -45,33 +45,43 @@ func alarmsCard(sv sheetView) cardView {
 				bold: true, kind: ctlToggle, on: a.On, rowTap: true})
 		case row.followed != nil:
 			f := row.followed
-			label, when := "Not set", "In Home Assistant"
+			label, when := tr("ui_not_set"), tr("ui_in_home_assistant")
 			if !f.At.IsZero() {
 				label, when = clockText(f.At), dayWord(f.At, sv.now)
 			}
 			if !f.Armed {
-				when = "Off"
+				when = tr("ui_off")
 			}
-			v.rows = append(v.rows, settingRow{label: label, sub: "From Home Assistant · " + cmpOr(f.Label, f.Entity),
+			v.rows = append(v.rows, settingRow{label: label, sub: fmt.Sprintf(tr("ui_from_home_assistant_s"), cmpOr(f.Label, f.Entity)),
 				bold: true, kind: ctlValue, value: when})
 		}
 	}
 	if len(v.rows) == 0 {
-		v.rows = append(v.rows, settingRow{label: "No alarms yet", sub: "Add one here, or from Home Assistant", kind: ctlValue})
+		v.rows = append(v.rows, settingRow{label: tr("ui_no_alarms_yet"), sub: tr("ui_add_one_here_or_from_home_assistant"), kind: ctlValue})
+	} else if off := config.Get().Alarms.AllOff; off || len(sv.alarms.Local)+len(sv.alarms.Followed) > 1 {
+		// Every alarm at once, for a trip (D#350): over the list, so a list of alarms each switched on
+		// does not look like it will ring while they are all off.
+		sub := tr("ui_all_alarms_on_sub")
+		if off {
+			sub = tr("ui_all_alarms_off_sub")
+		}
+		v.rows = append([]settingRow{{id: "allalarms", label: tr("ui_all_alarms"), sub: sub, kind: ctlToggle, on: !off}}, v.rows...)
 	}
 	v.rows = append(v.rows, timerRows(sv)...)
 	rows := []settingRow{
-		{id: "sunrise", label: "Wake with light", sub: sunriseSub(), kind: ctlChoice, value: sunriseValue()},
+		{id: "sunrise", label: tr("wake_with_light"), sub: sunriseSub(), kind: ctlChoice, value: sunriseValue()},
 	}
 	if anySunrise() {
-		rows = append(rows, settingRow{id: "sunface", label: "Sun with a face",
-			sub: "A face on it, for whoever has to look at it", kind: ctlToggle, on: config.Get().Alarms.SunriseFace})
+		rows = append(rows, settingRow{id: "sunface", label: tr("ui_sun_with_a_face"),
+			sub: tr("ui_a_face_on_it_for_whoever_has_to_look_at_it"), kind: ctlToggle, on: config.Get().Alarms.SunriseFace})
 	}
 	v.rows = append(v.rows, rows...)
 	return v.withRows(
-		settingRow{id: "snooze", label: "Snooze length", kind: ctlStepper, value: fmt.Sprintf("%d min", sv.snooze)},
+		settingRow{id: "snooze", label: tr("ui_snooze_length"), kind: ctlStepper, value: fmt.Sprintf(tr("ui_d_min"), sv.snooze)},
 		ringVolumeRow(),
-		settingRow{id: "alarmsound", label: "Alarm sound", sub: "Plays once when you choose it", kind: ctlChoice, value: alarm.Get().Sound()},
+		settingRow{id: "alarmsound", label: tr("alarm_sound"), sub: tr("ui_plays_once_when_you_choose_it"), kind: ctlChoice, value: alarm.Get().Sound()},
+		settingRow{id: "alarmwords", label: tr("said_as_it_rings"), sub: tr("ui_spoken_by_home_assistant"), kind: ctlChoice, value: alarm.Get().Say().Label()},
+		settingRow{id: "alarmrise", label: tr("ui_gets_louder"), sub: tr("ui_from_quiet_up_to_the_ring_volume"), kind: ctlChoice, value: alarm.Get().Rise().Label()},
 	)
 }
 
@@ -80,10 +90,10 @@ func alarmsCard(sv sheetView) cardView {
 func ringVolumeRow() settingRow {
 	n := ring.Level()
 	if n == 0 {
-		return settingRow{id: "ringvol", label: "Ring volume", sub: "Alarms and timers will make no sound", kind: ctlStepper, value: "Silent"}
+		return settingRow{id: "ringvol", label: tr("ui_ring_volume"), sub: tr("ui_alarms_and_timers_will_make_no_sound"), kind: ctlStepper, value: tr("ui_silent")}
 	}
-	return settingRow{id: "ringvol", label: "Ring volume", sub: "Alarms and timers, not the music", kind: ctlStepper,
-		value: fmt.Sprintf("%d of %d", n, sheetVolumeSteps)}
+	return settingRow{id: "ringvol", label: tr("ui_ring_volume"), sub: tr("ui_alarms_and_timers_not_the_music"), kind: ctlStepper,
+		value: fmt.Sprintf(tr("level_of"), n, sheetVolumeSteps)}
 }
 
 func (v cardView) withRows(rows ...settingRow) cardView {
@@ -100,22 +110,22 @@ func timerRows(sv sheetView) []settingRow {
 		if !c.Active {
 			continue
 		}
-		where := "From Home Assistant"
+		where := tr("ui_from_home_assistant")
 		if c.Local {
-			where = "Set here"
+			where = tr("ui_set_here")
 		}
 		if c.Name != "" && c.Name != "Timer" {
 			where += " · " + c.Name
 		}
-		row := settingRow{id: "timer:" + c.ID, label: timerLeft(c.Left), sub: where, bold: true, kind: ctlValue, value: "Running"}
+		row := settingRow{id: "timer:" + c.ID, label: timerLeft(c.Left), sub: where, bold: true, kind: ctlValue, value: tr("ui_running")}
 		if c.Local {
-			row.kind, row.button, row.value = ctlButton, "Stop", ""
+			row.kind, row.button, row.value = ctlButton, tr("stop"), ""
 		}
 		rows = append(rows, row)
 	}
 	// The row that sets one goes under whatever is already counting down.
-	return append(rows, settingRow{id: "newtimer", label: "New timer",
-		sub: "Rings from this device itself", kind: ctlButton, button: "Set"})
+	return append(rows, settingRow{id: "newtimer", label: tr("new_timer"),
+		sub: tr("ui_rings_from_this_device_itself"), kind: ctlButton, button: tr("ui_set")})
 }
 
 // timerLeft is how long a timer has to run, as the row says it: minutes and seconds under an hour,
@@ -129,47 +139,68 @@ func timerLeft(d time.Duration) string {
 }
 
 // The New timer row's choices.
-var (
-	timerLengths = []time.Duration{time.Minute, 2 * time.Minute, 3 * time.Minute, 5 * time.Minute,
-		10 * time.Minute, 15 * time.Minute, 20 * time.Minute, 30 * time.Minute, 45 * time.Minute, time.Hour}
-	timerLabels = []string{"1 minute", "2 minutes", "3 minutes", "5 minutes", "10 minutes", "15 minutes",
-		"20 minutes", "30 minutes", "45 minutes", "1 hour"}
-)
+var timerLengths = []time.Duration{time.Minute, 2 * time.Minute, 3 * time.Minute, 5 * time.Minute,
+	10 * time.Minute, 15 * time.Minute, 20 * time.Minute, 30 * time.Minute, 45 * time.Minute, time.Hour}
+
+// timerLabels are timerLengths as the list says them, in the screen's language.
+func timerLabels() []string {
+	out := make([]string, len(timerLengths))
+	for i, d := range timerLengths {
+		switch {
+		case d == time.Hour:
+			out[i] = tr("one_hour")
+		case d == time.Minute:
+			out[i] = tr("one_minute")
+		default:
+			out[i] = fmt.Sprintf(tr("ui_d_minutes"), int(d/time.Minute))
+		}
+	}
+	return out
+}
 
 // alarmEditorCard is one alarm being set. Its heading says when it will ring, so a change reads
 // back at once.
 func alarmEditorCard(sv sheetView, d alarmDraft) cardView {
 	a := d.alarm
-	title := "Edit alarm"
+	title := tr("ui_edit_alarm")
 	if d.isNew {
-		title = "New alarm"
+		title = tr("ui_new_alarm")
 	}
 	when := clockTime(a.Hour, a.Minute)
-	blurb := "Rings at " + when + ", " + config.DaysLabel(a.Days)
+	at, once := tr("alarm_rings_at"), tr("alarm_rings_once")
+	if a.LightOnly {
+		at, once = tr("alarm_lights_at"), tr("alarm_lights_once")
+	}
+	blurb := fmt.Sprintf(at, when, daysLabel(a.Days))
 	if a.Days&config.DaysEvery == config.DaysOnce {
-		blurb = "Rings once, at " + when
+		blurb = fmt.Sprintf(once, when)
 		if t, ok := a.OnDate(); ok {
-			blurb += ", " + t.Format("Monday, January 2")
+			blurb += ", " + locale.LongDate(t, screenLang())
 		}
 	}
 	v := cardView{
 		title: title, blurb: blurb,
-		actions: []headerAction{{id: "save", label: "Save", style: btnPrimary}, {id: "cancel", label: "Cancel", style: btnSecondary}},
+		actions: []headerAction{{id: "save", label: tr("ui_save"), style: btnPrimary}, {id: "cancel", label: tr("cancel"), style: btnSecondary}},
 		rows: []settingRow{
-			{id: "e.hour", label: "Hour", kind: ctlStepper, value: hourText(a.Hour)},
-			{id: "e.minute", label: "Minute", kind: ctlStepper, value: fmt.Sprintf(":%02d", a.Minute)},
-			{id: "e.repeat", label: "Repeat", kind: ctlChoice, value: repeatName(a.Days)},
-			{id: "e.days", label: "Days", kind: ctlDays, days: a.Days},
+			{id: "e.hour", label: tr("ui_hour"), kind: ctlStepper, value: hourText(a.Hour)},
+			{id: "e.minute", label: tr("ui_minute"), kind: ctlStepper, value: fmt.Sprintf(":%02d", a.Minute)},
+			{id: "e.repeat", label: tr("repeat"), kind: ctlChoice, value: repeatName(a.Days)},
+			{id: "e.days", label: tr("ui_days"), kind: ctlDays, days: a.Days},
 		},
 	}
 	// A reminder is nobody waking up, so it has no light of its own to choose.
 	if !a.Remind {
-		v.rows = append(v.rows, settingRow{id: "e.sunrise", label: "Wake with light", kind: ctlChoice, value: alarmSunriseValue(a)})
+		v.rows = append(v.rows, settingRow{id: "e.sunrise", label: tr("wake_with_light"), kind: ctlChoice, value: alarmSunriseValue(a)})
+		// A silent alarm is Home Assistant's, set there; it has no light to be only.
+		if !a.Silent {
+			v.rows = append(v.rows, settingRow{id: "e.lightonly", label: tr("ui_light_only"),
+				sub: tr("ui_no_sound_the_light_then_the_night_ends"), kind: ctlToggle, on: a.LightOnly})
+		}
 	}
 	if !d.isNew {
-		del := settingRow{id: "e.delete", label: "Delete alarm", sub: "Asks twice", kind: ctlDanger, button: "Delete"}
+		del := settingRow{id: "e.delete", label: tr("ui_delete_alarm"), sub: tr("asks_twice"), kind: ctlDanger, button: tr("ui_delete")}
 		if !d.deleteArm.IsZero() && sv.now.Sub(d.deleteArm) < restartWindow {
-			del.sub, del.button = "Tap again to delete it", "Confirm"
+			del.sub, del.button = tr("ui_tap_again_to_delete_it"), tr("ui_confirm")
 		}
 		v.rows = append(v.rows, del)
 	}
@@ -180,10 +211,34 @@ func alarmEditorCard(sv sheetView, d alarmDraft) cardView {
 func repeatName(days uint8) string {
 	for i, r := range repeats {
 		if r == days {
-			return repeatNames[i]
+			return repeatLabels()[i]
 		}
 	}
-	return "Custom"
+	return tr("ui_custom")
+}
+
+// daysLabel is config.DaysLabel in the screen's language: "every day", "weekdays", or the days' short
+// names.
+func daysLabel(days uint8) string {
+	switch days & config.DaysEvery {
+	case config.DaysOnce:
+		return tr("days_once")
+	case config.DaysEvery:
+		return tr("days_every_day")
+	case config.DaysWeekdays:
+		return tr("days_weekdays")
+	case config.DaysWeekends:
+		return tr("days_weekends")
+	}
+	// 2023-01-01 was a Sunday, the first of config's days.
+	sunday := time.Date(2023, time.January, 1, 12, 0, 0, 0, time.UTC)
+	var out []string
+	for i := range 7 {
+		if days&(1<<i) != 0 {
+			out = append(out, locale.ShortWeekday(sunday.AddDate(0, 0, i), screenLang()))
+		}
+	}
+	return strings.Join(out, " ")
 }
 
 func capitalize(s string) string {
@@ -192,7 +247,7 @@ func capitalize(s string) string {
 	}
 	// By letter, not byte: a name like élodie starts with two bytes.
 	r, size := utf8.DecodeRuneInString(s)
-	return string(unicode.ToUpper(r)) + s[size:]
+	return string(locale.UpperRune(screenLang(), r)) + s[size:]
 }
 
 // dayWord is when t falls, from now: Today, Tomorrow, or the weekday within the week.
@@ -202,13 +257,25 @@ func dayWord(t, now time.Time) string {
 	days := int(time.Date(y2, m2, d2, 0, 0, 0, 0, time.UTC).Sub(time.Date(y1, m1, d1, 0, 0, 0, 0, time.UTC)).Hours() / 24)
 	switch {
 	case days == 0:
-		return "Today"
+		return tr("today")
 	case days == 1:
-		return "Tomorrow"
+		return tr("tomorrow")
 	case days > 1 && days < 7:
-		return t.Weekday().String()
+		return locale.Weekday(t, screenLang())
+	}
+	if lang := screenLang(); lang != "" && lang != "en" {
+		return locale.MonthDay(t, lang)
 	}
 	return t.Format("Jan 2")
+}
+
+// alarmWhen is config's Alarm.When in the screen's language: the date of a dated one-off, the days
+// otherwise.
+func alarmWhen(a config.Alarm) string {
+	if t, ok := a.OnDate(); ok {
+		return locale.ShortDate(t, screenLang())
+	}
+	return daysLabel(a.Days)
 }
 
 // actionTap is a button in the card's header.
@@ -236,8 +303,8 @@ func (d *Display) actionTap(id string) {
 		var err error
 		if dr.isNew {
 			var al config.Alarm
-			if al, err = alarm.Get().Set(a.Hour, a.Minute, a.Days, a.Label); err == nil && al.Sunrise != a.Sunrise {
-				al.Sunrise = a.Sunrise
+			if al, err = alarm.Get().Set(a.Hour, a.Minute, a.Days, a.Label); err == nil && (al.Sunrise != a.Sunrise || al.LightOnly != a.LightOnly) {
+				al.Sunrise, al.LightOnly = a.Sunrise, a.LightOnly
 				err = alarm.Get().Put(al)
 			}
 		} else {
@@ -313,7 +380,7 @@ func (d *Display) alarmRowTap(id string, p part, opt int) bool {
 		case partPlus:
 			alarm.Get().SetRingVolume(n+1, true)
 		}
-	case "alarmsound", "e.repeat", "e.sunrise":
+	case "alarmsound", "alarmwords", "alarmrise", "e.repeat", "e.sunrise":
 		d.openPicker(id)
 	case "e.hour":
 		d.editDraft(func(dr *alarmDraft) {
@@ -337,6 +404,8 @@ func (d *Display) alarmRowTap(id string, p part, opt int) bool {
 		if p == partDay && opt >= 0 && opt < 7 {
 			d.editDraft(func(dr *alarmDraft) { dr.alarm.Days ^= 1 << opt })
 		}
+	case "e.lightonly":
+		d.editDraft(func(dr *alarmDraft) { dr.alarm.LightOnly = !dr.alarm.LightOnly })
 	case "e.delete":
 		d.mu.Lock()
 		dr := d.draft

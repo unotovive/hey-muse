@@ -13,6 +13,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/HuskerMinion/techo5/echod/internal/config"
@@ -77,6 +78,20 @@ type Stream struct {
 	holds  int
 	paused bool
 
+	// pauseTaken is when the sender of the received track took the listener's pause (pauseTook), zero
+	// until it has: a pause waits for its turn to reach the sender, and can take seconds to.
+	pauseTaken time.Time
+
+	// pauses counts the pauses that took effect, so a sender's late answer to one pause is not taken
+	// as its answer to a later one (pauseTook). bySender is the pause in effect being the sender's own
+	// (ReceiverPaused), not the listener's here (senderPlaysAgain).
+	pauses   uint64
+	bySender bool
+
+	// senderPlays is told a received track's sender that paused on its own is heard playing again
+	// (playingAgain); nil leaves it paused. Set once, before anything plays.
+	senderPlays func(name string)
+
 	// duckHeld is whether the duck was the thing that suspended, which only happens when the setting
 	// says pause. Ending the duck must not release a hold that a reply put there.
 	duckHeld bool
@@ -107,16 +122,26 @@ type track struct {
 	cancel context.CancelFunc
 	// received is audio a remote is sending (PlayPCM), not a url or a generator.
 	received bool
+	// live is a url the radio feature said is a live station when it started (SetLive), or as it
+	// started (MarkLive): fetched again when it drops, and given up on sooner when it goes quiet
+	// (resume.go).
+	live atomic.Bool
 
 	// heard closes when the track's first samples go to the speaker, and done when it has stopped for
 	// good, with failed saying why if it failed: how a caller that has to answer whether it is playing
 	// (the voice assistant) finds out, rather than taking the start for the sound.
 	heard, done chan struct{}
 	failed      error
+	// heardOnce closes heard: a resumed live stream (resume.go) fetches again, and arrives again.
+	heardOnce sync.Once
 
 	// handOff is a track Play started, whose url goes to the stream's handOff if it cannot be decoded.
 	// PlayChecked's caller is waiting for the answer, and hands it on itself.
 	handOff bool
+
+	// title is what Home Assistant named it before it was played (media_title), nil for none. It is the
+	// track's, so it goes when the track does.
+	title *Title
 
 	// ask is the stream's asks when this track was started.
 	ask uint64
@@ -193,11 +218,29 @@ func (m *Stream) Duck(db int) {
 //
 // It does not take the speaker from a reply or an announcement that is sounding. Those are seconds
 // long and end on their own, and the track waits behind them rather than talking over them.
-func (m *Stream) Play(url string) { m.play(url, true) }
+func (m *Stream) Play(url string) { m.play(url, true, nil) }
 
 // PlayOnly is Play for a url the device must play itself or not at all: never handed to the music
 // library when it cannot be decoded.
-func (m *Stream) PlayOnly(url string) { m.play(url, false) }
+func (m *Stream) PlayOnly(url string) { m.play(url, false, nil) }
+
+// PlayTitled is PlayOnly for a url Home Assistant named first (media_title): title goes with the track,
+// for the screen and the sensors, for as long as it is loaded. A nil title is PlayOnly.
+func (m *Stream) PlayTitled(url string, title *Title) { m.play(url, false, title) }
+
+// Title is what the loaded track was named, playing or paused; nil when it was not named or nothing is
+// loaded.
+func (m *Stream) Title() *Title {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.track == nil {
+		return nil
+	}
+	return m.track.title
+}
 
 // PlayChecked starts a url as Play does and waits, up to within, for audio the device can play to arrive
 // from it: nil once it has, or why it did not. A station that does not play says so, rather than the
@@ -205,7 +248,13 @@ func (m *Stream) PlayOnly(url string) { m.play(url, false) }
 // (the assistant asking for the station is one) would otherwise hold the answer until after it is given.
 // One that does not arrive in time is stopped, so it cannot start later with nobody expecting it.
 func (m *Stream) PlayChecked(url string, within time.Duration) error {
-	t := m.play(url, false)
+	return m.PlayTitledChecked(url, nil, within)
+}
+
+// PlayTitledChecked is PlayChecked for a url named by the device itself, like a news update: title goes
+// with the track, as PlayTitled's does.
+func (m *Stream) PlayTitledChecked(url string, title *Title, within time.Duration) error {
+	t := m.play(url, false, title)
 	if t == nil {
 		return errors.New("this device has no speaker")
 	}
@@ -237,14 +286,17 @@ func (m *Stream) drop(t *track) {
 	t.stop()
 }
 
-func (m *Stream) play(url string, handOff bool) *track {
+func (m *Stream) play(url string, handOff bool, title *Title) *track {
 	if m == nil {
 		slog.Warn("asked to play media with no speaker", "url", url)
 		return nil
 	}
 
-	t, ctx := m.start(&track{item: url, heard: make(chan struct{}), done: make(chan struct{}), handOff: handOff})
-	slog.Info("playing media", "url", url)
+	live := liveURL(url)
+	t := &track{item: url, heard: make(chan struct{}), done: make(chan struct{}), handOff: handOff, title: title}
+	t.live.Store(live)
+	t, ctx := m.start(t)
+	slog.Info("playing media", "url", url, "live", live)
 
 	safe.Go("media", func() {
 		itself := false
@@ -260,7 +312,16 @@ func (m *Stream) play(url string, handOff bool) *track {
 			// Canceled means stopped or replaced, which is somebody's doing and nobody's to undo.
 			m.finished(t, itself)
 		}()
-		err := m.run(ctx, t, url)
+		// Live radio that drops is fetched again as the same track (resume.go).
+		var err error
+		var again resumes
+		for {
+			began := time.Now()
+			err = m.run(ctx, t, url)
+			if !resume(ctx, t.live.Load(), err, time.Since(began), &again) {
+				break
+			}
+		}
 		if err != nil && ctx.Err() == nil {
 			slog.Error("playing media failed", "err", err)
 			t.failed = err
@@ -321,6 +382,27 @@ func (m *Stream) Noise() []string {
 	return m.track.sounds
 }
 
+// markLive makes the track playing now live radio (track.live), if it is url and still playing: the
+// radio feature found out it is a station only as it started (MarkLive). It says whether it was.
+func (m *Stream) markLive(url string) bool {
+	if m == nil || url == "" {
+		return false
+	}
+	m.mu.Lock()
+	t := m.track
+	m.mu.Unlock()
+	if t == nil || t.item != url {
+		return false
+	}
+	select {
+	case <-t.done:
+		return false
+	default:
+	}
+	t.live.Store(true)
+	return true
+}
+
 // start makes a track the one being played, dropping whatever was.
 func (m *Stream) start(t *track) (*track, context.Context) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -330,7 +412,7 @@ func (m *Stream) start(t *track) (*track, context.Context) {
 	m.asks++
 	t.ask = m.asks
 	previous := m.track
-	m.track, m.paused, m.rewind = t, false, nil
+	m.track, m.paused, m.bySender, m.rewind = t, false, false, nil
 	if m.holds == 0 {
 		m.unblock()
 	} else {
@@ -350,8 +432,16 @@ func (m *Stream) start(t *track) (*track, context.Context) {
 }
 
 // Pause stops the track where it is. What was queued but not heard is kept, so resuming does not
-// skip it.
-func (m *Stream) Pause() {
+// skip it. A phone's over Bluetooth that is told of the pause (ReceiverControl) is the exception: the
+// phone stops where it is and plays on from there, so what was queued here is a tail it plays again
+// after a gap, the time the phone takes to start sending once more. It is dropped instead.
+func (m *Stream) Pause() { m.pause(false) }
+
+// senderPause is Pause for the received track's sender pausing on its own (ReceiverPaused). A track
+// the listener already paused stays the listener's pause.
+func (m *Stream) senderPause() { m.pause(true) }
+
+func (m *Stream) pause(bySender bool) {
 	if m == nil {
 		return
 	}
@@ -361,47 +451,79 @@ func (m *Stream) Pause() {
 		m.mu.Unlock()
 		return
 	}
-	m.paused = true
+	m.paused, m.bySender = true, bySender
+	m.pauses++
+	m.pauseTaken = time.Time{}
 	m.block()
 	ours := m.holds == 0
+	live := m.track.received && strings.HasPrefix(m.track.item, BluetoothPrefix) &&
+		receiverControl(m.track.item) != nil
+	if live {
+		m.rewind = nil
+	}
 	m.mu.Unlock()
 
-	if ours {
+	switch {
+	case ours && live:
+		m.flush()
+	case ours:
 		m.keep()
 	}
 	m.changed()
 }
 
 // Unpause carries on from where Pause stopped.
-func (m *Stream) Unpause() {
+func (m *Stream) Unpause() { m.unpauseIf(nil) }
+
+// unpauseIf is Unpause if ok, given the track loaded and whether its pause is the sender's own, says
+// so, looked at in the same hold of mu; it says whether it unpaused.
+func (m *Stream) unpauseIf(ok func(t *track, bySender bool) bool) bool {
 	if m == nil {
-		return
+		return false
 	}
 
 	m.mu.Lock()
-	if m.track == nil || !m.paused {
+	if m.track == nil || !m.paused || (ok != nil && !ok(m.track, m.bySender)) {
 		m.mu.Unlock()
-		return
+		return false
 	}
-	m.paused = false
+	m.paused, m.bySender = false, false
 	if m.holds == 0 {
 		m.unblock()
 	}
 	m.mu.Unlock()
 
 	m.changed()
+	return true
 }
 
 // Stop ends the track. There is nothing to come back to afterwards.
-func (m *Stream) Stop() {
+func (m *Stream) Stop() { m.stopIf(nil) }
+
+// stopPaused ends the received track named name if it is the one loaded and the listener has it
+// paused, and says whether it did. It is looked at and ended in one hold of mu, so a play or another
+// track that comes just before is not undone.
+func (m *Stream) stopPaused(name string) bool {
+	return m.stopIf(func(t *track, paused bool) bool {
+		return t != nil && t.received && t.item == name && paused
+	})
+}
+
+// stopIf ends the track if ok, given it (nil with none loaded) and whether it is paused, says so, and
+// says whether it did; a nil ok ends it whatever it is.
+func (m *Stream) stopIf(ok func(t *track, paused bool) bool) bool {
 	if m == nil {
-		return
+		return false
 	}
 
 	m.mu.Lock()
-	m.asks++
 	t := m.track
-	m.track, m.paused, m.rewind = nil, false, nil
+	if ok != nil && !ok(t, m.paused) {
+		m.mu.Unlock()
+		return false
+	}
+	m.asks++
+	m.track, m.paused, m.bySender, m.rewind = nil, false, false, nil
 	m.forget()
 	m.unblock()
 	m.mu.Unlock()
@@ -409,11 +531,12 @@ func (m *Stream) Stop() {
 	m.bg.Gave(m)
 
 	if t == nil {
-		return
+		return false
 	}
 	t.stop()
 	m.flush()
 	m.changed()
+	return true
 }
 
 // Suspend implements speaker.Background: something else wants the speaker.
@@ -544,7 +667,7 @@ func (m *Stream) finished(t *track, itself bool) {
 		m.mu.Unlock()
 		return
 	}
-	m.track, m.paused, m.rewind = nil, false, nil
+	m.track, m.paused, m.bySender, m.rewind = nil, false, false, nil
 	m.forget()
 	m.unblock()
 	m.mu.Unlock()
@@ -571,6 +694,15 @@ func (m *Stream) run(ctx context.Context, t *track, url string) error {
 	// retrying — minutes of a player reporting that it is playing while nothing comes out.
 	fetch, giveUp := context.WithCancel(ctx)
 	defer giveUp()
+	// Live radio is fetched again when it drops (resume.go), so a station gone quiet is given up on
+	// sooner than a track would be: the sooner it is fetched again, the shorter the gap. Asked at every
+	// read, since a track can be found to be a station after it has started (MarkLive).
+	limit := func() time.Duration {
+		if t.live.Load() {
+			return liveStall
+		}
+		return stall
+	}
 
 	req, err := http.NewRequestWithContext(fetch, http.MethodGet, url, nil)
 	if err != nil {
@@ -588,12 +720,13 @@ func (m *Stream) run(ctx context.Context, t *track, url string) error {
 	}
 
 	body := bufio.NewReaderSize(resp.Body, chunk)
-	watchdog := time.AfterFunc(stall, giveUp) // an MP3's first frame is read here, before the loop's own
+	waited := limit()
+	watchdog := time.AfterFunc(waited, giveUp) // an MP3's first frame is read here, before the loop's own
 	src, err := pcmSource(body, resp.Header.Get("Content-Type"))
 	watchdog.Stop()
 	if err != nil {
 		if fetch.Err() != nil && ctx.Err() == nil {
-			return fmt.Errorf("nothing arrived for %s", stall)
+			return fmt.Errorf("nothing arrived for %s", waited)
 		}
 		return err
 	}
@@ -603,7 +736,8 @@ func (m *Stream) run(ctx context.Context, t *track, url string) error {
 	for {
 		// Armed only around the read: a track waiting for a turn to finish is not stalled, and
 		// counting that time would end it for being interrupted.
-		watchdog := time.AfterFunc(stall, giveUp)
+		waited = limit()
+		watchdog := time.AfterFunc(waited, giveUp)
 		n, err := io.ReadFull(src, buf)
 		watchdog.Stop()
 
@@ -612,7 +746,7 @@ func (m *Stream) run(ctx context.Context, t *track, url string) error {
 			// the speaker is free to take it yet.
 			if !arrived && t.heard != nil {
 				arrived = true
-				close(t.heard)
+				t.heardOnce.Do(func() { close(t.heard) })
 			}
 			// Read ahead of the wait by one chunk, so the answer does not wait on the speaker; the
 			// queue still takes no more than it has room for.
@@ -626,11 +760,18 @@ func (m *Stream) run(ctx context.Context, t *track, url string) error {
 		case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
 			return m.settle(ctx)
 		case fetch.Err() != nil && ctx.Err() == nil:
-			return fmt.Errorf("nothing arrived for %s", stall)
+			return fmt.Errorf("nothing arrived for %s", waited)
 		default:
 			return err
 		}
 	}
+}
+
+// held is whether the track may not go on now: paused, or the speaker taken by a reply (wait).
+func (m *Stream) held() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.gate != nil
 }
 
 // wait holds the stream until it may play and the queue has room for more.

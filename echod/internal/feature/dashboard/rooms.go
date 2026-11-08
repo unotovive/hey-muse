@@ -10,6 +10,8 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/HuskerMinion/techo5/echod/internal/feature/home"
 	"github.com/HuskerMinion/techo5/echod/internal/lib/hass"
@@ -154,11 +156,11 @@ func tileOf(e hass.LiveEntity, room string) (Tile, bool) {
 
 // describe is how any entity looks as a tile: its icon, its name, and its state in words, with the
 // tap that suits it. Locks and thermostats get none: a tap is too easy to make by accident for a
-// front door, and a thermostat wants more than on and off.
+// front door, and a thermostat wants more than on and off (the screen opens its sheet instead).
 func describe(e hass.LiveEntity, name string) Tile {
 	domain, _, _ := strings.Cut(e.ID, ".")
 	class, _ := e.Attrs["device_class"].(string)
-	t := Tile{Name: name}
+	t := Tile{Entity: e.ID, Name: name}
 	on := e.State == "on" || e.State == "open" || e.State == "opening" || e.State == "playing" ||
 		e.State == "unlocked" || e.State == "heat" || e.State == "cool" || e.State == "heat_cool" || e.State == "home"
 	t.On = on
@@ -182,7 +184,9 @@ func describe(e hass.LiveEntity, name string) Tile {
 		t.Value = climateValue(e)
 	case "media_player":
 		t.Value = title(e.State)
-		if e.State == "playing" || e.State == "paused" {
+		// Idle too: Music Assistant stops a group it cannot pause, and a play then takes its queue up
+		// again (transportTo); a speaker with nothing to go on simply does nothing.
+		if e.State == "playing" || e.State == "paused" || e.State == "idle" {
 			t.Tap = toggle("media_player.media_play_pause")
 		}
 		t.On = e.State == "playing"
@@ -272,12 +276,23 @@ func nameOf(e hass.LiveEntity, room string) string {
 	if name == "" {
 		_, name, _ = strings.Cut(e.ID, ".")
 	}
-	if len(name) > len(room)+1 && strings.EqualFold(name[:len(room)], room) {
-		if rest := strings.TrimLeft(name[len(room):], " -:"); rest != "" {
-			name = strings.ToUpper(rest[:1]) + rest[1:]
-		}
+	return withoutRoom(name, room)
+}
+
+// withoutRoom is name without room in front of it, its first letter made a capital: under Kitchen,
+// "Kitchen ceiling light" is "Ceiling light". Only a whole word or words: "Kitchenette light" stays
+// as it is, and so does a name that is nothing but the room.
+func withoutRoom(name, room string) string {
+	if room == "" || len(name) <= len(room)+1 || !strings.EqualFold(name[:len(room)], room) ||
+		!strings.ContainsRune(" -:", rune(name[len(room)])) {
+		return name
 	}
-	return name
+	rest := strings.TrimLeft(name[len(room):], " -:")
+	if rest == "" {
+		return name
+	}
+	r, size := utf8.DecodeRuneInString(rest)
+	return string(unicode.ToUpper(r)) + rest[size:]
 }
 
 func onOff(s string) string {
@@ -424,8 +439,11 @@ func iconOf(e hass.LiveEntity, domain, class string, on bool) string {
 	return "help-circle-outline"
 }
 
+// volumeSet is MediaPlayerEntityFeature.VOLUME_SET.
+const volumeSet = 4
+
 // adjustOf is the level a finger sliding along the entity's tile sets, if it has one: a light that
-// dims, a cover that stops part way, a thermostat's temperature.
+// dims, a cover that stops part way, a thermostat's temperature, a fan's speed, a media player's volume.
 func adjustOf(e hass.LiveEntity, domain string) *Adjust {
 	switch domain {
 	case "light":
@@ -455,19 +473,24 @@ func adjustOf(e hass.LiveEntity, domain string) *Adjust {
 		if !ok {
 			return nil
 		}
-		lo, _ := e.Attrs["min_temp"].(float64)
-		hi, _ := e.Attrs["max_temp"].(float64)
-		step, _ := e.Attrs["target_temp_step"].(float64)
-		if hi <= lo {
-			lo, hi = t-10, t+10
-		}
-		if step <= 0 {
-			step = 0.5
-			if hi > 40 {
-				step = 1 // Fahrenheit
-			}
-		}
+		lo, hi, step := climateLimits(e, t)
 		return &Adjust{Entity: e.ID, Kind: "temperature", Value: t, Min: lo, Max: hi, Step: step}
+	case "fan":
+		// A fan that takes a speed (set speed): a slide sets it, on the steps it says it takes.
+		n := fanNow(e)
+		if !n.HasSpeed {
+			return nil
+		}
+		return &Adjust{Entity: e.ID, Kind: "speed", Value: n.Percentage, Min: 0, Max: 100, Step: n.Step}
+	case "media_player":
+		// Only a player that says its volume and takes one (MediaPlayerEntityFeature.VOLUME_SET): one
+		// that is off says none, and a slide would set nothing anybody could see.
+		vol, ok := e.Attrs["volume_level"].(float64)
+		features, _ := e.Attrs["supported_features"].(float64)
+		if !ok || int(features)&volumeSet == 0 {
+			return nil
+		}
+		return &Adjust{Entity: e.ID, Kind: "volume", Value: vol * 100, Min: 0, Max: 100, Step: 1}
 	}
 	return nil
 }

@@ -4,6 +4,7 @@ package display
 
 import (
 	"image"
+	"image/color"
 	"image/draw"
 
 	"github.com/HuskerMinion/techo5/echod/internal/feature/video"
@@ -39,9 +40,9 @@ func (r *renderer) videoPage(s scene) (over image.Rectangle) {
 	r.videoZones = nil
 	r.zmu.Unlock()
 	if s.videoLive {
-		draw.Draw(r.dst, r.dst.Rect, image.Transparent, image.Point{}, draw.Src)
+		fillCanvas(r.dst, color.Transparent)
 	} else {
-		draw.Draw(r.dst, r.dst.Rect, image.Black, image.Point{}, draw.Src)
+		fillCanvas(r.dst, color.Black)
 		r.videoWords(s)
 	}
 	if s.videoControls && s.video.Active() {
@@ -49,7 +50,7 @@ func (r *renderer) videoPage(s scene) (over image.Rectangle) {
 	}
 	if s.showVolume {
 		r.volumeBar(s)
-		over = over.Union(image.Rect(0, r.h-110, r.w, r.h))
+		over = over.Union(image.Rect(0, r.h-r.s(volumeBarH), r.w, r.h))
 	}
 	return over
 }
@@ -64,9 +65,9 @@ func (r *renderer) videoWords(s scene) {
 	if s.demo && name != "" {
 		name = "A film"
 	}
-	head, sub := "Loading video…", name
+	head, sub := tr("loading_video"), name
 	if !v.Active() && v.Err != "" {
-		head, sub = "This video can't be played", v.Err
+		head, sub = tr("ui_this_video_can_t_be_played"), v.Err
 		if s.demo {
 			sub = "Server returned 404 Not Found"
 		}
@@ -85,7 +86,7 @@ func (r *renderer) videoWords(s scene) {
 		r.text(r.small, l, (r.w-r.width(r.small, l))/2, cy+r.s(56)+i*r.s(42), dim)
 	}
 	if !v.Active() {
-		hint := "Tap to go back"
+		hint := tr("tap_to_go_back")
 		r.text(r.tiny, hint, (r.w-r.width(r.tiny, hint))/2, r.h-r.s(40), dim)
 	}
 }
@@ -129,7 +130,7 @@ func (r *renderer) videoControls(s scene) image.Rectangle {
 		at += " / " + videoTime(s.video.Dur)
 	}
 	if s.video.Phase == video.Loading || !s.video.Frames {
-		at = "Loading…"
+		at = tr("ui_loading")
 	}
 	mid := strip.Min.Y + strip.Dy()/2
 	r.text(r.small, r.fit(r.small, name, right-left), left, mid-r.s(4), cream)
@@ -172,7 +173,7 @@ func (r *renderer) videoAskPage(s scene) {
 	rad := float64(r.s(actionRadius))
 	mid := (no.Min.Y + no.Max.Y) / 2
 	fg := r.buttonFace(no, rad, btnSecondary)
-	r.text(r.body, "Not now", no.Min.X+(no.Dx()-r.width(r.body, "Not now"))/2, mid+r.s(14), fg)
+	r.text(r.body, tr("not_now"), no.Min.X+(no.Dx()-r.width(r.body, tr("not_now")))/2, mid+r.s(14), fg)
 	fg = r.buttonFace(yes, rad, btnPrimary)
-	r.text(r.title, "Allow", yes.Min.X+(yes.Dx()-r.width(r.title, "Allow"))/2, mid+r.s(16), fg)
+	r.text(r.title, tr("ui_allow"), yes.Min.X+(yes.Dx()-r.width(r.title, tr("ui_allow")))/2, mid+r.s(16), fg)
 }

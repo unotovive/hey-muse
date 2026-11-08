@@ -2,6 +2,7 @@ package alsa
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -28,8 +29,12 @@ const (
 	elemValueSize = valueDataOff + 128*longSize + 128 // 1224
 
 	idNumidOff = 0
+	idIfaceOff = 4
 	idNameOff  = 16
 	idNameLen  = 44
+
+	// ifaceMixer is SNDRV_CTL_ELEM_IFACE_MIXER, where every control this package writes lives.
+	ifaceMixer = 2
 
 	infoTypeOff  = elemIDSize
 	infoCountOff = elemIDSize + 8
@@ -121,6 +126,10 @@ func (m *Mixer) Controls() ([]Control, error) {
 	return out, nil
 }
 
+// ErrNoControl is Find's answer for a mixer read whole without the control asked for, as opposed to
+// one that could not be read.
+var ErrNoControl = errors.New("alsa: no control")
+
 // Find looks a control up by name.
 func (m *Mixer) Find(name string) (Control, error) {
 	controls, err := m.Controls()
@@ -132,7 +141,24 @@ func (m *Mixer) Find(name string) (Control, error) {
 			return c, nil
 		}
 	}
-	return Control{}, fmt.Errorf("alsa: no control named %q", name)
+	return Control{}, fmt.Errorf("%w named %q", ErrNoControl, name)
+}
+
+// Lookup finds one mixer control by name and asks the card about that one only, where Find walks
+// every control on the card first. On a card where touching the wrong control has side effects (the
+// 2nd gen Echo Show 8's, whose list holds timestamp and playback-state controls), a lookup is the way
+// to be sure nothing else is read.
+func (m *Mixer) Lookup(name string) (Control, error) {
+	if len(name) >= idNameLen {
+		return Control{}, fmt.Errorf("alsa: control name %q is too long", name)
+	}
+	var buf [elemInfoSize]byte
+	binary.LittleEndian.PutUint32(buf[idIfaceOff:], ifaceMixer)
+	copy(buf[idNameOff:], name)
+	if err := ioctl(m.f.Fd(), ioctlElemInfo, unsafe.Pointer(&buf)); err != nil {
+		return Control{}, fmt.Errorf("alsa: no control named %q: %w", name, err)
+	}
+	return m.decodeInfo(&buf)
 }
 
 // info reads a control's metadata, including the names of an enumerated control's items.
@@ -142,7 +168,12 @@ func (m *Mixer) info(numid uint32) (Control, error) {
 	if err := ioctl(m.f.Fd(), ioctlElemInfo, unsafe.Pointer(&buf)); err != nil {
 		return Control{}, err
 	}
+	return m.decodeInfo(&buf)
+}
 
+// decodeInfo reads the answer to an info request, and the item names of an enumerated control.
+func (m *Mixer) decodeInfo(buf *[elemInfoSize]byte) (Control, error) {
+	numid := binary.LittleEndian.Uint32(buf[idNumidOff:])
 	c := Control{
 		Numid: numid,
 		Name:  cstr(buf[idNameOff : idNameOff+idNameLen]),
@@ -216,13 +247,32 @@ func valueWidth(typ uint32) int {
 	return longSize // long value[128]
 }
 
+// putValue stores one value of a control of type typ at the stride valueWidth gives. An integer or
+// boolean control's slot is the kernel's long, and on arm64 that is 64 bits: the value is
+// sign-extended into it, because the 32-bit pattern of a negative level with its high half left zero
+// would reach the kernel as a large positive number instead. On a 32-bit build the long is the 32 bits
+// themselves. Get reads the low half back, the same 32-bit pattern on either ABI. A 64-bit control
+// keeps what it always had, the value zero-extended.
+func putValue(b []byte, typ uint32, v uint32) {
+	switch w := valueWidth(typ); {
+	case w == 1:
+		b[0] = byte(v)
+	case w == 8 && typ != TypeInteger64:
+		binary.LittleEndian.PutUint64(b, uint64(int64(int32(v))))
+	case w == 8:
+		binary.LittleEndian.PutUint64(b, uint64(v))
+	default:
+		binary.LittleEndian.PutUint32(b, v)
+	}
+}
+
 // Set writes the same value to every channel of a control.
 func (m *Mixer) Set(c Control, v uint32) error {
 	var buf [elemValueSize]byte
 	binary.LittleEndian.PutUint32(buf[idNumidOff:], c.Numid)
-	w := uint32(valueWidth(c.Type))
-	for i := uint32(0); i < c.Count; i++ {
-		binary.LittleEndian.PutUint32(buf[valueDataOff+i*w:], v)
+	w := valueWidth(c.Type)
+	for i := 0; i < int(c.Count); i++ {
+		putValue(buf[valueDataOff+i*w:], c.Type, v)
 	}
 	if err := ioctl(m.f.Fd(), ioctlElemWrite, unsafe.Pointer(&buf)); err != nil {
 		return fmt.Errorf("alsa: writing %q: %w", c.Name, err)
@@ -241,11 +291,7 @@ func (m *Mixer) SetAll(c Control, values []uint32) error {
 	binary.LittleEndian.PutUint32(buf[idNumidOff:], c.Numid)
 	w := valueWidth(c.Type)
 	for i, v := range values {
-		if w == 1 {
-			buf[valueDataOff+i] = byte(v)
-			continue
-		}
-		binary.LittleEndian.PutUint32(buf[valueDataOff+i*w:], v)
+		putValue(buf[valueDataOff+i*w:], c.Type, v)
 	}
 	if err := ioctl(m.f.Fd(), ioctlElemWrite, unsafe.Pointer(&buf)); err != nil {
 		return fmt.Errorf("alsa: writing %q: %w", c.Name, err)

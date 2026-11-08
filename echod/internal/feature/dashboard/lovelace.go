@@ -3,9 +3,11 @@
 package dashboard
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"html"
+	"image/color"
 	"math"
 	"regexp"
 	"strconv"
@@ -83,7 +85,7 @@ func (l *lovelaceSource) load(ctx context.Context, live *hass.Live) (needs, erro
 				if len(nodes) == 0 {
 					continue
 				}
-				if vis := c.conditions(sm["visibility"]); len(vis) > 0 {
+				if vis := c.conditions(sm["visibility"], ""); len(vis) > 0 {
 					nodes = []node{condNode{conds: vis, child: group(nodes)}}
 				}
 				sects = append(sects, nodes)
@@ -99,10 +101,33 @@ func (l *lovelaceSource) load(ctx context.Context, live *hass.Live) (needs, erro
 			}
 		}
 	}
+	// A view of one picture fills the screen with it (the display's lonePicture): kept as wide as the
+	// screen, not a card, so it is not stretched.
+	if len(sects) == 1 && len(sects[0]) == 1 {
+		if n, w, ok := widePicture(sects[0][0]); ok {
+			sects[0][0], c.need.pictures = n, []wanted{w}
+		}
+	}
 	l.mu.Lock()
 	l.sects, l.fallback = sects, nil
 	l.mu.Unlock()
 	return c.need, nil
+}
+
+// widePicture is a picture card, behind its visibility conditions or not, kept as wide as the screen,
+// and the picture it now wants; false for any other card.
+func widePicture(n node) (node, wanted, bool) {
+	switch v := n.(type) {
+	case pictureNode:
+		v.want.wide = true
+		return v, v.want, true
+	case condNode:
+		if child, w, ok := widePicture(v.child); ok {
+			v.child = child
+			return v, w, true
+		}
+	}
+	return nil, wanted{}, false
 }
 
 func (l *lovelaceSource) sections(lk look) []Section {
@@ -115,8 +140,16 @@ func (l *lovelaceSource) sections(lk look) []Section {
 	var out []Section
 	for _, nodes := range sects {
 		var blocks []Block
+		under := lk
+		under.room = ""
 		for _, n := range nodes {
-			blocks = append(blocks, n.blocks(lk)...)
+			got := n.blocks(under)
+			for _, b := range got {
+				if b.Heading != "" {
+					under.room = b.Heading
+				}
+			}
+			blocks = append(blocks, got...)
 		}
 		// Tiles one after another make one grid, however many cards they came from: a section of
 		// tile cards is one grid in Home Assistant too.
@@ -221,7 +254,9 @@ func (c *compiler) card(card raw) node {
 	if n == nil {
 		return nil
 	}
-	if vis := c.conditions(card["visibility"]); len(vis) > 0 {
+	// A condition naming no entity is about the card's own, when it names one as a string: Home
+	// Assistant's getConfigEntityId reads nothing else.
+	if vis := c.conditions(card["visibility"], str(card, "entity")); len(vis) > 0 {
 		return condNode{conds: vis, child: n}
 	}
 	return n
@@ -235,10 +270,10 @@ func (c *compiler) cardItself(card raw) node {
 		if title == "" {
 			title = str(card, "title")
 		}
-		return headingNode{text: c.render(title, ""), sub: c.render(str(card, "subtitle"), "")}
+		return headingNode{text: c.render(title, ""), sub: c.render(str(card, "subtitle"), ""), color: cardColorOf(card)}
 
 	case kind == "markdown":
-		return textNode{title: c.render(str(card, "title"), ""), body: c.render(str(card, "content"), "")}
+		return textNode{title: c.render(str(card, "title"), ""), body: c.render(str(card, "content"), ""), color: cardColorOf(card)}
 
 	case kind == "entities":
 		return c.rowsCard(card)
@@ -318,6 +353,9 @@ func (c *compiler) cardItself(card raw) node {
 
 	case kind == "picture-entity" || kind == "picture-glance" || kind == "picture" || kind == "picture-elements":
 		w := wanted{camera: str(card, "camera_image"), url: str(card, "image")}
+		if m, ok := card["image"].(raw); ok {
+			w.url = str(m, "media_content_id") // an image picked in the editor's media browser
+		}
 		e := str(card, "entity")
 		if w.camera == "" && w.url == "" && strings.HasPrefix(e, "camera.") {
 			w.camera = e
@@ -325,19 +363,28 @@ func (c *compiler) cardItself(card raw) node {
 		if w.camera == "" && w.url == "" {
 			return nil
 		}
+		if kind == "picture-elements" {
+			// Its picture is often the whole page, drawn as wide as the screen: kept that wide.
+			w.wide = true
+			// No band with its title across the foot, either: that is where its buttons may be.
+			c.need.pictures = append(c.need.pictures, w)
+			return pictureNode{want: w, tap: pictureTap(card, e), elements: c.elements(card["elements"], nil)}
+		}
 		c.need.pictures = append(c.need.pictures, w)
 		name := str(card, "title")
 		if name == "" {
 			name = str(card, "name")
 		}
-		return pictureNode{key: w.key(), name: name, tap: pictureTap(card, e)}
+		return pictureNode{want: w, name: name, tap: pictureTap(card, e)}
 
 	case entityCards[kind]:
 		e := str(card, "entity")
 		if e == "" {
 			// A button that only runs something: its name, its icon, what it runs.
 			if a := actionOf(card, ""); a != nil {
-				return listNode{items: []tileItem{{name: str(card, "name"), icon: str(card, "icon"), action: a, fixed: true}}}
+				wide, high := gridOf(card)
+				return listNode{items: []tileItem{{name: str(card, "name"), icon: str(card, "icon"), action: a, fixed: true,
+					wide: wide, high: high}}}
 			}
 			return nil
 		}
@@ -369,7 +416,7 @@ func (c *compiler) cardItself(card raw) node {
 		if n.child == nil {
 			return nil
 		}
-		n.conds = c.conditions(card["conditions"])
+		n.conds = c.conditions(card["conditions"], "")
 		return n
 	}
 	if kind == "" {
@@ -423,7 +470,28 @@ func (c *compiler) items(v any) []tileItem {
 // item is an entity as a card or a row presents it: its own name and icon if it gives them, and its
 // tap.
 func (c *compiler) item(m raw, entity string) tileItem {
-	return tileItem{entity: entity, name: str(m, "name"), icon: str(m, "icon"), action: actionOf(m, entity)}
+	wide, high := gridOf(m)
+	return tileItem{entity: entity, name: str(m, "name"), icon: str(m, "icon"), action: actionOf(m, entity), color: cardColorOf(m),
+		wide: wide, high: high}
+}
+
+// gridOf reads a card's grid_options. A section is 12 columns wide and a tile normally takes 6, so 12
+// (or "full") means the whole width. rows is the height in tiles, capped at four.
+func gridOf(m raw) (wide bool, high int) {
+	g, _ := m["grid_options"].(raw)
+	if g == nil {
+		return false, 0
+	}
+	switch v := g["columns"].(type) {
+	case float64:
+		wide = v >= 12
+	case string:
+		wide = v == "full"
+	}
+	if r, ok := g["rows"].(float64); ok && r > 1 {
+		high = min(int(r), 4)
+	}
+	return wide, high
 }
 
 func hoursOf(card raw, fallback int) int {
@@ -441,6 +509,12 @@ func actionOf(m raw, entity string) *Action {
 	tap, _ := m["tap_action"].(raw)
 	if tap == nil {
 		return nil
+	}
+	// Home Assistant asks first when an action carries a confirmation. There is no asking here, and
+	// one tap must not do what the dashboard's author wanted a second word for, so the card is only
+	// something to look at.
+	if c, ok := tap["confirmation"]; ok && c != nil && c != false {
+		return &Action{}
 	}
 	switch str(tap, "action") {
 	case "none":
@@ -514,19 +588,25 @@ func (g group) blocks(l look) []Block {
 	return out
 }
 
-type headingNode struct{ text, sub textRef }
+type headingNode struct {
+	text, sub textRef
+	color     color.RGBA
+}
 
 func (h headingNode) blocks(l look) []Block {
 	if t := h.text.get(l.rendered); t != "" {
-		return []Block{{Heading: t, Right: h.sub.get(l.rendered)}}
+		return []Block{{Heading: t, Right: h.sub.get(l.rendered), Color: h.color}}
 	}
 	return nil
 }
 
-type textNode struct{ title, body textRef }
+type textNode struct {
+	title, body textRef
+	color       color.RGBA
+}
 
 func (t textNode) blocks(l look) []Block {
-	b := Block{Title: t.title.get(l.rendered), Text: plainText(t.body.get(l.rendered))}
+	b := Block{Title: t.title.get(l.rendered), Text: plainText(t.body.get(l.rendered)), Color: t.color}
 	if b.Title == "" && len(b.Text) == 0 {
 		return nil
 	}
@@ -541,7 +621,10 @@ type tileItem struct {
 	entity, name, icon, value string
 	section                   string // a heading within a list instead
 	action                    *Action
-	fixed                     bool // not an entity's: drawn as given
+	color                     color.RGBA // the card's color; zero for none
+	fixed                     bool       // not an entity's: drawn as given
+	wide                      bool       // spans the whole section (gridOf)
+	high                      int        // height in tiles; 0 and 1 both mean one (gridOf)
 }
 
 // listNode is tiles.
@@ -552,12 +635,16 @@ type listNode struct {
 
 func (n listNode) blocks(l look) []Block {
 	var out []Block
+	room := l.room
 	if t := n.title.get(l.rendered); t != "" {
 		out = append(out, Block{Heading: t})
+		room = t
 	}
 	var tiles []Tile
 	for _, it := range n.items {
-		tiles = append(tiles, it.tile(l.states))
+		t := it.tile(l.states, room)
+		t.Wide, t.High = it.wide, it.high
+		tiles = append(tiles, t)
 	}
 	if len(tiles) > 0 {
 		out = append(out, Block{Tiles: tiles})
@@ -574,15 +661,17 @@ type rowsNode struct {
 func (n rowsNode) blocks(l look) []Block {
 	var out []Block
 	cur := Block{Title: n.title.get(l.rendered)}
+	room := cmp.Or(cur.Title, l.room)
 	for _, it := range n.items {
 		if it.section != "" {
 			if len(cur.Rows) > 0 || cur.Title != "" {
 				out = append(out, cur)
 			}
 			cur = Block{Title: it.section}
+			room = it.section
 			continue
 		}
-		t := it.tile(l.states)
+		t := it.tile(l.states, room)
 		t.Switch = t.Tap != nil && strings.HasSuffix(t.Tap.Service, "toggle") && (t.Value == "On" || t.Value == "Off" || strings.HasPrefix(t.Value, "On ·"))
 		cur.Rows = append(cur.Rows, t)
 	}
@@ -592,9 +681,15 @@ func (n rowsNode) blocks(l look) []Block {
 	return out
 }
 
-func (it tileItem) tile(states map[string]hass.LiveEntity) Tile {
+// tile is the item as a tile. An entity's own name, when the card gives none, is shown without the
+// room it is under in front of it (withoutRoom); a name the card gives is shown as it is.
+func (it tileItem) tile(states map[string]hass.LiveEntity, room string) Tile {
 	if it.fixed {
-		return Tile{Name: it.name, Icon: orIcon(it.icon, "gesture-tap"), Value: it.value, Tap: it.action}
+		t := Tile{Name: it.name, Icon: orIcon(it.icon, "gesture-tap"), Value: it.value, Tap: it.action}
+		if t.Tap != nil && t.Tap.Service == "" && t.Tap.View == "" {
+			t.Tap = nil // tap_action none, or one that asks first: nothing to do on a tap
+		}
+		return t
 	}
 	e, ok := states[it.entity]
 	if !ok {
@@ -606,8 +701,14 @@ func (it tileItem) tile(states map[string]hass.LiveEntity) Tile {
 		if name == "" {
 			name = it.entity
 		}
+		name = withoutRoom(name, room)
 	}
 	t := describe(e, name)
+	if it.color.A != 0 && !t.Gone {
+		if domain, _, _ := strings.Cut(it.entity, "."); t.On || !colorsOnlyWhenActive[domain] {
+			t.Color = it.color
+		}
+	}
 	if it.icon != "" {
 		t.Icon = it.icon
 	}
@@ -636,7 +737,7 @@ type templateNode struct {
 func (t templateNode) blocks(l look) []Block {
 	tile := Tile{Name: t.primary.get(l.rendered), Value: t.secondary.get(l.rendered), Icon: orIcon(t.icon.get(l.rendered), "card-text-outline")}
 	if t.item.entity != "" {
-		base := t.item.tile(l.states)
+		base := t.item.tile(l.states, l.room)
 		tile.On, tile.Tap = base.On, base.Tap
 	} else if t.item.action != nil && (t.item.action.Service != "" || t.item.action.View != "") {
 		tile.Tap = t.item.action
@@ -706,13 +807,24 @@ func (g gaugeNode) blocks(l look) []Block {
 
 // pictureNode is a camera or an image.
 type pictureNode struct {
-	key, name string
-	tap       *Action
+	want     wanted
+	name     string
+	tap      *Action
+	elements []element // a picture-elements card's
 }
 
 func (p pictureNode) picture(l look) Picture {
-	img, arrived := l.pictures[p.key]
-	return Picture{Name: p.name, Image: img, TooLarge: arrived && img == nil, Tap: p.tap}
+	sh := l.pictures[p.want.key()]
+	pic := Picture{Name: p.name, Image: sh.img, TooLarge: sh.tooLarge, Failed: sh.failed, Tap: p.tap}
+	if sh.img == nil {
+		pic.Shape = sh.size
+	}
+	for _, e := range p.elements {
+		if el, ok := e.at(l); ok {
+			pic.Elements = append(pic.Elements, el)
+		}
+	}
+	return pic
 }
 
 func (p pictureNode) blocks(l look) []Block {
@@ -738,7 +850,8 @@ type galleryNode struct {
 }
 
 // asGallery is a grid's cards as a gallery, when the grid asks for two or more columns and every
-// card in it is a picture. Anything else in it, and the grid stays as it was: its cards in turn.
+// card in it is a picture. Anything else in it, and the grid stays as it was: its cards in turn. A
+// picture with elements is not cut to a gallery's frame, which would move them off what they are on.
 func asGallery(children []node, card raw) (galleryNode, bool) {
 	cols, _ := card["columns"].(float64)
 	if cols < 2 || len(children) < 2 {
@@ -747,7 +860,7 @@ func asGallery(children []node, card raw) (galleryNode, bool) {
 	g := galleryNode{columns: int(cols)}
 	for _, n := range children {
 		p, ok := n.(pictureNode)
-		if !ok {
+		if !ok || len(p.elements) > 0 {
 			return galleryNode{}, false
 		}
 		g.pics = append(g.pics, p)
@@ -765,9 +878,11 @@ func (g galleryNode) blocks(l look) []Block {
 
 // cond is one of Home Assistant's conditions, as a conditional card and a card's visibility use
 // them: an entity's state or number, the screen's width, or several of those together. A user
-// condition is always met: the device is not signed in as anybody.
+// condition is always met: the device is not signed in as anybody. A state condition that names no
+// entity is about the card's own entity, as in Home Assistant; where the card has none (a section, a
+// conditional card) it is never met, so what it hides stays hidden rather than showing by mistake.
 type cond struct {
-	kind       string // state, numeric_state, screen, and, or, not, always
+	kind       string // state, numeric_state, screen, and, or, not, always, never
 	entity     string
 	state, not []string
 	above      *float64
@@ -777,8 +892,9 @@ type cond struct {
 }
 
 // conditions reads a list of conditions, in either of the forms Home Assistant writes them: a
-// conditional card's old {entity, state} or the {condition: ...} everything else uses.
-func (c *compiler) conditions(v any) []cond {
+// conditional card's old {entity, state} or the {condition: ...} everything else uses. host is the
+// entity of the card they belong to, for a condition that names none; "" where there is no card's own.
+func (c *compiler) conditions(v any, host string) []cond {
 	list, _ := v.([]any)
 	var out []cond
 	for _, x := range list {
@@ -793,14 +909,16 @@ func (c *compiler) conditions(v any) []cond {
 		cd := cond{kind: kind}
 		switch kind {
 		case "state":
-			cd.entity, cd.state, cd.not = str(m, "entity"), listOf(m["state"]), listOf(m["state_not"])
+			cd.entity, cd.state, cd.not = condEntity(m, host), listOf(m["state"]), listOf(m["state_not"])
 			if cd.entity == "" {
+				out = append(out, cond{kind: "never"})
 				continue
 			}
 			c.follow(cd.entity)
 		case "numeric_state":
-			cd.entity = str(m, "entity")
+			cd.entity = condEntity(m, host)
 			if cd.entity == "" {
+				out = append(out, cond{kind: "never"})
 				continue
 			}
 			c.follow(cd.entity)
@@ -813,13 +931,31 @@ func (c *compiler) conditions(v any) []cond {
 		case "screen":
 			cd.minW, cd.maxW = widths(str(m, "media_query"))
 		case "and", "or", "not":
-			cd.subs = c.conditions(m["conditions"])
+			cd.subs = c.conditions(m["conditions"], host)
 		default:
 			cd.kind = "always" // user, location and the like: nothing here to hold against
 		}
 		out = append(out, cd)
 	}
 	return out
+}
+
+// condEntity is the entity a state or numeric_state condition is about. Home Assistant's own
+// frontend reads entity_id (the form automations write) ahead of entity, and with neither takes the
+// card's own entity (host), so this does too. An entity_id that lists more than one entity names
+// none this can hold a card against.
+func condEntity(m raw, host string) string {
+	ids := listOf(m["entity_id"])
+	if len(ids) > 1 {
+		return ""
+	}
+	if len(ids) == 1 && ids[0] != "" {
+		return ids[0]
+	}
+	if e := str(m, "entity"); e != "" {
+		return e
+	}
+	return host
 }
 
 func number64(v any) (float64, bool) {
@@ -852,6 +988,9 @@ func widths(q string) (lo, hi int) {
 func (cd cond) met(l look) bool {
 	switch cd.kind {
 	case "state":
+		if len(cd.state) == 0 && len(cd.not) == 0 {
+			return false // a condition with no state to hold against, which Home Assistant does not meet
+		}
 		s := l.states[cd.entity].State
 		if len(cd.state) > 0 && !contains(cd.state, s) {
 			return false
@@ -884,6 +1023,8 @@ func (cd cond) met(l look) bool {
 			}
 		}
 		return true
+	case "never":
+		return false
 	}
 	return true
 }

@@ -81,12 +81,23 @@ func brainSection(w http.ResponseWriter, token string) {
 	 <input id="search" name="search" value="%s" placeholder="http://192.168.1.20:8888" autocomplete="off">
 	 <p class="note">To look up what the chat model cannot know: games, news, opening hours. SearXNG needs
 	  its JSON format turned on (search.formats in its settings.yml). Empty: no looking things up.</p>
+	 <label for="reader">Page reader</label>
+	 <input id="reader" name="reader" value="%s" placeholder="http://192.168.1.20:8891" autocomplete="off">
+	 <p class="note">Optional: a browser that reads pages that fill themselves in with scripts, like a
+	  store's hours (TECHO5's tools/page-reader). Used only when a page has almost no text as it comes,
+	  or the site turns the device away with an error.</p>
+	 <label for="news">News updates</label>
+	 <textarea id="news" name="news" rows="3" maxlength="2000" placeholder="City Radio https://example.com/news.xml">%s</textarea>
+	 <p class="note">Asked for the news, the assistant plays the newest episode of a news podcast. ABC News
+	  Update, Fox News Hourly Update and NPR News Now are built in. Add others here, one a line: a name,
+	  then the podcast's feed address. The first one here plays when no source is named; with none here,
+	  the assistant asks which.</p>
 	 <label for="prompt">Anything the assistant should know</label>
 	 <textarea id="prompt" name="prompt" rows="3" maxlength="2000">%s</textarea>`,
 		selected(b.Mode == config.BrainHomeAssistant), selected(b.Mode == config.BrainDirect), selected(b.Mode == config.BrainMuse),
 		html.EscapeString(b.STT), html.EscapeString(b.TTS), html.EscapeString(b.Voice), html.EscapeString(b.Language),
 		html.EscapeString(b.LLM), html.EscapeString(b.Model), keyHint(b.Key != ""), html.EscapeString(b.Search),
-		html.EscapeString(b.Prompt))
+		html.EscapeString(b.Reader), html.EscapeString(b.News), html.EscapeString(b.Prompt))
 
 	m := b.Muse
 	fmt.Fprint(w, `<p class="note"><strong>Muse</strong> answers through Meta's Muse, which hears what was
@@ -271,6 +282,8 @@ func saveBrain(r *http.Request) string {
 		LLM:      strings.TrimRight(v("llm"), "/"),
 		Model:    v("model"),
 		Search:   strings.TrimRight(v("search"), "/"),
+		Reader:   strings.TrimRight(v("reader"), "/"),
+		News:     strings.TrimSpace(strings.ReplaceAll(r.PostFormValue("news"), "\r", "")),
 		Prompt:   strings.TrimSpace(r.PostFormValue("prompt")),
 		Muse: config.Muse{Speech: config.Speech{
 			Base:  strings.TrimRight(v("speechbase"), "/"),
@@ -302,6 +315,15 @@ func saveBrain(r *http.Request) string {
 		if err != nil || (p.Scheme != "http" && p.Scheme != "https") || p.Host == "" {
 			return u.what + " should be an address like " + u.like
 		}
+	}
+	if b.Reader != "" {
+		u, err := url.Parse(b.Reader)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return "the page reader should be an address like http://192.168.1.20:8891"
+		}
+	}
+	if _, err := b.NewsSources(); err != nil {
+		return "news updates: " + err.Error()
 	}
 	if b.Mode == config.BrainDirect && (b.STT == "" || b.TTS == "" || b.LLM == "") {
 		return "answering directly needs all three: speech to text, text to speech and the chat model"

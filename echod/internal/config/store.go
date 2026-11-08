@@ -2,36 +2,42 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"sync"
+	"sync/atomic"
 
 	"github.com/HuskerMinion/techo5/echod/internal/layout"
 )
 
 // The process-wide store, at layout.StatePath. There is one device and one file, so callers use the
-// package functions rather than being handed a Store.
+// package functions rather than being handed a Store. Atomic because a test's Use swaps it while
+// goroutines another test started may still be reading it.
 var (
 	once   sync.Once
-	shared *Store
+	shared atomic.Pointer[loaded]
 )
 
-func store() *Store {
-	once.Do(func() {
-		var err error
-		shared, err = Load(layout.StatePath)
-		if err != nil {
-			loadErr = err
-		}
-	})
-	return shared
+// loaded is the store and whatever its load reported, for callers that want to log it.
+type loaded struct {
+	s   *Store
+	err error
 }
 
-// loadErr is whatever the first load reported, for callers that want to log it.
-var loadErr error
+func current() *loaded {
+	once.Do(func() {
+		s, err := Load(layout.StatePath)
+		shared.Store(&loaded{s, err})
+	})
+	return shared.Load()
+}
+
+func store() *Store { return current().s }
 
 // Get is what the device is set to.
 func Get() Config { return store().Get() }
@@ -43,10 +49,7 @@ func Set() Writer { return store().Set() }
 
 // LoadError reports a problem reading the file. Config is still usable: it starts from defaults and
 // the file is overwritten on the next change.
-func LoadError() error {
-	store()
-	return loadErr
-}
+func LoadError() error { return current().err }
 
 // Started records what echod was told at start-up.
 func Started(d Device) { store().started(d) }
@@ -54,7 +57,8 @@ func Started(d Device) { store().started(d) }
 // Use points the process-wide store at another path. For tests.
 func Use(path string) {
 	once.Do(func() {})
-	shared, loadErr = Load(path)
+	s, err := Load(path)
+	shared.Store(&loaded{s, err})
 }
 
 // Store reads and writes one file.
@@ -88,6 +92,7 @@ func Load(path string) (*Store, error) {
 	if err != nil {
 		if os.IsNotExist(err) {
 			st.c.Speaker.SoundsMoved = true // a new device starts on the new default: nothing to move
+			st.c.rescaleNightLight()        // nor a night clock level to put on the new scale
 			st.readable = true
 			return st, nil
 		}
@@ -99,6 +104,7 @@ func Load(path string) (*Store, error) {
 	_ = json.Unmarshal(b, &st.was)
 	st.c.moveSounds()
 	st.c.Brain.Muse.validate()
+	st.c.rescaleNightLight()
 
 	st.readable = true
 	return st, nil
@@ -118,10 +124,16 @@ func (st *Store) Get() Config {
 	}
 	c.Alarms.Follow = slices.Clone(st.c.Alarms.Follow)
 	c.Alarms.Snoozed = slices.Clone(st.c.Alarms.Snoozed)
+	c.Alarms.Skipped = slices.Clone(st.c.Alarms.Skipped)
+	if h := st.c.Alarms.Held; h != nil {
+		held := *h
+		c.Alarms.Held = &held
+	}
 	c.Timers.Local = slices.Clone(st.c.Timers.Local)
 	c.Screen.WorldClocks = slices.Clone(st.c.Screen.WorldClocks)
 	c.Deck = st.c.Deck.clone()
 	c.Video = st.c.Video.clone()
+	c.Share = st.c.Share.clone()
 	return c
 }
 
@@ -134,7 +146,9 @@ func (st *Store) started(d Device) {
 	st.c.Device = d
 }
 
-// Update applies a change and writes the file.
+// Update applies a change and writes the file. A change the file could not take still holds in
+// memory, and goes to disk with the next change that is saved: what callers count on for a value they
+// make up once and must keep (the DLNA renderer's id), whether or not it could be saved.
 func (st *Store) Update(f func(*Config)) error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -143,6 +157,71 @@ func (st *Store) Update(f func(*Config)) error {
 	st.c.Brain.Muse.validate()
 	return st.write()
 }
+
+// UpdateOrUndo is Update for a setting that must not hold unless it was saved: one the file could not
+// take is taken back whole, so the next change saved cannot write it behind everyone's back. Keep wake
+// clips is one: turned on while the flash was failing, the recorder stays off, and the setting must
+// too. A file that was never readable is the exception, since nothing is written over it all run: the
+// change holds until the next start, as Update's do.
+func (st *Store) UpdateOrUndo(f func(*Config)) error {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	before := deepCopy(st.c)
+	f(&st.c)
+	err := st.write()
+	var renamed afterRename
+	switch {
+	case err == nil, !st.readable:
+	case errors.As(err, &renamed):
+		// The new file is in place, only not yet flushed with its folder: the disk has the change, and
+		// memory keeps it to match. Saved, as far as the caller goes, so what it does for the setting
+		// (the recorder Keep wake clips turns on) matches both.
+		slog.Warn("config: saved, but the folder could not be flushed after", "path", st.path, "err", err)
+		return nil
+	default:
+		st.c = before
+	}
+	return err
+}
+
+// UpdateChecked applies a change and writes the file only when f accepts it. A change f refuses, or
+// one that could not be saved, is taken back whole — even when the file was never readable. Unlike
+// UpdateOrUndo there is no run-long exception for an unreadable file, because this is for something
+// the caller reports as done only once it is on disk, and memory alone must not be able to say so.
+//
+// f may change st.c before returning an error; the change is taken back either way.
+func (st *Store) UpdateChecked(f func(*Config) error) error {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	before := deepCopy(st.c)
+	if err := f(&st.c); err != nil {
+		st.c = before
+		return err
+	}
+	err := st.write()
+	var renamed afterRename
+	switch {
+	case err == nil:
+		return nil
+	case errors.As(err, &renamed):
+		// As UpdateOrUndo: the new file is in place, only not yet flushed with its folder. Memory
+		// keeps the change to match what is on disk, and the caller is told it was saved.
+		slog.Warn("config: saved, but the folder could not be flushed after", "path", st.path, "err", err)
+		return nil
+	default:
+		st.c = before
+		return err
+	}
+}
+
+// afterRename is write failing after the new file took the old one's place: what is on disk is the
+// change, though a power cut could still lose it.
+type afterRename struct{ err error }
+
+func (e afterRename) Error() string { return e.err.Error() }
+func (e afterRename) Unwrap() error { return e.err }
 
 // write replaces the file through a temporary one, flushed at every step, because the thing this has
 // to survive is a reboot rather than a crash.
@@ -169,7 +248,7 @@ func (st *Store) write() error {
 
 	tmp := st.path + ".tmp"
 	// Owner-only: the file holds passwords and tokens (the Reolink recorder's, Music Assistant's, the
-	// cameras' for talking through them). Set on the file itself too, since one left from an older
+	// cameras' for talking through them, a go2rtc server's). Set on the file itself too, since one left from an older
 	// build keeps the mode it was made with.
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
@@ -200,8 +279,11 @@ func (st *Store) write() error {
 	}
 	d, err := os.Open(dir)
 	if err != nil {
-		return err
+		return afterRename{err}
 	}
 	defer func() { _ = d.Close() }()
-	return d.Sync()
+	if err := d.Sync(); err != nil {
+		return afterRename{err}
+	}
+	return nil
 }

@@ -33,8 +33,10 @@ type Config struct {
 	Diag           Diag           `json:"diag"`
 	Media          Media          `json:"media"`
 	Sendspin       Sendspin       `json:"sendspin"`
+	Snapcast       Snapcast       `json:"snapcast,omitempty"`
 	MusicAssistant MusicAssistant `json:"music_assistant,omitempty"`
 	TalkBack       TalkBack       `json:"talk_back,omitempty"`
+	Doorbell       Doorbell       `json:"doorbell,omitempty"`
 	Streaming      Streaming      `json:"streaming,omitempty"`
 	Presence       Presence       `json:"presence,omitempty"`
 	Screen         Screen         `json:"screen"`
@@ -44,9 +46,21 @@ type Config struct {
 	Timers         Timers         `json:"timers"`
 	Dashboard      Dashboard      `json:"dashboard"`
 	Calendar       Calendar       `json:"calendar"`
+	Todo           Todo           `json:"todo,omitempty"`
 	Brain          Brain          `json:"brain"`
 	Deck           Deck           `json:"deck,omitempty"`
 	Video          Video          `json:"video,omitempty"`
+	Tailscale      Tailscale      `json:"tailscale"`
+	Netbird        Netbird        `json:"netbird"`
+	Nearest        Nearest        `json:"nearest,omitempty"`
+	Remote         Remote         `json:"remote,omitempty"`
+	CamStream      CamStream      `json:"cam_stream,omitempty"`
+	Share          Share          `json:"share,omitempty"`
+	Realtime       Realtime       `json:"realtime,omitempty"`
+	Tessera        Tessera        `json:"tessera,omitempty"`
+	WifiQuiet      WifiQuiet      `json:"wifi_quiet,omitempty"`
+	WifiBand       WifiBand       `json:"wifi_band,omitempty"`
+	FirstRun       FirstRun       `json:"first_run,omitempty"`
 }
 
 // Defaults is a device nobody has set anything on.
@@ -98,16 +112,29 @@ func (w Writer) Security() SecurityWriter             { return SecurityWriter(w)
 func (w Writer) Alarms() AlarmsWriter                 { return AlarmsWriter(w) }
 func (w Writer) Timers() TimersWriter                 { return TimersWriter(w) }
 func (w Writer) Sendspin() SendspinWriter             { return SendspinWriter(w) }
+func (w Writer) Snapcast() SnapcastWriter             { return SnapcastWriter(w) }
 func (w Writer) MusicAssistant() MusicAssistantWriter { return MusicAssistantWriter(w) }
 func (w Writer) Home() HomeWriter                     { return HomeWriter(w) }
 func (w Writer) Dashboard() DashboardWriter           { return DashboardWriter(w) }
 func (w Writer) Calendar() CalendarWriter             { return CalendarWriter(w) }
+func (w Writer) Todo() TodoWriter                     { return TodoWriter(w) }
 func (w Writer) Brain() BrainWriter                   { return BrainWriter(w) }
 func (w Writer) TalkBack() TalkBackWriter             { return TalkBackWriter(w) }
+func (w Writer) Doorbell() DoorbellWriter             { return DoorbellWriter(w) }
 func (w Writer) Streaming() StreamingWriter           { return StreamingWriter(w) }
 func (w Writer) Presence() PresenceWriter             { return PresenceWriter(w) }
 func (w Writer) Deck() DeckWriter                     { return DeckWriter(w) }
 func (w Writer) Video() VideoWriter                   { return VideoWriter(w) }
+func (w Writer) Tailscale() TailscaleWriter           { return TailscaleWriter(w) }
+func (w Writer) Netbird() NetbirdWriter               { return NetbirdWriter(w) }
+func (w Writer) Nearest() NearestWriter               { return NearestWriter(w) }
+func (w Writer) Remote() RemoteWriter                 { return RemoteWriter(w) }
+func (w Writer) CamStream() CamStreamWriter           { return CamStreamWriter(w) }
+func (w Writer) Share() ShareWriter                   { return ShareWriter(w) }
+func (w Writer) Realtime() RealtimeWriter             { return RealtimeWriter(w) }
+func (w Writer) Tessera() TesseraWriter               { return TesseraWriter(w) }
+func (w Writer) WifiQuiet() WifiQuietWriter           { return WifiQuietWriter(w) }
+func (w Writer) WifiBand() WifiBandWriter             { return WifiBandWriter(w) }
 
 // Wake names one slot, since every wake word setting belongs to one.
 func (w Writer) Wake(slot int) WakeWriter { return WakeWriter{st: w.st, slot: slot} }
@@ -115,19 +142,44 @@ func (w Writer) Wake(slot int) WakeWriter { return WakeWriter{st: w.st, slot: sl
 // Stop is the stop word, which is not a slot.
 func (w Writer) Stop() StopWriter { return StopWriter(w) }
 
+// Hangup is the hang-up word, which is not a slot either.
+func (w Writer) Hangup() HangupWriter { return HangupWriter(w) }
+
+// VolumeDown is the volume down word, which is not a slot either.
+func (w Writer) VolumeDown() VolumeDownWriter { return VolumeDownWriter(w) }
+
+// VolumeUp is the volume up word, which is not a slot either.
+func (w Writer) VolumeUp() VolumeUpWriter { return VolumeUpWriter(w) }
+
+// NextSong is the next song word, which is not a slot either.
+func (w Writer) NextSong() NextSongWriter { return NextSongWriter(w) }
+
+// OnHA is Home Assistant's wake word engine.
+func (w Writer) OnHA() OnHAWriter { return OnHAWriter(w) }
+
 // NoneChosen records whether "No wake word" was chosen on purpose.
 func (w Writer) NoneChosen(v bool) error {
 	return w.st.Update(func(c *Config) { c.Wake.NoneChosen = v })
 }
 
+// KeepClips records whether the device keeps clips of the wake word. An on that could not be saved is
+// taken back, as the recorder stays off for it; an off holds either way, as the recorder stops anyway,
+// and goes to disk with the next change saved if not with this one.
+func (w Writer) KeepClips(v bool) error {
+	if v {
+		return w.st.UpdateOrUndo(func(c *Config) { c.Wake.KeepClips = true })
+	}
+	return w.st.Update(func(c *Config) { c.Wake.KeepClips = false })
+}
+
 func errSlot(n int) error { return fmt.Errorf("config: wake slot %d", n) }
 
-// Labelled is a setting whose values name themselves. The entity layer binds any of these to a
+// Labeled is a setting whose values name themselves. The entity layer binds any of these to a
 // select without knowing which setting it is.
-type Labelled interface{ Label() string }
+type Labeled interface{ Label() string }
 
 // Labels is the list Home Assistant shows for a set of values, in the order given.
-func Labels[T Labelled](values []T) []string {
+func Labels[T Labeled](values []T) []string {
 	out := make([]string, 0, len(values))
 	for _, v := range values {
 		out = append(out, v.Label())
@@ -137,7 +189,7 @@ func Labels[T Labelled](values []T) []string {
 
 // ByLabel resolves what Home Assistant sent back to the value it names. A select speaks labels,
 // everything else speaks values, and this is the one place the two meet.
-func ByLabel[T Labelled](values []T, label string) (T, bool) {
+func ByLabel[T Labeled](values []T, label string) (T, bool) {
 	for _, v := range values {
 		if v.Label() == label {
 			return v, true

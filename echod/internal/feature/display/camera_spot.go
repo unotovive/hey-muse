@@ -6,8 +6,11 @@ import (
 	"image"
 	"image/color"
 	"math"
+	"strings"
 	"time"
 
+	"github.com/HuskerMinion/techo5/echod/internal/feature/babymon"
+	"github.com/HuskerMinion/techo5/echod/internal/feature/camstream"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/home"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/talkback"
 )
@@ -51,22 +54,40 @@ func (r *roundRenderer) cameraView(s roundScene) {
 	r.clear()
 	v := s.camera
 	if f := v.Frame; f != nil {
-		r.coverCircle(f, v.Entity == home.LocalCamera)
+		home.ReadFrame(func() { r.coverCircle(f, v.Entity == home.LocalCamera) })
 	} else {
-		msg := "Connecting…"
+		msg := tr("drawer_connecting")
 		if v.Error != "" {
-			msg = "No picture"
+			msg = tr("drawer_no_picture")
 		}
 		r.centered(r.title, msg, 250, colDim)
 		if v.Error != "" {
 			r.paragraph(r.small, v.Error, 290, colDim, 2)
 		}
 	}
-	// The name on a dark band near the top, readable over any picture.
-	if v.Name != "" {
-		w := r.width(r.label, v.Name)
+	// The name on a dark band near the top, readable over any picture; a notification's title in its
+	// place, and its words on a band under it. A picture sent with no words has neither: it is the
+	// picture alone.
+	name := v.Name
+	if c := v.Caption; c != nil && c.Title != "" {
+		name = clip(r.label, r, c.Title, 240)
+	}
+	if name != "" && (v.Caption == nil || !v.Caption.Wordless()) {
+		w := r.width(r.label, name)
 		r.line(float64(center-w/2-10), 62, float64(center+w/2+10), 62, 32, color.RGBA{0, 0, 0, 150})
-		r.centered(r.label, v.Name, 69, colText)
+		r.centered(r.label, name, 69, colText)
+	}
+	if c := v.Caption; c != nil && c.Message != "" {
+		lines := r.wrap(r.small, c.Message, 290)
+		if len(lines) > 2 {
+			lines = append(lines[:1], clip(r.small, r, strings.Join(lines[1:], " "), 290))
+		}
+		const lineH, top = 26, 112
+		mid := float64(top + (len(lines)-1)*lineH/2 - 8)
+		r.line(float64(center-150), mid, float64(center+150), mid, float64(len(lines)*lineH+12), color.RGBA{0, 0, 0, 160})
+		for i, line := range lines {
+			r.centered(r.small, line, top+i*lineH, colText)
+		}
 	}
 	// Talk, as a bar like the sound's just above it: a tap sends the microphones to the camera's speaker,
 	// and another ends it, and the bar is red while they go. Why a talk failed shows above it for a few
@@ -75,12 +96,8 @@ func (r *roundRenderer) cameraView(s roundScene) {
 	if s.talkOffered {
 		label := talkLabel(s.talk, v.Entity)
 		b := cameraSoundBox(r.width(r.label, label) + 24).Sub(image.Pt(0, 34+talkGap))
-		band := color.RGBA{0, 0, 0, 150}
-		if s.talk.Entity == v.Entity && s.talk.Phase != talkback.Idle {
-			band = talkLive
-		}
-		r.line(float64(b.Min.X), float64(b.Min.Y+b.Dy()/2), float64(b.Max.X), float64(b.Min.Y+b.Dy()/2), float64(b.Dy()), band)
-		r.centered(r.label, label, b.Min.Y+b.Dy()/2+8, colText)
+		live := s.talk.Entity == v.Entity && s.talk.Phase != talkback.Idle
+		r.cameraControl(b, label, live)
 		r.setCameraTalkAt(b)
 		talkback.Get().Seen(v.Entity) // a talk goes on only while this is on the screen
 		if s.talk.Error != "" && s.talk.Entity == v.Entity {
@@ -96,15 +113,64 @@ func (r *roundRenderer) cameraView(s roundScene) {
 	// drawn. A circle has no corner to put one in, so it is the same bar of words as the name above it:
 	// a tap silences what the camera is saying and leaves the view up.
 	if s.cameraSound {
-		label := "Unmute"
+		label := tr("drawer_unmute")
 		if s.cameraSoundLive {
-			label = "Mute"
+			label = tr("drawer_mute")
 		}
+		b := cameraSoundBox(r.width(r.label, label) + 24)
+		r.cameraControl(b, label, false)
+		r.setCameraSoundAt(b)
+	}
+	// A notification's picture says how to close it, in the sound's place at the foot when that is
+	// free: the Show's page has always said so, and a picture somebody else put up is one a person
+	// standing here may not know is theirs to dismiss.
+	if v.Caption != nil && !s.cameraSound && !s.talkOffered {
+		label := tr("drawer_camera_close")
 		b := cameraSoundBox(r.width(r.label, label) + 24)
 		r.line(float64(b.Min.X), float64(b.Min.Y+b.Dy()/2), float64(b.Max.X), float64(b.Min.Y+b.Dy()/2), float64(b.Dy()), color.RGBA{0, 0, 0, 150})
 		r.centered(r.label, label, b.Min.Y+b.Dy()/2+8, colText)
-		r.setCameraSoundAt(b)
 	}
+	r.cameraButtons(s)
+}
+
+// cameraButtons draws the view's action buttons as bars like Talk's, stacked up the face from just above
+// the bars at its foot (or from the sound's place when there are none), the first lowest, where a thumb
+// reaches first. Each is as wide as what it says, within the circle.
+func (r *roundRenderer) cameraButtons(s roundScene) {
+	if len(s.camButtons) == 0 {
+		return
+	}
+	const barH, barMin, barMax = 34, 96, 300
+	top := cameraSoundBox(0).Max.Y + talkGap // nothing at the foot: the first goes in the sound's place
+	if s.cameraSound || s.camera.Caption != nil {
+		top = cameraSoundBox(0).Min.Y // the sound's bar, or the "tap to close" in its place
+	}
+	if !r.drawnTalk.Empty() {
+		top = min(top, r.drawnTalk.Min.Y)
+	}
+	at := make([]image.Rectangle, len(s.camButtons))
+	for i, f := range s.camButtons {
+		f.label = clip(r.label, r, f.label, barMax-24)
+		w := min(max(r.width(r.label, f.label)+24, barMin), barMax)
+		bottom := top - talkGap
+		b := image.Rect(center-w/2, bottom-barH, center+w/2, bottom)
+		r.cameraButton(b, f)
+		at[i], top = b, b.Min.Y
+	}
+	r.drawnButtons = at
+}
+
+// cameraButtonTapped is which of the action buttons drawn in the frame last drawn a tap at x, y is on,
+// or -1. Each is grown a little, as Talk is, less than half the gap between them.
+func (r *roundRenderer) cameraButtonTapped(x, y int) int {
+	r.zmu.Lock()
+	defer r.zmu.Unlock()
+	for i, b := range r.cameraButtonsAt {
+		if !b.Empty() && image.Pt(x, y).In(b.Inset(-4)) {
+			return i
+		}
+	}
+	return -1
 }
 
 // talkGap is between the Talk bar and the sound's below it: more than the two taps' margins together
@@ -127,7 +193,7 @@ func (r *roundRenderer) setCameraSoundAt(b image.Rectangle) { r.drawnSound = b }
 // publishCameraTaps makes the finished frame's camera controls the ones a tap is matched against.
 func (r *roundRenderer) publishCameraTaps() {
 	r.zmu.Lock()
-	r.cameraSoundAt, r.cameraTalkAt = r.drawnSound, r.drawnTalk
+	r.cameraSoundAt, r.cameraTalkAt, r.cameraButtonsAt = r.drawnSound, r.drawnTalk, r.drawnButtons
 	r.zmu.Unlock()
 }
 
@@ -145,6 +211,7 @@ func (r *roundRenderer) cameraTalkTapped(x, y int) bool {
 func (r *roundRenderer) clearCameraSoundTap() {
 	r.setCameraSoundAt(image.Rectangle{})
 	r.setCameraTalkAt(image.Rectangle{})
+	r.drawnButtons = nil
 }
 
 // cameraSoundTapped reports whether a tap at x, y is on the sound control drawn in the frame last
@@ -199,6 +266,30 @@ func (r *roundRenderer) coverCircle(img *image.RGBA, mirror bool) {
 func (r *roundRenderer) cameraDot() {
 	r.discAt(center, float64(center-(rimIn+rimOut)/2), 9, colIconGround)
 	r.discAt(center, float64(center-(rimIn+rimOut)/2), 6, colCameraOn)
+}
+
+// colRoomHeard is the mark that says the room is being listened to in a browser (feature/babymon):
+// amber, as a Dot's ring is.
+var colRoomHeard = color.RGBA{0xE0, 0x8A, 0x10, 255}
+
+// listeningDot is that mark, at the top of the rim beside the camera's.
+func (r *roundRenderer) listeningDot(s roundScene) {
+	if !s.listening {
+		return
+	}
+	x, y := float64(center+26), float64(center-(rimIn+rimOut)/2)
+	r.discAt(x, y, 9, colIconGround)
+	r.discAt(x, y, 6, roomHeard(colRoomHeard))
+}
+
+// watchedDark is the frame of a dark face while the camera is streamed or the room is listened to:
+// black, and the marks.
+func (r *roundRenderer) watchedDark() {
+	fillCanvas(r.dst, color.Black)
+	if camstream.Watching() {
+		r.cameraDot()
+	}
+	r.listeningDot(roundScene{listening: babymon.Shown()})
 }
 
 // cameraIndex is where entity is on the camera list, or 0.
@@ -256,3 +347,6 @@ func (r *roundRenderer) discImage(img *image.RGBA, cx, cy, rad float64) {
 		}
 	}
 }
+
+// hasCameraLook is false on the Spot: its round camera view has no strips, and its picture its own fit.
+const hasCameraLook = false

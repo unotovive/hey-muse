@@ -1,7 +1,6 @@
 package timer
 
 import (
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -190,7 +189,7 @@ func TestWhatIsCountingDownIsNamedSoonestFirstByWhenItFinishes(t *testing.T) {
 
 	// The screen's own setting decides the form a time is written in, twelve hour or twenty-four, so a
 	// timer read in Home Assistant is written the way the panel would write it.
-	config.Use(filepath.Join(t.TempDir(), "state.json"))
+	useTestState(t)
 	if err := config.Set().Screen().Clock24(true); err != nil {
 		t.Fatal(err)
 	}
@@ -216,7 +215,7 @@ func TestWhatIsCountingDownIsNamedSoonestFirstByWhenItFinishes(t *testing.T) {
 }
 func TestAnUnnamedTimerStillHasSomethingToCallIt(t *testing.T) {
 	now := time.Date(2026, 9, 30, 18, 38, 0, 0, time.Local)
-	config.Use(filepath.Join(t.TempDir(), "state.json"))
+	useTestState(t)
 	if err := config.Set().Screen().Clock24(true); err != nil {
 		t.Fatal(err)
 	}
@@ -286,7 +285,11 @@ func TestATimerSetHereCountsDownAndRings(t *testing.T) {
 	if id == "" {
 		t.Fatal("no timer started")
 	}
-	now := time.Now()
+	// The timer's own clock: Start saves and publishes after it reads the time, which on a busy machine
+	// takes over a second, and "four minutes later" read after that came out as 5m59s left.
+	ts.mu.Lock()
+	now := ts.held[id].at
+	ts.mu.Unlock()
 	list := ts.List(now.Add(4 * time.Minute))
 	if len(list) != 1 {
 		t.Fatalf("listing %d timers, want 1", len(list))
@@ -537,6 +540,96 @@ func TestForgetDropsAPausedTimerQuietly(t *testing.T) {
 	if len(ts.ended) != 0 {
 		t.Error("a paused timer was taken for one the device had ended")
 	}
+}
+
+// heldCount is how many timers are held now, for a test watching a wait that runs in the background.
+func heldCount(ts *Timers) int {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	return len(ts.held)
+}
+
+// waitForHeld waits for the held count to reach want, for the goroutine ForgetAfter runs.
+func waitForHeld(t *testing.T, ts *Timers, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if heldCount(ts) == want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := heldCount(ts); got != want {
+		t.Errorf("holding %d timers, want %d", got, want)
+	}
+}
+
+// forgetWaitOf is the channel a pending ForgetAfter waits on, for a test telling one wait from the
+// next.
+func forgetWaitOf(ts *Timers) chan struct{} {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	return ts.forgetWait
+}
+
+// A link that is only reconnecting does not take Home Assistant's timers with it: they wait out the
+// grace, and are dropped only when it runs out.
+func TestForgetAfterWaitsOutTheGrace(t *testing.T) {
+	ts := build()
+	t.Cleanup(func() { ts.Stop() })
+	ts.Event(started("kettle", 600))
+
+	ts.ForgetAfter(200 * time.Millisecond)
+	if got := heldCount(ts); got != 1 {
+		t.Fatalf("holding %d timers at once, want 1", got)
+	}
+	waitForHeld(t, ts, 0)
+}
+
+// Home Assistant listening again within the grace calls the forget off.
+func TestKeepCallsOffAPendingForget(t *testing.T) {
+	ts := build()
+	t.Cleanup(func() { ts.Stop() })
+	ts.Event(started("kettle", 600))
+
+	ts.ForgetAfter(200 * time.Millisecond)
+	ts.Keep()
+	time.Sleep(300 * time.Millisecond)
+
+	if got := heldCount(ts); got != 1 {
+		t.Errorf("holding %d timers after Home Assistant came back, want 1", got)
+	}
+}
+
+// A link that drops again while the grace is running gives it the whole grace from the latest drop,
+// rather than letting the first one run out underneath it.
+func TestASecondForgetAfterStartsTheGraceAgain(t *testing.T) {
+	ts := build()
+	t.Cleanup(func() { ts.Stop() })
+	ts.Event(started("kettle", 600))
+
+	ts.ForgetAfter(time.Minute)
+	first := forgetWaitOf(ts)
+	ts.ForgetAfter(time.Minute)
+	second := forgetWaitOf(ts)
+
+	if first == nil || second == nil || first == second {
+		t.Fatalf("the second drop left no wait of its own: first %v, second %v", first, second)
+	}
+	select {
+	case <-first:
+	default:
+		t.Error("the first wait was not called off by the second drop")
+	}
+	select {
+	case <-second:
+		t.Error("the second wait was called off the moment it was made")
+	default:
+	}
+	if got := heldCount(ts); got != 1 {
+		t.Errorf("holding %d timers while the second grace runs, want 1", got)
+	}
+	ts.Keep()
 }
 
 // What the device ended is only remembered for as long as a late event could still be on its way, and a

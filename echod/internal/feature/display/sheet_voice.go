@@ -138,7 +138,7 @@ func pickerVoices(b config.Brain) []string {
 // quality nearly every voice comes in, is left unsaid.
 func voiceLabel(name string) string {
 	if name == "" {
-		return "Server default"
+		return tr("ui_server_default")
 	}
 	parts := strings.Split(name, "-")
 	if len(parts) != 3 {
@@ -173,19 +173,19 @@ func museVoices(b config.Brain) []speech.Voice {
 // voiceRow is the Sound card's Speaking voice row.
 func voiceRow() settingRow {
 	b := config.Get().Brain
-	switch {
-	case b.Mode == config.BrainMuse:
-		return settingRow{id: "ttsvoice", label: "Speaking voice", sub: "How Muse's answers sound", kind: ctlChoice, value: capitalize(museVoice(b).Label())}
-	case b.Direct():
-		refreshVoices(b)
-		return settingRow{id: "ttsvoice", label: "Speaking voice", sub: "How answers sound", kind: ctlChoice, value: voiceLabel(b.Voice)}
+	if b.Mode == config.BrainMuse {
+		return settingRow{id: "ttsvoice", label: tr("ui_speaking_voice"), sub: "How Muse's answers sound", kind: ctlChoice, value: capitalize(museVoice(b).Label())}
 	}
-	return settingRow{label: "Speaking voice", sub: "Home Assistant: Settings, Voice assistants", kind: ctlValue, value: "Set there"}
+	if !b.Direct() {
+		return settingRow{label: tr("ui_speaking_voice"), sub: tr("ui_home_assistant_settings_voice_assistants"), kind: ctlValue, value: tr("ui_set_there")}
+	}
+	refreshVoices(b)
+	return settingRow{id: "ttsvoice", label: tr("ui_speaking_voice"), sub: tr("ui_how_answers_sound"), kind: ctlChoice, value: voiceLabel(b.Voice)}
 }
 
 func voicePicker() (pickerView, bool) {
 	b := config.Get().Brain
-	p := pickerView{title: "Speaking voice", cur: -1}
+	p := pickerView{title: tr("ui_speaking_voice"), cur: -1}
 	switch {
 	case b.Mode == config.BrainMuse:
 		for i, v := range museVoices(b) {

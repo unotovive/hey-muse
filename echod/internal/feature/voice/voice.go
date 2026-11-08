@@ -9,21 +9,28 @@ package voice
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	esphome "github.com/ygelfand/go-esphome-device"
+	"github.com/ygelfand/go-esphome-device/api"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/HuskerMinion/techo5/echod/internal/component"
 	"github.com/HuskerMinion/techo5/echod/internal/config"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/media"
+	"github.com/HuskerMinion/techo5/echod/internal/feature/mute"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/phone"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/ring"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/timer"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/wakeword"
 	"github.com/HuskerMinion/techo5/echod/internal/hardware/buttons"
+	"github.com/HuskerMinion/techo5/echod/internal/hardware/led"
 	"github.com/HuskerMinion/techo5/echod/internal/hardware/speaker"
 	"github.com/HuskerMinion/techo5/echod/internal/lib/wake"
 )
@@ -41,8 +48,10 @@ const Features = esphome.DefaultVoiceFeatures |
 	esphome.FeatureTimers
 
 type Voice struct {
-	vs   *esphome.VoiceSatellite
-	turn *conversation
+	vs        *esphome.VoiceSatellite
+	turn      *conversation
+	effect    *esphome.Action
+	wakeCalls wakeCallSelects // Call on wake word (wakecall_select.go)
 }
 
 var (
@@ -99,15 +108,22 @@ func build() *Voice {
 	}
 	v.turn = newConversation(v.vs)
 	slog.Info("wake words", "ours", len(ours), "active", active)
+	warnRepeatedWord()
 
 	v.vs.OnTimer = timer.Get().Event
 	v.vs.OnSubscribed = func(subscribed bool) {
-		if !subscribed {
-			timer.Get().Forget()
+		if subscribed {
+			timer.Get().Keep()
+		} else {
+			timer.Get().ForgetAfter(timer.ForgetGrace)
 		}
+		v.turn.post(event{kind: evWatch})
 	}
+	// A stream to Home Assistant stops the moment the microphones are cut, not at the next look.
+	mute.Get().Changed.Listen(func(bool) { v.turn.post(event{kind: evWatch}) })
 
 	wakeword.Requested.Listen(v.Start)
+	wakeword.CancelRequested.Listen(func(struct{}) { v.CancelRequest() })
 
 	// The action button is the only one where a hold means something different from a press, and what
 	// it means is the conversation's to decide. The other buttons are somebody else's listeners.
@@ -139,9 +155,62 @@ func build() *Voice {
 
 func (v *Voice) Name() string { return "conversation" }
 
+// Actions is voice_effect (ShowEffect).
+func (v *Voice) Actions() []*esphome.Action {
+	if v.effect == nil {
+		v.effect = &esphome.Action{
+			Name: "voice_effect",
+			Args: []esphome.Arg{{Name: "effect", Type: esphome.ArgString}},
+			Run: func(c esphome.Call) (any, error) {
+				return nil, v.ShowEffect(strings.TrimSpace(c.String("effect")))
+			},
+		}
+	}
+	return []*esphome.Action{v.effect}
+}
+
+// ShowEffect puts the effect named name on the ring for the step the running request is in, for an
+// automation to say what the request is waiting on: another speech-to-text taking over, a slow
+// answer. None turns the ring off for it, and Default (or nothing) goes back to the step's own
+// setting. It is the request's, not a setting: nothing is saved, and the next step, or the next
+// request, shows its own effect as ever. With no request running it does nothing; a name the ring
+// does not have is refused.
+func (v *Voice) ShowEffect(name string) error {
+	switch {
+	case name == "", name == component.EffectDefault, name == component.EffectNone:
+	case !slices.Contains(led.EffectNames(), name):
+		return fmt.Errorf("no ring effect called %q", name)
+	}
+	if !v.turn.Busy() {
+		return nil
+	}
+	v.turn.askEffect(name)
+	return nil
+}
+
 // Handle is the satellite's own protocol messages, which have no entity to arrive through.
+//
+// The connection a subscription arrives on is kept: a run at the wake word stage is a request the
+// satellite has no call for, and goes out on it directly (hawake.go).
+//
+// A subscription on a new connection takes over from the one held. The satellite turns it away while
+// another connection holds it, and Home Assistant subscribes once per connection: an old connection
+// not yet seen to close (the device's Wi-Fi dropped under it) would hold voice with nothing to take it
+// back when it finally goes.
 func (v *Voice) Handle(ctx context.Context, c *esphome.Conn, msg proto.Message) error {
+	if m, ok := msg.(*api.SubscribeVoiceAssistantRequest); ok && m.GetSubscribe() {
+		if old := v.turn.conn.Swap(c); old != nil && old != c {
+			v.vs.ConnClosed(old)
+		}
+	}
 	return v.vs.Handle(ctx, c, msg)
+}
+
+// ConnClosed lets go of a closed connection's subscription, so Home Assistant's next one, on its new
+// connection, takes it. The server tells the handlers of each connection that closes.
+func (v *Voice) ConnClosed(c *esphome.Conn) {
+	v.turn.conn.CompareAndSwap(c, nil)
+	v.vs.ConnClosed(c)
 }
 
 // Run owns the conversation until ctx is canceled. Nothing happens on a wake word until it is
@@ -156,6 +225,11 @@ func (v *Voice) Run(ctx context.Context) error {
 // does, so this is what the device shows on the ring while it comes up.
 func (v *Voice) Ready() bool { return v.vs.Subscribed() || config.Get().Brain.Standalone() }
 
+// HomeAssistant reports whether Home Assistant itself has a voice pipeline listening, whatever the
+// brain. Ready is always true with a direct brain, so it says nothing about whether Home Assistant
+// can still reach the device.
+func (v *Voice) HomeAssistant() bool { return v.vs.Subscribed() }
+
 // Start asks for a turn as if that slot's wake word had fired, which is how detection and the
 // buttons both reach a pipeline. What that means from the phase the conversation is already in is
 // the conversation's decision, not the caller's.
@@ -163,13 +237,79 @@ func (v *Voice) Ready() bool { return v.vs.Subscribed() || config.Get().Brain.St
 // A wake word said over a ringing alarm or timer silences it first, the way a button press does:
 // whoever says it at a ringing alarm wants it quiet, and should not have to know the one word that
 // stops it. The turn goes on, over a quiet room, and "stop" in it ends the ring (see stopsRing).
-func (v *Voice) Start(slot int) {
-	if micTaken() {
-		slog.Info("wake word while the microphones are talking through a camera, ignored")
+func (v *Voice) Start(slot int) { v.open(slot, false, time.Time{}) }
+
+// CancelRequest is the Cancel request button: it ends a request that is running, whichever
+// assistant it is for and whatever step it is at, as a tap on the action button ends one, and like
+// that tap it silences what holds the speaker then: an announcement or a call ring that came in
+// during the request stops with it. A ringing alarm is not on the speaker claim and goes on. With no
+// request running it does nothing.
+func (v *Voice) CancelRequest() {
+	if !v.turn.Busy() {
 		return
 	}
-	if ring.IsSounding() && ring.Silence() {
+	slog.Info("cancel request button, canceling the request", "phase", v.turn.Phase())
+	v.turn.Cancel()
+}
+
+// Woke is Start for the wake word itself, which is the one way a turn can be opened by mistake: by a
+// sound that was not the word (see Mistaken).
+func (v *Voice) Woke(slot int) { v.open(slot, true, time.Time{}) }
+
+// WokeAt is Woke for a wake word heard at at and acted on later, once the devices that heard it agreed
+// which answers (feature/nearest). The turn sends what was said in between, from the history.
+func (v *Voice) WokeAt(slot int, at time.Time) { v.open(slot, true, at) }
+
+// CanAnswer is whether a wake word in slot would open a turn here now: an assistant is there to take it
+// (Home Assistant, or the device's own direct pipeline), the microphones are not taken by something
+// else (a talk through a camera, takes being recorded), and the slot has a wake word Home Assistant
+// knows it by. A slot chosen for realtime voice is
+// answered by it alone (backendFor): set up and with minutes left today, whatever Home Assistant is
+// doing. A slot chosen to call a contact, with the phone idle, can when the call can be placed
+// (wakecall.go). A device that could not answer must not claim a wake word over the others
+// (feature/nearest).
+func (v *Voice) CanAnswer(slot int) bool {
+	if micTaken() {
+		return false
+	}
+	if wakeCallApplies(slot) {
+		return v.wakeCallReady(slot)
+	}
+	if w := config.Get().Wake.Words; slot >= 0 && slot < len(w) && w[slot].Realtime {
+		return v.turn != nil && v.turn.realtime.Ready()
+	}
+	if !v.Ready() {
+		return false
+	}
+	if config.Get().Brain.Direct() {
+		return true
+	}
+	return slot >= 0 && slot < len(v.ActiveWakeWords())
+}
+
+func (v *Voice) open(slot int, woke bool, at time.Time) {
+	if micTaken() {
+		slog.Info("wake word ignored: the microphones are taken", "by", heldBy())
+		return
+	}
+	silencedRing := ring.IsSounding() && ring.Silence()
+	if silencedRing {
 		slog.Info("wake word over a ring, silencing it")
+	}
+	if woke && wakeCallApplies(slot) {
+		// The first wake over a ringing alarm only quiets it. A second can call.
+		if !silencedRing {
+			v.callOnWake(slot)
+		}
+		return
+	}
+	if woke {
+		if at.IsZero() {
+			v.turn.Woke(slot)
+		} else {
+			v.turn.WokeAt(slot, at)
+		}
+		return
 	}
 	v.turn.Start(slot)
 }
@@ -195,10 +335,10 @@ func (v *Voice) Action() {
 		return
 	}
 
-	// Talking through a camera: the press ends it, as it hangs up a call, rather than asking a question
-	// that would go out of the camera's speaker.
+	// Talking through a camera, or takes being recorded: the press ends it, as it hangs up a call,
+	// rather than asking a question that would go out of the camera's speaker or into the takes.
 	if micTaken() && !ring.IsSounding() {
-		if y := yield.Load(); y != nil {
+		if y, ok := holder(); ok {
 			go y.release()
 		}
 		return
@@ -215,6 +355,14 @@ func (v *Voice) Action() {
 	v.turn.Start(0)
 }
 
+// What Stop and Interrupt ask of the music, and what lets go of the wake light a ring left on; here
+// so tests can stand in for them.
+var (
+	musicPlaying = func() bool { return media.Get().Audible() }
+	pauseMusic   = func() { media.Get().PauseAudible() }
+	releaseRing  = ring.Release
+)
+
 // Interrupt is the stop word.
 //
 // It only acts while the device is making a sound. "Stop" is an ordinary word: somebody halfway through
@@ -225,15 +373,21 @@ func (v *Voice) Interrupt() {
 	// "<wake word>, stop" over music: the stop word hears "stop" while the turn the wake word opened is
 	// still listening, and it is the music that was meant, not the question that has not been asked.
 	if v.turn.Phase() == phaseListening && !ring.IsSounding() {
-		if playing, _ := media.Get().Playing(); playing {
+		if musicPlaying() {
 			slog.Info("stop word after the wake word: pausing the music")
 			v.turn.Cancel()
-			media.Get().Pause()
+			pauseMusic()
 			return
 		}
 	}
 	if !speaker.Sound().Busy() && !ring.IsSounding() {
-		if playing, _ := media.Get().Playing(); !playing {
+		if !musicPlaying() {
+			// Nothing audible, but the wake light held at full after an alarm (#161) is the device
+			// plainly doing something, and stop is what somebody waking under it says to turn it off.
+			if releaseRing() {
+				slog.Info("stop word with nothing sounding: the held wake light let go")
+				return
+			}
 			slog.Debug("stop word ignored, nothing to stop")
 			return
 		}
@@ -269,12 +423,15 @@ func (v *Voice) Stop() bool {
 		return true
 	}
 
-	if playing, _ := media.Get().Playing(); playing {
-		media.Get().Pause()
+	if musicPlaying() {
+		pauseMusic()
 		return true
 	}
-	// Last: a reminder left on the screen, with nothing else going on, is what the press was for.
-	return ring.End()
+	// Last: a reminder left on the screen, with nothing else going on, is what the press was for. And
+	// the wake light held at full after an alarm (#161), which nothing above stops: reaching for stop
+	// with nothing sounding lets it go, as Stop in Home Assistant does.
+	ended := ring.End()
+	return releaseRing() || ended
 }
 
 // ActionHold is holding the action button, which reaches the second assistant. Holding does not
@@ -295,24 +452,61 @@ func (v *Voice) ActionHold() {
 	v.turn.Start(1)
 }
 
-// A feature that sends the microphones somewhere of its own (feature/talkback, which cannot be imported
-// here) says so through YieldTo: while taken says so, no turn starts, and the action button calls
-// release instead.
+// A feature that takes the microphones for something of its own (feature/talkback sending them to a
+// camera, feature/takes recording takes of a word; neither can be imported here) says so through
+// YieldTo: while its taken says so, no turn starts, and the action button calls its release instead.
 type yielding struct {
+	name    string // what has the microphones, for the log: "a talk through a camera"
 	taken   func() bool
 	release func()
 }
 
-var yield atomic.Pointer[yielding]
+// yields is every feature that has said so, in the order they did. It is read on every frame of a
+// stream to Home Assistant (hawake.go), so it is a pointer to a list that is replaced, never changed.
+var yields atomic.Pointer[[]yielding]
 
-// YieldTo is how that feature is told about; the last call wins.
-func YieldTo(taken func() bool, release func()) {
-	yield.Store(&yielding{taken: taken, release: release})
+// YieldTo is how such a feature is told about. Each call adds one: a talk and a recording are
+// different features, and either may have the microphones.
+func YieldTo(name string, taken func() bool, release func()) {
+	for {
+		old := yields.Load()
+		var next []yielding
+		if old != nil {
+			next = append(next, *old...)
+		}
+		next = append(next, yielding{name: name, taken: taken, release: release})
+		if yields.CompareAndSwap(old, &next) {
+			return
+		}
+	}
+}
+
+// holder is the feature that has the microphones now, if one has.
+func holder() (yielding, bool) {
+	if ys := yields.Load(); ys != nil {
+		for _, y := range *ys {
+			if y.taken() {
+				return y, true
+			}
+		}
+	}
+	return yielding{}, false
 }
 
 func micTaken() bool {
-	y := yield.Load()
-	return y != nil && y.taken()
+	_, taken := holder()
+	return taken
+}
+
+// MicTaken is whether a feature that said so through YieldTo has the microphones now, for a listener
+// on the action button that does not go through Action: the Dot's double tap, whose first tap may
+// have been the one that started or stopped a recording.
+func MicTaken() bool { return micTaken() }
+
+// heldBy names what has the microphones, for the log.
+func heldBy() string {
+	y, _ := holder()
+	return y.name
 }
 
 // OnWakeWord is called when Home Assistant changes the selection, so the engine can follow. It is
@@ -344,6 +538,7 @@ func (v *Voice) OnWakeWord(load func(ids []string) []string, selected func()) {
 		if len(accepted) != len(ids) {
 			slog.Warn("some wake words were refused", "asked", ids, "running", accepted)
 		}
+		warnRepeatedWord()
 		selected()
 	}
 }
@@ -375,4 +570,12 @@ func (v *Voice) ActiveWakeWords() []string { return v.vs.ActiveWakeWords }
 func (v *Voice) SetActiveWakeWords(ids []string) {
 	v.vs.ActiveWakeWords = ids
 	slog.Info("wake words listening", "active", ids)
+}
+
+// warnRepeatedWord says so in the log when the same wake word is in two slots: both fire at once, and
+// only the one that fires first answers, which looks like the other assistant missing requests.
+func warnRepeatedWord() {
+	if id := config.Get().Wake.RepeatedWord(); id != "" {
+		slog.Warn("the same wake word is in two slots: only one of them answers each time, whichever fires first; give one slot a different word", "word", id)
+	}
 }

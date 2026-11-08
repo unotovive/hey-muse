@@ -14,31 +14,22 @@ import (
 // device and no use at all to one that has never met a Home Assistant — it sits on UTC with nothing
 // able to change it. Choosing here holds until Follow Home Assistant is chosen again.
 
-// followHA is the first choice in the region list: give the zone back to Home Assistant. common is
-// the second, a short list that saves swiping through the 174 zones under America to reach Denver.
-const (
-	followHA = "Home Assistant"
-	common   = "Common"
-)
+// The first choice in the region list gives the zone back to Home Assistant (ui_tz_follow_ha); common
+// is the second (ui_tz_common), a short list that saves swiping through the 174 zones under America to
+// reach Denver. The list is read by position, so both are shown in the screen's language; common is the
+// picker's id for that list.
+const common = "Common"
 
 // commonZones are the ones most people setting this up will want, in the order they are offered.
 // Everything else is still there, a region at a time.
-var commonZones = []string{
-	"America/New_York", "America/Chicago", "America/Denver", "America/Phoenix", "America/Los_Angeles",
-	"America/Anchorage", "Pacific/Honolulu", "America/Toronto", "America/Vancouver", "America/Mexico_City",
-	"America/Sao_Paulo", "Europe/London", "Europe/Dublin", "Europe/Paris", "Europe/Berlin",
-	"Europe/Madrid", "Europe/Rome", "Europe/Amsterdam", "Europe/Stockholm", "Europe/Warsaw",
-	"Europe/Moscow", "Africa/Johannesburg", "Asia/Dubai", "Asia/Kolkata", "Asia/Singapore",
-	"Asia/Shanghai", "Asia/Tokyo", "Asia/Seoul", "Australia/Perth", "Australia/Sydney",
-	"Pacific/Auckland", "UTC",
-}
+var commonZones = timezone.Common
 
 // zoneValue is what the row shows: the zone in force, short enough to read.
 func zoneValue() string {
 	zone := timezone.Get().Current()
 	switch {
 	case zone == "":
-		return "Not set"
+		return tr("ui_not_set")
 	case !timezone.Get().SetHere():
 		return zoneShort(zone)
 	}
@@ -48,12 +39,12 @@ func zoneValue() string {
 // zoneSub says where the zone came from, since that is what decides whether it will change again.
 func zoneSub() string {
 	if timezone.Get().SetHere() {
-		return "Chosen here"
+		return tr("ui_chosen_here")
 	}
 	if timezone.Get().Current() == "" {
-		return "Waiting for Home Assistant"
+		return tr("ui_waiting_for_home_assistant")
 	}
-	return "From Home Assistant"
+	return tr("ui_from_home_assistant")
 }
 
 // zoneShort is a zone as the row says it: the city, with the region behind it dropped, since the row
@@ -86,7 +77,7 @@ func isRule(zone string) bool {
 // zonePicker lists one region's zones, or the common ones, which are written as they are.
 func zonePicker(region string) pickerView {
 	if region == common {
-		p := pickerView{title: common, cur: -1}
+		p := pickerView{title: tr("ui_tz_common"), cur: -1}
 		current := timezone.Get().Current()
 		for i, z := range commonZones {
 			p.opts = append(p.opts, strings.ReplaceAll(z, "_", " "))

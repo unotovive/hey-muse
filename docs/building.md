@@ -19,7 +19,7 @@ sudo apt install git python3 qemu-user-static binfmt-support uidmap \
     build-essential bc bison flex libssl-dev curl xz-utils bzip2
 ```
 
-and Go 1.26 or later from [go.dev/dl](https://go.dev/dl/) (distribution packages are often older).
+and Go 1.27 or later from [go.dev/dl](https://go.dev/dl/) (distribution packages are often older).
 
 **Windows:** install [Git for Windows](https://git-scm.com/download/win) (its Git Bash runs the
 `.sh` scripts), [Go](https://go.dev/dl/) and [Python 3](https://www.python.org/downloads/). Then
@@ -76,13 +76,15 @@ GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -o ../bin/echod-arm ./cmd/e
 cd ..
 ```
 
-(`go test` runs everywhere; a few hardware packages only build for Linux.) To try a daemon on a Show
+(Run `go test` on Linux, or in WSL on Windows: the daemon is Linux-only, and a few hardware packages only build there. The Dot and the Spot have their own builds, so also run it with `-tags dot` and `-tags spot`.) To try a daemon on a Show
 already running TECHO5: turn on its SSH switch in Home Assistant with a key sent through the
-`ssh_keys` action, copy the binary over, and bind it in place until the next reboot:
+`ssh_keys` action, copy the binary over, and bind it in place until the next reboot. The devices
+have no SFTP server, which `scp` uses by default since OpenSSH 9, so `-O` asks for the old way:
 
 ```
-scp bin/echod-arm root@<address>:/tmp/echod-test
-ssh root@<address> 'mount --bind /tmp/echod-test /usr/local/bin/techo5 && killall techo5'
+DEVICE=192.168.x.y   # the device's IP address
+scp -O bin/echod-arm root@$DEVICE:/tmp/echod-test
+ssh root@$DEVICE 'mount --bind /tmp/echod-test /usr/local/bin/techo5 && killall techo5'
 ```
 
 ## 4. The root filesystem
@@ -135,10 +137,17 @@ fixes for it:
 - `checkers-0003-mute-button-follows-a-short-press.patch` keeps the driver's idea of the latch right
   after a quick tap to unmute, so the next long press mutes instead of doing nothing.
 
+A fourth isn't about the latch:
+
+- `checkers-0004-jack-plugged-in-at-boot.patch` lets a unit start with a plug in the headphone jack.
+  The jack driver asked for its interrupt before it was ready to handle it, and a plug already in at
+  power-on fired that interrupt over and over, so the boot hung at the logo. The 2nd gen Show 5 has
+  the driver too, but its device tree turns the jack off, so it never starts there.
+
 Despite the names they are not only for the 1st gen Show 5: they touch `drivers/misc/gating.c`,
-`include/misc/gating.h`, `mt_soc_machine.c` and the checkers and crown camera drivers, and the Show 8
-has the same latch. `crown_defconfig` is in
-the Amazon kernel tree already, beside the others, at the same commit — it was diffed against a Show 8's
+`include/misc/gating.h`, `mt_soc_machine.c`, the checkers and crown camera drivers and the jack
+driver (`accdet_amzn.c`), and the Show 8 has the same latch and the same jack setup.
+`crown_defconfig` is in the Amazon kernel tree already, beside the others, at the same commit — it was diffed against a Show 8's
 own `/proc/config.gz`, 1341 options each side and no differences either way.
 
 ## 6. The boot image
@@ -187,6 +196,87 @@ Pico, tools/pico) for armv7 with `zig cc`, on macOS, Linux or WSL. `deploy-rootf
 `bin/techo5-pico-arm` and the voice's data when it exists. Without it Muse can only answer aloud
 through a speech endpoint.
 
+The `techo5-aec` WebRTC echo canceller is separate from the optional
+[External microphone ASP interface](external-asp.md). Building or installing one does not install or
+enable the other.
+
+## Optional: the GPU helper (Show 8 2nd gen)
+
+[tools/gpu/build.sh](../tools/gpu/build.sh) builds `bin/techo5-gpu-arm`, the helper that draws the
+screen on the Mali-G72 through the kernel's panfrost driver, and
+[tools/linux/build-mesa.sh](../tools/linux/build-mesa.sh) `bin/techo5-mesa-arm.tar.gz`, the cut-down
+Mesa it loads (panfrost, EGL, GLES and GBM, no LLVM). Both run in an armv7 Alpine container with Docker
+(QEMU on an x86_64 host: the helper takes a minute, Mesa about an hour). An athena image
+(`DEVICE_OVERLAY=tools/linux/athena/overlay`) carries them when both are there, and the daemon draws on
+the cores without them, or on a kernel without panfrost.
+
+## Optional: the JPEG decoder (Show 8 2nd gen)
+
+[tools/jpeg/build.sh](../tools/jpeg/build.sh) builds `bin/techo5-jpeg-arm`, a small static helper that
+decodes photos and camera pictures with libjpeg-turbo's NEON code, at a half, a quarter or an eighth of
+their size where that still covers the screen. It builds libjpeg-turbo itself from the release it names,
+in an armv7 Alpine container with Docker (a few minutes under QEMU); `arm64` as an argument builds it for
+a 64-bit root filesystem. An athena image carries it when it is there, and the daemon decodes in Go
+without it.
+
+## AirPlay 2
+
+[tools/linux/build-shairport-sync.sh](../tools/linux/build-shairport-sync.sh) builds
+`bin/techo5-shairport-sync-arm`, shairport-sync with AirPlay 2, and `bin/techo5-nqptp-arm`, the clock it
+needs (Linux or WSL, with zig). Every image `deploy-rootfs.sh` builds carries both, and it stops when they
+are missing; a release built from a worktree needs them copied into its `bin/`. On the device they let an
+iPhone group it with other AirPlay 2 speakers; where they can't run, the daemon keeps the classic receiver
+from Alpine. Its sources are checked against the SHA-256s in the script, and it prints the binaries' own.
+
+## The video decoder
+
+Every image carries a small ffmpeg for the video player and live cameras. It is not optional:
+`deploy-rootfs.sh` stops when it is missing.
+
+- [tools/linux/build-ffmpeg.sh](../tools/linux/build-ffmpeg.sh) builds `bin/techo5-ffmpeg-arm`, the
+  32-bit one every image carries (Linux or WSL).
+- [tools/linux/build-ffmpeg-arm64.sh](../tools/linux/build-ffmpeg-arm64.sh) builds
+  `bin/techo5-ffmpeg-arm64`: the same ffmpeg for aarch64, fully static, with H.265, VP8 and VP9 added. It
+  is a cross build in WSL or on x86_64 Linux (under a minute once its build root is made). Only the
+  Show 8 2nd gen (athena) and Skylight images carry it, beside the 32-bit one, and the daemon runs it
+  on their 64-bit kernels. `deploy-rootfs.sh` stops when it is missing from either image.
+  OpenSSL is linked into it, so an OpenSSL fix needs a rebuild: `ROOTS=fresh` makes the build root again
+  with Alpine's current packages.
+
+Both go in `bin/`, which git ignores. A release built from a worktree needs both copied into its `bin/`.
+
+## Tailscale
+
+Every image `deploy-rootfs.sh` builds carries Tailscale's daemon ([docs/tailscale.md](tailscale.md)), and
+it stops when it is missing.
+[tools/linux/build-tailscaled.sh](../tools/linux/build-tailscaled.sh) builds `bin/tailscaled-arm64` and
+its license from Tailscale's own release source, pinned and checked by SHA-256, with Go (Linux or WSL,
+under a minute). One static arm64 build serves every image, on the devices' 64-bit kernels; on a 32-bit
+one (an athena on Amazon's kernel) the daemon doesn't offer Tailscale. The build is
+reproducible: the same script gives the same bytes on any machine. A release built from a worktree needs
+it copied into its `bin/` as well, with `tailscaled-arm64.LICENSE`.
+
+## NetBird
+
+No image carries NetBird's client ([docs/netbird.md](netbird.md)): a device downloads it when NetBird
+is turned on, from the release that first published it, checked against the size and SHA-256 in
+`echod/internal/feature/netbird/pinned.go`.
+[tools/linux/build-netbird.sh](../tools/linux/build-netbird.sh) builds `bin/netbird-arm64.tar.gz`, the
+client and its license, from NetBird's own release source, pinned and checked by SHA-256, with a pinned
+Go (Linux, WSL or Git Bash on Windows). The build is reproducible, so the same script gives the bytes
+`pinned.go` names; a new NetBird version means a new build, new values there, and the archive published
+with that release.
+
+## The Japanese font
+
+No image carries a Japanese font either: a Show or a Spot whose screen language is Japanese downloads
+one into its fonts folder (`echod/internal/feature/cjkfont`), from the release that first published it,
+checked against the size and SHA-256 pinned there. [tools/fonts/make_cjk_font.py](../tools/fonts/make_cjk_font.py)
+builds `bin/techo5-noto-sans-jp.tar.gz`, Noto Sans JP (SIL Open Font License) cut down to kana and the
+everyday kanji, with its license, from google/fonts at a pinned commit, with a pinned fontTools
+(`pip install fonttools==4.65.0`). The same script gives the same bytes; release.ps1 checks them against
+the pin.
+
 ## Optional: a CPU profile from a device
 
 To see where the daemon spends its time on a unit, turn SSH on and write the number of seconds to a
@@ -216,6 +306,20 @@ pin is a two-line edit at the top of `tools/fetch-inputs.py`; the script prints 
 to when it does not match, and techo5-dot's `tools/install-dot.py` carries the same pins for the models
 it puts on a Dot.
 
+## Custom screens (other boards)
+
+A board of your own can add full-screen pages of its own. Each one registers itself from its own file
+in `echod/internal/feature/display` with `registerScreen`: whether the device offers it, what a frame
+shows, how it is drawn, what a finger does and how often it moves. `custom_screens.go` and
+`render_custom.go` keep what the screens share: their tabs and the ×, the edge swipes, "go home" and
+the voice assistant's pages. A screen may keep its page between frames and has a cache of its own.
+
+Once a build has a custom screen, Home Assistant gets an **Idle screen** select: the clock, or one of
+the screens shown in its place whenever the clock would be. Music, a dashboard and everything else that
+takes the screen still come first, and the × or a swipe from the left edge puts the screen away for two
+minutes. With no screen registered, as in TECHO5's own builds, nothing changes and there is no Idle
+screen select.
+
 ## Releases (maintainer)
 
 `tools/release.ps1` (Show 5), techo5-dot's `tools/release-dot.ps1` and techo5-spot's
@@ -231,7 +335,7 @@ This repository is such a fork. Its own release, from a Mac, is in
 `TECHO5_SIGN_KEY` never leaves the maintainer's machine — it is not a GitHub Actions secret, and the
 build itself does not need to happen locally to keep that true. Pushing a release tag runs
 [.github/workflows/build.yml](../.github/workflows/build.yml), which tests every device's build and
-builds `echod-arm`, `echod-arm-dot` and `echod-arm-spot` on GitHub's own runners, attesting (via
+builds `echod-arm`, `echod-arm-dot`, `echod-arm-donut` and `echod-arm-spot`, and the TECHO5 Deck agents, on GitHub's own runners, attesting (via
 Sigstore, keyless) that they came from that exact commit and tag — so anyone, not just the maintainer,
 can check a release actually matches this repo's source instead of trusting that it does.
 
@@ -243,8 +347,20 @@ for all three is built here:
 ```
 git tag v0.6.0 && git push origin v0.6.0                       # the Show; triggers the workflow
 gh run download -n techo5-v0.6.0 -D bin                        # once it finishes
-.\tools\release.ps1 -Version v0.6.0 -Notes "..." -PrebuiltArm bin\echod-arm -PrebuiltArmDot bin\echod-arm-dot -Agents bin
+bash tools/linux/third-party-sources.sh v0.6.0                 # build/techo5-third-party-sources-v0.6.0.tar.gz
+.\tools\release.ps1 -Version v0.6.0 -Notes "..." -PrebuiltArm bin\echod-arm -PrebuiltArmDot bin\echod-arm-dot -Agents bin -ThirdPartySources build\techo5-third-party-sources-v0.6.0.tar.gz
 ```
+
+The images carry programs built from others' sources (FFmpeg, Shairport Sync, nqptp, librespot; see
+NOTICE), with their licenses in `/usr/share/licenses`. Their licenses want the source beside the
+binaries, so every release attaches it: `third-party-sources.sh` downloads each source the build scripts
+name, checks its SHA-256, and packs it with the patches, licenses and build scripts. The three release
+scripts refuse to publish without `-ThirdPartySources`; the Dot and the Spot take the same archive.
+
+The Show release also carries the Show 8 2nd gen (athena) and Skylight files: `-AthenaRootfs`,
+`-AthenaImage`, `-AthenaBoot` and `-AthenaKernelSource` for the first, `-SkylightRootfs`,
+`-SkylightStore`, `-SkylightBoot`, `-SkylightInstaller` and `-SkylightKernelSource` for the second
+(`-NoSkylight` to leave them out). The param block in `tools/release.ps1` says what each one is.
 
 All three Shows share the tag `vX.Y.Z` and the one `echod-arm`: which board a unit is settles itself at
 run time from the panel name in its kernel command line. What is per-board is the boot image, and each

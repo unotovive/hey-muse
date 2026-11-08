@@ -13,6 +13,11 @@ firmware): releases don't carry it, so it is copied into the store before the pa
 `userdata` is kept (TECHO5 reads the Wi-Fi network Android saved from it), and TWRP stays in
 `recovery`, so LineageOS can be put back with TWRP and its zip.
 
+The 2nd gen Show 8 (`athena`) installs differently: no LineageOS, TECHO5's own 64-bit mainline kernel
+written to `boot` and the TECHO5 image written to `system`, both from TWRP. Three screen panels
+are tested so far (ILI9881C with BOE glass, JD9365 with KD/HSD glass, JD9365 with BOE glass (new)); the installer checks, and tries
+the others with `--force-panel`. See [install-athena.md](install-athena.md).
+
 ## Unlock the bootloader first
 
 **The bootloader has to be unlocked before any of this works.** Running LineageOS does not mean it
@@ -37,6 +42,14 @@ still says `unlock_status: false`. The installer fails on it at the same write. 
 the installer. Afterwards fastboot reports `product: CRONOS` and `unlock_status: true`, and TWRP is
 3.7.0. Signs of the old unlock: TWRP 3.2.3, `fastboot getvar product` answering `CHECKERS`, and
 `adb reboot recovery` from TWRP starting Android instead.
+
+**`image is not a boot image`?** If `fastboot flash boot` prints `[amonet] Injecting microloader...`
+and then fails with `FAILED (remote: 'image is not a boot image')`, the Show 5 2nd gen runs another
+build of the unlock, one that rewrites the boot image on its way in. Nothing is written, and
+`fastboot continue` starts the unit again. Flash `amonet-cronos-v2.0.1.zip` in TWRP as above. On a
+Show 5 2nd gen the installer reads the unlock's version first (`fastboot getvar kaeru-version`;
+v2.0.1 answers `2.0.0`) and stops before flashing when it is another one; `--any-unlock` flashes
+anyway.
 
 ## What you need
 
@@ -66,7 +79,7 @@ script, give everything as switches instead: `--serial <serial> --name "Kitchen"
 nothing (it also asks nothing, and stops rather than guess, when its input or output isn't a terminal).
 
 It does steps 1 to 6 below: downloads the latest release and checks the boot image and root filesystem
-against their checksums, keeps LineageOS's boot image in `backups/<serial>/` when adb is root, flashes,
+against their checksums (a download that fails its checksum is tried once more, and the error says how many bytes arrived), keeps LineageOS's boot image in `backups/<serial>/` when adb is root, flashes,
 creates the slot store over the USB serial console, provisions the name and
 the Home Assistant key (kept in `backups/<serial>/home-assistant.key`), and waits for the first boot.
 `--ssh-key ~/.ssh/id_ed25519.pub` also turns SSH on with your key. Then go to
@@ -82,7 +95,8 @@ waits, and it can be fixed in another terminal without stopping the install.
 
 A unit fresh from its unlock sits in TWRP, and it doesn't have to start LineageOS at all. LineageOS is
 only needed for the Wi-Fi and Bluetooth drivers on its system partition, which TWRP can install without
-booting it. Download the LineageOS zip the unlock guide links, then, with the unit in TWRP:
+booting it. Download the 2026-09-04 LineageOS zip the getting started guide links (`cronos` v0.4,
+`checkers` v0.7, `crown` v0.5; a newer one is not supported yet), then, with the unit in TWRP:
 
 ```
 python3 tools/install-show.py --lineage-zip lineage-18.1-XXXXXXXX-UNOFFICIAL-cronos.zip --wifi "MyNetwork"
@@ -109,7 +123,8 @@ python3 tools/show-wifi.py "MyNetwork"
 It asks for the passphrase, saves the network on the unit, restarts it, and says whether it joined.
 
 If an install stops partway, after the boot image was flashed, the unit is left in the rescue
-environment (its screen says RESCUE) and a re-run can't see it over adb; the installer says so. The
+environment (its screen shows color bars, TECHO5 and a ticking clock, or RESCUE on a boot image built
+from newer sources) and a re-run can't see it over adb; the installer says so. The
 unit isn't lost: the steps from [step 4](#4-create-the-slot-store-and-install) on can be done by hand
 on its USB serial console, and `STORE=/store slotctl status` there says how far it got.
 
@@ -131,8 +146,8 @@ The boot image is the kernel plus the small rescue environment that sets a unit 
   `techo5-boot-crown-<version>.img`, each built against that board's own
   kernel and device tree — from the same
   [release](https://github.com/wobsoriano/hey-muse/releases) as the root filesystem. The boot image
-  changes rarely, so most releases don't carry one; when yours doesn't, take it from the newest
-  earlier release that does. It carries no SSH key, so steps 4 and 5 are typed into the unit's
+  changes rarely, so a release may not carry one for your model; when yours doesn't, take it from
+  the newest earlier release that does. It carries no SSH key, so steps 4 and 5 are typed into the unit's
   **USB serial console**.
 - **Built yourself with your own SSH key**, to SSH into the rescue environment instead:
 
@@ -148,6 +163,10 @@ and Bluetooth modules load. Check before flashing:
 ```
 adb -s <serial> shell uname -r      # must be 4.9.337-g8d928c5176cc
 ```
+
+That is the 2026-09-04 LineageOS build (`cronos` v0.4, `checkers` v0.7, `crown` v0.5). The builds of
+2026-10-14 run 4.9.337-g9ef8b783847e, a newer commit with a different kernel configuration, and are not
+supported yet: flash the 2026-09-04 zip in TWRP, or install from TWRP with `--lineage-zip`.
 
 ## 2. Put the root filesystem on the unit
 
@@ -170,9 +189,10 @@ fastboot -s <serial> continue
 ```
 
 The unit boots the TECHO5 initramfs. With LineageOS still on `system` there is no slot store, so it
-stays in the **rescue environment**: it joins the Wi-Fi network Android saved and puts **RESCUE** on
-the screen, with a ticking clock and a line saying why — at this point, "No slot store yet - normal
-at install", which is exactly where you should be. Open a root shell on it:
+stays in the **rescue environment**: it joins the Wi-Fi network Android saved and shows a test screen,
+color bars with TECHO5 and a ticking clock. That is exactly where you should be. (A boot image built
+from newer sources puts **RESCUE** on the screen instead, with a line saying why — at this point, "No
+slot store yet - normal at install".) Open a root shell on it:
 
 - **USB serial console** (any boot image), at 115200 baud; press Enter for a `#` prompt:
   - Windows: a new "USB Serial Device (COMn)" in Device Manager; open it in PuTTY (connection type
@@ -205,7 +225,7 @@ PATH=/usr/local/sbin:$PATH
 slotctl mkstore /dev/mmcblk0p12 --i-know-this-erases-it
 tar -xf /data/techo5-linux/vendor.tar -C /store   # kept in the store from now on
 STORE=/store slotctl install /data/media/0/Download/techo5-rootfs-<version>.tar.gz
-[ -e /store/slots/a/vendor/lib/modules/mt76x8_wlan.ko ] || cp -a /store/vendor/. /store/slots/a/vendor/
+[ -e /store/slots/a/vendor/lib/modules/mt76x8_wlan.ko ] || { mkdir -p /store/slots/a/vendor && cp -a /store/vendor/. /store/slots/a/vendor/; }
 rm /data/techo5-linux/vendor.tar
 STORE=/store slotctl status                       # slot a: trial 3
 ```
@@ -267,11 +287,12 @@ ESPHome integration by hand with host `<address>` and port 6053.
 Then:
 
 - **Time zone**: nothing to set. The unit starts on UTC and takes Home Assistant's zone as soon as it
-  connects, and keeps it from then on.
+  connects, and keeps it from then on. A unit with no internet can use a time server on your own
+  network (setup page, General, Time server), or takes Home Assistant's time when it connects.
 - **Wake word**: the default is "Alexa". Change it on the device (swipe down from the top, Sound,
   Wake word) or in Home Assistant; the other follows.
-- **Home Assistant token** (optional, for the forecast page, local radio stations, the list of
-  weather sources, and cameras): create a long-lived access token on your Home Assistant profile page, then run
+- **Home Assistant token** (optional, for the forecast page, local radio stations and the radio's
+  star, the list of weather sources, and cameras): create a long-lived access token on your Home Assistant profile page, then run
   the `esphome.<device>_home_assistant` action with `url` (like `http://192.168.1.20:8123`) and
   `token`.
 - **Weather**: Home Assistant's own forecast by default. To show another weather entity, use the
@@ -288,14 +309,16 @@ Then:
 ## Updating the boot image
 
 A firmware update replaces the root filesystem and leaves the boot image (the kernel) alone. When a
-release has a new boot image for your model, put it on over SSH. v1.0.1 has one for the 1st gen
-Show 5 (`techo5-boot-checkers-v1.0.1.img`) and the Show 8 (`techo5-boot-crown-v1.0.1.img`), so a
-quick tap to unmute no longer leaves the camera off. The 2nd gen Show 5 doesn't need it.
+release has a new boot image for your model, put it on over SSH. The release's notes say what a new
+image changes. For the 1st gen Show 5 and the Show 8 it is `techo5-boot-checkers-<version>.img` or
+`techo5-boot-crown-<version>.img`. A unit installed before v1.2.10 needs one so that it starts with
+headphones plugged in instead of stopping at the logo, and one from before v1.0.1 needs one for the
+camera after a quick tap to unmute. The 2nd gen Show 5 uses `techo5-boot-<version>.img`.
 
 Turn **SSH** on, then from the folder you downloaded the image to:
 
 ```
-scp -O techo5-boot-<board>-v1.0.1.img root@<address>:/tmp/boot.img
+scp -O techo5-boot-<board>-<version>.img root@<address>:/tmp/boot.img
 ssh root@<address>
 ```
 
@@ -310,16 +333,26 @@ p=$(grep -l '^PARTNAME=boot$' /sys/class/block/mmcblk0p*/uevent); p=/dev/$(basen
 ```
 
 Settings, slots and Home Assistant are kept; only the kernel and the rescue environment change.
+To go back, do the same with the image from the release you had before. If the unit no
+longer starts, flash that image with fastboot as in [step 3](#3-flash-the-boot-image).
 
 ## Radio
 
 There are three places a station can come from. Any of them works on its own.
 
-**1. Radio Browser (needs the Home Assistant token).** On a Show, swipe in from the right edge of
-the clock and choose Radio; on a Spot, turn the dial to Radio. The device lists stations near home
-and popular ones, from the Radio Browser integration Home Assistant sets up by itself. If it is
-missing, add it under Devices & services. "Near home" is worked out from the location set in Home
-Assistant, so set that if the list looks like somebody else's country.
+**1. Radio Browser.** On a Show, swipe in from the right edge of the clock and choose Radio; on a
+Spot, turn the dial to Radio. The device lists stations near home and popular ones. Where the lists
+come from, and what plays a station, depends on the Home Assistant token:
+
+- **With the token**, the lists come from the Radio Browser integration Home Assistant sets up by
+  itself (if it is missing, add it under Devices & services), and a station plays through Home
+  Assistant: the device asks for it with `media_player.play_media` on its own player, and Home
+  Assistant fetches the stream and converts it for the device. "Near home" is worked out from the
+  location set in Home Assistant, so set that if the list looks like somebody else's country.
+- **Without it**, the device asks radio-browser.info itself, for stations near the place set on its
+  setup page, and plays the stream itself, with no Home Assistant in the path. Only MP3 stations are
+  listed then, the kind the device plays on its own, unless the device's Music Assistant connection
+  is set up and reachable to play the rest.
 
 **2. Stations kept on the device (needs nothing at all).** Open the setup page (Settings, Privacy,
 Setup page) and add a station as a name and the address of its stream. The device plays these
@@ -331,16 +364,23 @@ Home Assistant.
   screen, and a Dot has none. Ask it for music through Home Assistant until that is fixed.
 
 **3. Your own favorites in Home Assistant.** If you already have an input_select of stations and a
-script that plays one, wire them up with the `esphome.<device>_home_radio` action:
+script that plays one, wire them up with the `esphome.<device>_home_radio` action (all of it in
+[Wire up the radio page](actions.md#wire-up-the-radio-page)). The device calls the script over its
+ESPHome connection, which needs **Allow the device to perform Home Assistant actions** turned on in
+its ESPHome entry (Configure); without it, picking a favorite does nothing. Home Assistant refuses
+the call without telling the device, so when nothing of the station shows up within a few seconds,
+the screen says so: "Home Assistant didn't start the stream", asking about that setting, and the log
+says `Home Assistant did not start the station`. Every argument has to be in the call, even the ones with a default: send `""` for those, or Home Assistant refuses the call
+with `required key not provided`.
 
 | Argument | What it is |
 |---|---|
 | `stations` | `input_select` entities whose options are station names, comma separated, listed in that order |
 | `now` | an entity whose state names the station playing, shown on the screen while it plays |
 | `service` | the script that plays a station, e.g. `script.radio_play_on_speaker` |
-| `field` | the script's station argument (default `station`) |
-| `speaker_field` | the script's argument for which speaker to play on |
-| `speaker` | this device's media player entity, if the device should not work it out itself |
+| `field` | the script's station argument (`""` for `station`) |
+| `speaker_field` | the script's argument for which speaker to play on (`""` for `speaker`) |
+| `speaker` | this device's media player entity, or `""` for the device to work it out itself |
 
 The device calls that script with the station name and its own media player entity, and the script
 decides what to play. A script of two lines is enough:
@@ -362,6 +402,94 @@ radio_play_on_speaker:
         media_content_id: "{{ urls[station] }}"
 ```
 
+The `input_select`'s options are the station names the Favorites list shows, and the keys in `urls`
+are the same names (without an " on TuneIn" or " on iHeartRadio" at the end, which the device drops
+before it calls the script). In Home Assistant's script editor (**Edit in YAML**), leave out the
+first line, which is the script's id, and paste the rest one level less indented.
+
+**Stations from more than one place.** A station without a plain stream address can be played
+another way in the same script. This one plays a stream address if it has one, a Radio Browser
+station by its id (the `stationuuid` on radio-browser.info), and asks Music Assistant for anything
+else by name, which is how TuneIn stations play (with the TuneIn provider added in Music Assistant):
+
+```yaml
+radio_play_on_speaker:
+  fields:
+    station: {}
+    speaker: {}
+  variables:
+    urls:
+      "KXYZ 101.1": "https://stream.example.org/kxyz.mp3"
+    radio_browser:
+      "The Mountain": "<stationuuid>"
+    # This device's player from the Music Assistant integration, not its ESPHome one
+    music_assistant_player: media_player.kitchen_2
+  sequence:
+    - choose:
+        - conditions: "{{ station in urls }}"
+          sequence:
+            - action: media_player.play_media
+              target: { entity_id: "{{ speaker }}" }
+              data:
+                media_content_type: music
+                media_content_id: "{{ urls[station] }}"
+        - conditions: "{{ station in radio_browser }}"
+          sequence:
+            - action: media_player.play_media
+              target: { entity_id: "{{ speaker }}" }
+              data:
+                media_content_type: music
+                media_content_id: "media-source://radio_browser/{{ radio_browser[station] }}"
+      default:
+        - action: music_assistant.play_media
+          target: { entity_id: "{{ music_assistant_player }}" }
+          data:
+            media_id: "{{ station }}"
+            media_type: radio
+```
+
+The device drops " on TuneIn" or " on iHeartRadio" from the end of a name before it calls the
+script, so an option "BBC Radio 1 on TuneIn" reaches it as "BBC Radio 1".
+
+**Done when.** `home_radio` is called once, from Developer Tools → Actions or a script; the device
+keeps the wiring and follows the entities from then on, so it is called again only to change them.
+The device only reads `now`. Have the play script (or an automation) set it to the station's name
+each time one starts, with an `input_text` for instance. When the device cannot name a stream itself,
+which is most of the time, it is the name the screen shows while a station plays and the name the
+star saves:
+
+```yaml
+    - action: input_text.set_value
+      target: { entity_id: input_text.radio_now }
+      data: { value: "{{ station }}" }
+```
+
+**The star on the player.** Tapping the star while a station plays saves it to your favorites. The
+device does that by calling a script named exactly `script.radio_favorite_add_station`, with one
+field, `station` (the station's name), using the Home Assistant token. Nothing creates the script;
+without it the screen says "Couldn't save the station" and names the script, and the log says
+`saving to favorites failed` with a `400`. This one adds the station to the favorites `input_select`:
+
+```yaml
+radio_favorite_add_station:
+  fields:
+    station: {}
+  sequence:
+    - variables:
+        options: "{{ state_attr('input_select.radio_stations', 'options') or [] }}"
+    - condition: template
+      value_template: "{{ station not in options }}"
+    - action: input_select.set_options
+      target: { entity_id: input_select.radio_stations }
+      data:
+        options: "{{ options + [station] }}"
+```
+
+The play script then has to know how to play the new name: the Music Assistant fallback above plays
+any station by name. Options set with `input_select.set_options` last only until Home Assistant
+restarts, when the helper's own list comes back; add a station you want to keep to the helper's
+options too (Settings → Devices & services → Helpers).
+
 **Nothing to set up for the audio itself.** Home Assistant transcodes a stream for the device
 through its own ESPHome proxy, which is part of that integration: the URLs in the log with
 `/api/esphome/ffmpeg_proxy/` in them are its doing, and there is nothing to install or configure.
@@ -372,14 +500,108 @@ It will do that three times in ten minutes and then leave it off, since a statio
 up is not going to. The log says `the stream ended by itself, putting it back on`. Music starting
 again on its own is this, not a fault.
 
+**If it says playing and nothing comes out.** Home Assistant and the screen show a station as
+playing even when not a byte of it arrives. The device's log says why (setup page, General →
+Download diagnostics; with SSH on, `/data/techo5-linux/techo5.log`). Look for `playing media` with
+the address the device was handed, then `playing media failed`, or
+`media: the live stream dropped; fetching it again` with `ran=0s`: the stream ended before it began.
+An address with `/api/esphome/ffmpeg_proxy/` in it is Home Assistant's own, made from the URLs in
+its Settings → System → Network, and the device has to reach it exactly as written. If it cannot,
+set the **Local network** (internal) URL there to an address the device can reach, with the scheme
+Home Assistant answers on: `https://` if Home Assistant serves HTTPS itself, since a plain `http://`
+address then gets no answer.
+
+## If the install stops at the slot store
+
+Once the installer has flashed TECHO5's boot image, the unit runs its rescue environment (the screen
+says RESCUE, or shows color bars with TECHO5 and a clock) while the installer saves LineageOS's vendor
+tree, erases the system partition into the slot store and installs the release into slot a. If the
+installer stops there, for example because the unit restarted partway or its USB went away, the unit
+isn't lost. The installer's message says whether anything was erased:
+
+- **Nothing was erased yet** (it stopped while saving the vendor tree): LineageOS is still on the unit.
+  Run the installer again, or put LineageOS back as in "To go back to LineageOS" below.
+- **The system partition may be, or is, erased**: finish by hand as below.
+
+Finish on the unit's USB console: a terminal on the port the installer named, at 115200 (`screen
+/dev/ttyACM0 115200` on Linux or macOS, PuTTY on Windows). The port can come back under another name
+after a restart.
+
+If the unit restarted by itself, also run these once it is back on the console, and attach what they
+print to an issue (the installer saves the same to `slot-store-restart.txt` in the unit's folder under
+`backups/` when it sees the unit come back):
+
+```
+mount -t pstore pstore /sys/fs/pstore 2>/dev/null
+cat /sys/fs/pstore/console-ramoops* /proc/last_kmsg 2>/dev/null | tail -200
+tail -100 /data/techo5-linux/rescue.log
+```
+
+1. Keep the rescue environment up, and see how far it got:
+   ```
+   touch /tmp/stay
+   PATH=/usr/local/sbin:$PATH
+   STORE=/store slotctl status; ls /store; ls -la /data/techo5-linux /data/media/0/Download
+   ```
+2. If `slotctl status` says there is no store (no `/store/.techo5-store`), the store was not made yet.
+   First check that the saved vendor tree is this unit's and whole: the serial is the unit you mean,
+   and the list shows the Wi-Fi driver.
+   ```
+   cat /proc/idme/serial
+   tar -tf /data/techo5-linux/vendor.tar | grep mt76x8_wlan.ko
+   ```
+   If it does, make the store (this erases the system partition), then go on with step 3:
+   ```
+   umount /android 2>/dev/null
+   slotctl mkstore /dev/mmcblk0p12 --i-know-this-erases-it
+   ```
+   Don't run the `tar -cf` line from [step 4](#4-create-the-slot-store-and-install) here: it would
+   overwrite the saved copy, which may be the only one left. If `vendor.tar` is missing or doesn't list
+   the driver, stop here and open an issue with what step 1 printed.
+3. If `/store` has no `vendor` folder, put this unit's vendor tree there from the copy the installer
+   kept:
+   ```
+   tar -xf /data/techo5-linux/vendor.tar -C /store
+   ls /store/vendor/lib/modules/mt76x8_wlan.ko
+   ```
+4. Install the release into slot a (it takes a few minutes; use the file name `ls` showed), and give slot
+   a the vendor tree. If `slotctl status` in step 1 already showed slot a, skip the `slotctl install`
+   line.
+   ```
+   STORE=/store slotctl install /data/media/0/Download/techo5-rootfs-<version>.tar.gz
+   [ -e /store/slots/a/vendor/lib/modules/mt76x8_wlan.ko ] || { mkdir -p /store/slots/a/vendor && cp -a /store/vendor/. /store/slots/a/vendor/; }
+   rm -f /data/techo5-linux/vendor.tar
+   STORE=/store slotctl status
+   ```
+5. Write the unit's name and Home Assistant key as [step 5](#5-provision-before-the-first-boot) does.
+   The installer keeps the key in `backups/<serial>/home-assistant.key`; use that one, so Home Assistant
+   keeps the device:
+   ```
+   mkdir -p /data/misc/techo5
+   printf 'Kitchen\n' > /data/misc/techo5/name
+   (umask 077; printf '%s\n' '<the key from home-assistant.key>' > /data/misc/techo5/psk)
+   sync
+   ```
+6. Restart, and add it to Home Assistant as after any install:
+   ```
+   /bin/busybox.static reboot -f
+   ```
+   If the screen then stops at "hacked fastboot", run `fastboot -s <serial> continue` on the computer.
+   After five healthy minutes the slot keeps itself (`slotctl status` shows `good`).
+
 ## Troubleshooting
 
 | Symptom | Cause and fix |
 |---|---|
 | The daemon restarts every few seconds on a fresh install, log shows `slice bounds out of range` in `microwakeword` | v0.2.5 shipped damaged wake word models. Use v0.2.6 or later; on a unit already installed, copy good `.tflite` files over `/data/misc/techo5/models/`. |
 | An update from Home Assistant fails with `context deadline exceeded` | The download was too slow, usually on 2.4 GHz next to the unit's own Bluetooth. Press Install again; from v0.2.5 the unit moves itself to the network's 5 GHz radio when one is in range. |
+| An update from Home Assistant is slow, or fails with `nothing arrived` or `gave up after 2h0m0s` | The download is slow or keeps stalling. Newer builds keep what they fetched and carry on from there, on their own and on the next press of Install, and give up only after two hours. A download from the internet that crawls under 50 kB/s while the Wi-Fi is up gets one Wi-Fi reassociation (at most once every 6 hours); the log says `a download from the internet is crawling`. If it is still slow, reconnect the unit's Wi-Fi or restart it, then press Install again. |
 | The screen shows "hacked fastboot" | A leftover `reboot bootloader` request: `fastboot -s <serial> continue`. |
 | No SSH after the switch to the slot | SSH is off unless step 5 was done: turn on the SSH switch in Home Assistant and send a key with the `ssh_keys` action, or use the USB serial console. |
+| A phone pairs over Bluetooth, then drops after a second or two | Some newer phones are dropped while the controller has Secure Connections on (#183). Turn off **Bluetooth Secure Connections** (Settings > Connections, the setup page's Connections tab, or Home Assistant), forget the device on the phone and pair again. See [Music](setup.md#5-music) for what it costs. |
+| The device jumps to full volume when a computer plays to it over Bluetooth | The computer reports full volume once and turns its own sound down itself, often on Linux (#245). Turn off **Bluetooth sets the volume** (the setup page's Connections tab, or Home Assistant): the device then keeps its own volume. See [Music](setup.md#5-music). |
+| The radio says playing and stays quiet | The stream never arrived. See "If it says playing and nothing comes out" at the end of [Radio](#radio). |
+| Picking a favorite station shows "Home Assistant didn't start the stream" | Home Assistant refused the device's call to the radio script. Turn on **Allow the device to perform Home Assistant actions** in the device's ESPHome entry (Configure), then pick the station again. See [Radio](#radio). |
 | The unit sits in rescue | The screen says so: **RESCUE**, with the reason on the last line. No bootable slot. `slotctl status` shows why; the daemon still runs from a slot in rescue, so Home Assistant keeps working while you look. |
 
 To go back to LineageOS: boot TWRP from `recovery`, flash the LineageOS zip (which rewrites `system`)

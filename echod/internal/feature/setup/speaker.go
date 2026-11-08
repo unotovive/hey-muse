@@ -31,6 +31,21 @@ func speakerSection(w http.ResponseWriter, token string) {
 	fmt.Fprintf(w, `<label for="volume">Volume, 0 to %d</label>
 	 <input id="volume" name="volume" type="number" min="0" max="%d" value="%d"><input type="hidden" name="was_volume" value="%d">`,
 		media.VolumeSteps, media.VolumeSteps, vol, vol)
+	if p.SpeakerGainAvailable() {
+		gain := p.SpeakerGain()
+		fmt.Fprintf(w, `<label for="gain">Speaker gain, dB (0 is normal)</label>
+	 <input id="gain" name="gain" type="number" min="0" max="%d" step="1" value="%d"><input type="hidden" name="was_gain" value="%d">
+	 <p>Boosts can distort, especially at high volume or with raised bass or treble, and make the wake word harder to catch over loud music. Set 0 dB to restore normal gain.</p>`,
+			config.SpeakerGainMax, gain, gain)
+	}
+	if p.LouderTopAvailable() {
+		top := p.LouderTop()
+		fmt.Fprintf(w, `<p><label><input type="checkbox" name="top" value="yes" style="width:auto"%s> Louder top volume:
+	  the steps above 16 go up to 8 dB hotter into the tuning, for music that stays too quiet at full volume; can distort with Speaker gain raised</label><input type="hidden" name="was_top" value="%t"></p>`, checkedIf(top), top)
+	}
+	louder := c.Speaker.LouderSpeech
+	fmt.Fprintf(w, `<p><label><input type="checkbox" name="louder" value="yes" style="width:auto"%s> Louder speech:
+	  replies and announcements compressed so the quiet parts of words are heard; music is not changed</label><input type="hidden" name="was_louder" value="%t"></p>`, checkedIf(louder), louder)
 
 	if models := wake.Lib().Ours(); len(models) > 0 {
 		cur := c.Wake.Slot(0).ID
@@ -63,8 +78,19 @@ func speakerSection(w http.ResponseWriter, token string) {
 	fmt.Fprintf(w, `<label for="night">Night volume: turned down to this as quiet hours start, and back after; 0 for none</label>
 	 <input id="night" name="night" type="number" min="0" max="%d" value="%d"><input type="hidden" name="was_night" value="%d">`,
 		media.VolumeSteps, night, night)
+	voiceOff, callOff := p.VoiceOffset(), p.CallOffset()
+	fmt.Fprintf(w, `<label for="voicevol">Voice volume: replies and announcements, in steps from the volume (0 is the same, -5 quieter, 5 louder; never the music)</label>
+	 <input id="voicevol" name="voicevol" type="number" min="-%d" max="%d" value="%d"><input type="hidden" name="was_voicevol" value="%d">
+	 <label for="callvol">Call volume: intercom and phone calls, in steps from the volume</label>
+	 <input id="callvol" name="callvol" type="number" min="-%d" max="%d" value="%d"><input type="hidden" name="was_callvol" value="%d">`,
+		media.VolumeSteps, media.VolumeSteps, voiceOff, voiceOff, media.VolumeSteps, media.VolumeSteps, callOff, callOff)
 	if speaker.HasJack {
 		choiceField(w, "output", "Audio output", media.OutputChoices(), p.Output())
+	}
+	if speaker.Get().CanStereo() {
+		st := p.Stereo()
+		fmt.Fprintf(w, `<p><label><input type="checkbox" name="stereo" value="yes" style="width:auto"%s> Stereo speakers:
+	  left and right on their own speakers; can make the wake word harder to catch over music</label><input type="hidden" name="was_stereo" value="%t"></p>`, checkedIf(st), st)
 	}
 
 	dnd := c.Home.DoNotDisturb
@@ -111,6 +137,19 @@ func level(r *http.Request, name, what string) (n int, ok bool, problem string) 
 	return n, true, ""
 }
 
+// offset reads a -VolumeSteps..VolumeSteps field that changed, as level does for a level.
+func offset(r *http.Request, name, what string) (n int, ok bool, problem string) {
+	v, ok := changed(r, name)
+	if !ok {
+		return 0, false, ""
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || n < -media.VolumeSteps || n > media.VolumeSteps {
+		return 0, false, fmt.Sprintf("the %s is a number from -%d to %d", what, media.VolumeSteps, media.VolumeSteps)
+	}
+	return n, true, ""
+}
+
 func saveSpeaker(r *http.Request) string {
 	_ = r.ParseForm()
 	p := media.Get()
@@ -122,6 +161,23 @@ func saveSpeaker(r *http.Request) string {
 	night, nightChanged, problem := level(r, "night", "night volume")
 	if problem != "" {
 		return problem
+	}
+	voiceOff, voiceChanged, problem := offset(r, "voicevol", "voice volume")
+	if problem != "" {
+		return problem
+	}
+	callOff, callChanged, problem := offset(r, "callvol", "call volume")
+	if problem != "" {
+		return problem
+	}
+	gain, gainChanged, problem := gainLevel(r, p.SpeakerGainAvailable())
+	if problem != "" {
+		return problem
+	}
+	if gainChanged {
+		if err := p.SetSpeakerGain(gain); err != nil {
+			return "the speaker gain could not be saved: " + err.Error()
+		}
 	}
 	if volChanged {
 		p.Adjust(vol - p.Volume())
@@ -147,13 +203,34 @@ func saveSpeaker(r *http.Request) string {
 	if nightChanged {
 		p.SetNightVolume(night)
 	}
+	if voiceChanged {
+		p.SetVoiceOffset(voiceOff)
+	}
+	if callChanged {
+		p.SetCallOffset(callOff)
+	}
 	if v, ok := changed(r, "output"); ok && speaker.HasJack {
 		if !oneOf(v, media.OutputChoices()) {
 			return "that is not one of the outputs"
 		}
 		p.SetOutput(v)
 	}
-	// A checkbox left clear sends nothing, so do not disturb is read from whether it came.
+	// A checkbox left clear sends nothing, so these are read from whether they came.
+	if was := r.PostFormValue("was_stereo"); was != "" && speaker.Get().CanStereo() {
+		if on := r.PostFormValue("stereo") == "yes"; strconv.FormatBool(on) != was {
+			p.SetStereo(on)
+		}
+	}
+	if was := r.PostFormValue("was_top"); was != "" && p.LouderTopAvailable() {
+		if on := r.PostFormValue("top") == "yes"; strconv.FormatBool(on) != was {
+			p.SetLouderTop(on)
+		}
+	}
+	if was := r.PostFormValue("was_louder"); was != "" {
+		if on := r.PostFormValue("louder") == "yes"; strconv.FormatBool(on) != was {
+			p.SetLouderSpeech(on)
+		}
+	}
 	if was := r.PostFormValue("was_dnd"); was != "" {
 		if on := r.PostFormValue("dnd") == "yes"; strconv.FormatBool(on) != was {
 			phone.Get().SetDoNotDisturb(on)
@@ -161,6 +238,21 @@ func saveSpeaker(r *http.Request) string {
 	}
 	slog.Info("setup page: speaker and voice saved")
 	return ""
+}
+
+func gainLevel(r *http.Request, available bool) (n int, ok bool, problem string) {
+	v, ok := changed(r, "gain")
+	if !ok {
+		return 0, false, ""
+	}
+	if !available {
+		return 0, false, "speaker gain is not supported on this amplifier"
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || n < 0 || n > config.SpeakerGainMax {
+		return 0, false, fmt.Sprintf("the speaker gain is a whole number from 0 to %d dB", config.SpeakerGainMax)
+	}
+	return n, true, ""
 }
 
 func oneOf(v string, list []string) bool {

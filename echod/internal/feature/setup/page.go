@@ -2,23 +2,30 @@ package setup
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"html"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/HuskerMinion/techo5/echod/internal/config"
+	"github.com/HuskerMinion/techo5/echod/internal/feature/announce"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/api"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/diag"
+	"github.com/HuskerMinion/techo5/echod/internal/feature/firstrun"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/home"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/media"
 	gadget "github.com/HuskerMinion/techo5/echod/internal/feature/muse"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/timezone"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/web"
+	"github.com/HuskerMinion/techo5/echod/internal/hardware/speaker"
 	"github.com/HuskerMinion/techo5/echod/internal/layout"
 	"github.com/HuskerMinion/techo5/echod/internal/lib/wifi"
 )
@@ -36,8 +43,17 @@ const maxDeckBody = 128 << 10
 // cookieName is the session a press hands out.
 const cookieName = "techo5_setup"
 
+// sweptUploads is the sweep of what sound uploads a power cut stopped left behind, made once a process.
+// The supervisor runs Run again after it fails, and by then the page may be open with an upload half
+// written under its temporary name: a sweep at every Run would delete it from under its writer.
+var sweptUploads sync.Once
+
 // Run closes the page when it has been left alone, and keeps Home Assistant's switch honest.
 func (f *Feature) Run(ctx context.Context) error {
+	// The first thing at a start, before the page can be opened to send one: what an upload a power cut
+	// stopped left behind. The wake word library sweeps its own as it is made.
+	sweptUploads.Do(speaker.SweepUploads)
+
 	t := time.NewTicker(15 * time.Second)
 	defer t.Stop()
 	for {
@@ -46,6 +62,7 @@ func (f *Feature) Run(ctx context.Context) error {
 			return nil
 		case <-t.C:
 		}
+		f.showAsking() // a browser that gave up asking is not still asking in Home Assistant
 		if !f.On() {
 			f.mu.Lock()
 			stale := !f.openedAt.IsZero()
@@ -61,7 +78,8 @@ func (f *Feature) serve(w http.ResponseWriter, r *http.Request) {
 	// Only a browser that has been let in keeps the page open. Anything else on the network can ask
 	// for this path as often as it likes, and the idle time is there to close the page when the
 	// person who opened it has walked away — a scanner or a stale tab must not hold it open for them.
-	if _, in := f.session(r); in {
+	// A view polling on its own is not somebody there either (watching).
+	if _, in := f.session(r); in && !watching[strings.TrimSuffix(r.URL.Path, "/")] {
 		f.used()
 	}
 	switch strings.TrimSuffix(r.URL.Path, "/") {
@@ -75,12 +93,32 @@ func (f *Feature) serve(w http.ResponseWriter, r *http.Request) {
 		f.save(w, r)
 	case "/setup/photo":
 		f.photo(w, r)
+	case "/setup/font":
+		f.font(w, r)
+	case "/setup/sound":
+		f.sound(w, r)
+	case "/setup/soundpack":
+		f.soundPack(w, r)
+	case "/setup/wakeword":
+		f.wakeWordUpload(w, r)
 	case "/setup/diagnostics.txt":
 		f.diagnostics(w, r)
+	case "/setup/settings.json":
+		f.settingsFile(w, r)
+	case "/setup/restore":
+		f.restore(w, r)
 	default:
+		if route, ok := routes[strings.TrimSuffix(r.URL.Path, "/")]; ok {
+			route(f, w, r)
+			return
+		}
 		http.NotFound(w, r)
 	}
 }
+
+// watching is the paths a view left up on the page asks for by itself. Answering them is not the page
+// being used: a tab left watching the scores would otherwise hold the page open for as long as it ran.
+var watching = map[string]bool{"/setup/scores": true, "/setup/takes/state": true, "/setup/log/stream": true}
 
 // diagnostics hands over everything worth having when something is wrong, with the addresses, names,
 // keys and serial numbers already replaced — so that somebody can send it to an issue without
@@ -118,11 +156,23 @@ func (f *Feature) index(w http.ResponseWriter, r *http.Request) {
 	token, in := f.session(r)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
+	// A one-time code from first run's Bluetooth setup lets this browser in with no press
+	// (firstrun_code.go).
+	if !in && f.enterWithCode(w, r) {
+		http.Redirect(w, r, firstRunPath, http.StatusSeeOther)
+		return
+	}
 	if !in {
 		f.lockedPage(w)
 		return
 	}
 	q := r.URL.Query()
+	// First run still to do opens on its own page (firstrun_page.go); "all" is the way past it to
+	// every setting.
+	if firstrun.Pending() && q.Get("all") == "" && q.Get("tab") == "" {
+		http.Redirect(w, r, firstRunPath, http.StatusSeeOther)
+		return
+	}
 	f.settingsPage(r.Context(), w, token, tabOf(q.Get("tab")), q.Get("saved"), q.Get("renamed"), q.Get("problem"), q.Get("scan") != "")
 }
 
@@ -132,7 +182,11 @@ func (f *Feature) wait(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "post to ask", http.StatusMethodNotAllowed)
 		return
 	}
-	token, ok := f.await()
+	from, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		from = r.RemoteAddr
+	}
+	token, ok := f.awaitFrom(from, web.AwayRequest(r)) // for Home Assistant's let in (remote.go)
 	if !ok {
 		if f.ShutOut() {
 			http.Error(w, "too many tries without a press on the device; try again in a few minutes",
@@ -150,8 +204,9 @@ func (f *Feature) wait(w http.ResponseWriter, r *http.Request) {
 		Name: cookieName, Value: token, Path: "/",
 		HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: int(life / time.Second),
 	})
+	f.showAsking()
 	f.Changed.Emit(struct{}{}) // the device says a browser is asking
-	slog.Info("setup page: a browser is asking to be let in")
+	slog.Info("setup page: a browser is asking to be let in", "from", from)
 	http.Redirect(w, r, "/setup", http.StatusSeeOther)
 }
 
@@ -192,7 +247,7 @@ func (f *Feature) save(w http.ResponseWriter, r *http.Request) {
 	}
 	// The form carries the session it came from, so a page on another site cannot post here with a
 	// browser's cookie.
-	if r.PostFormValue("token") != token {
+	if !sameToken(r.PostFormValue("token"), token) {
 		slog.Warn("setup page: a save arrived without the page's own token")
 		http.Error(w, "that form did not come from this page", http.StatusForbidden)
 		return
@@ -207,12 +262,25 @@ func (f *Feature) save(w http.ResponseWriter, r *http.Request) {
 			ssid = other
 		}
 		problem = joinWifi(r.Context(), ssid, r.PostFormValue("passphrase"))
+	case "address":
+		var handled bool
+		if problem, handled = saveAddress(w, r); handled {
+			return
+		}
 	case "forget":
 		ssid := strings.TrimSpace(r.PostFormValue("ssid"))
 		if err := wifi.Forget(r.Context(), ssid); err != nil {
 			problem = "could not forget " + ssid + ": " + err.Error()
 		} else {
 			slog.Info("setup page: a network was forgotten", "ssid", ssid)
+		}
+	case "giftreset":
+		if r.PostFormValue("understood") != "yes" {
+			problem = "tick the box to say you know everything on the device is cleared"
+		} else if err := firstrun.Reset(); err != nil {
+			problem = "the reset did not finish: " + err.Error()
+		} else {
+			renamed = true // the same banner: the device is restarting
 		}
 	case "name":
 		problem = rename(r.PostFormValue("name"), r.PostFormValue("understood") == "yes")
@@ -230,6 +298,8 @@ func (f *Feature) save(w http.ResponseWriter, r *http.Request) {
 		default:
 			problem = saveStations(r)
 		}
+	case "replyplayer":
+		problem = saveReplyPlayer(r.PostFormValue("player"))
 	case "house":
 		problem = saveHouse(r.PostFormValue("word"))
 	case "update-install", "update-check", "update-auto":
@@ -242,16 +312,44 @@ func (f *Feature) save(w http.ResponseWriter, r *http.Request) {
 		problem = saveMusic(r)
 	case "streaming":
 		problem = saveStreaming(r)
+	case "bluetooth":
+		problem = saveBluetooth(r)
 	case "speaker":
 		problem = saveSpeaker(r)
 	case "screen":
 		problem = saveScreen(r)
+	case "themes":
+		problem = saveThemes(r)
+	case "theme-colors":
+		problem = saveThemeColors(r)
 	case "listening":
 		problem = saveListening(r)
 	case "photos-remove":
 		problem = removePhotos(r)
+	case "immich":
+		problem = saveImmich(r)
+	case "immich-album":
+		problem = chooseImmichAlbum(r)
+	case "immich-show":
+		problem = saveImmichShow(r)
+	case "immich-forget":
+		problem = forgetImmich()
+	case "font-remove":
+		problem = removeFont(r)
+	case "sound-play":
+		problem = playSound(r)
+	case "sound-remove":
+		problem = removeSound(r)
+	case "wakeword-remove":
+		problem = removeWakeWord(r)
+	case "hacameras":
+		problem = saveHACameras(r)
 	case "reolink":
 		problem = saveReolink(r)
+	case "doorbell":
+		problem = saveDoorbell(r)
+	case "doorbell-chime":
+		chimeDoorbell()
 	case "talkback":
 		problem = saveTalkBack(r)
 	case "lock":
@@ -262,6 +360,10 @@ func (f *Feature) save(w http.ResponseWriter, r *http.Request) {
 		problem = saveCalendarLink(r)
 	case "calendar-remove":
 		problem = removeCalendarLink(r)
+	case "calendar-look":
+		problem = saveCalendarLook(r)
+	case "todo":
+		problem = saveTodo(r)
 	case "adopt":
 		if _, err := api.Get().OpenAdoption(); err != nil {
 			problem = "could not open the device to a Home Assistant: " + err.Error()
@@ -280,6 +382,10 @@ func (f *Feature) save(w http.ResponseWriter, r *http.Request) {
 		problem = saveDeckPC(r)
 	case "video":
 		problem = saveVideo(r)
+	case "tailscale":
+		problem = saveTailscale(r)
+	case "netbird":
+		problem = saveNetbird(r)
 	case "timezone":
 		zone := strings.TrimSpace(r.PostFormValue("zone"))
 		switch {
@@ -292,8 +398,14 @@ func (f *Feature) save(w http.ResponseWriter, r *http.Request) {
 				problem = "that is not a time zone this device knows: " + err.Error()
 			}
 		}
+	case "timeserver":
+		if err := timezone.SetServer(r.PostFormValue("server")); err != nil {
+			problem = err.Error()
+		}
 	default:
-		if !alarmSave(r, what, &problem) {
+		if save, ok := saves[what]; ok {
+			problem = save(r)
+		} else if !alarmSave(r, what, &problem) {
 			problem = "nothing to save"
 		}
 	}
@@ -335,7 +447,7 @@ func (f *Feature) settingsPage(ctx context.Context, w http.ResponseWriter, token
 	fmt.Fprintf(w, `<div class="wrap"><h1>%s</h1><p class="sub">Setup</p><div class="layout">`, html.EscapeString(deviceName()))
 	nav(w, tab)
 	fmt.Fprint(w, `<section>`)
-	for _, t := range tabs {
+	for _, t := range shownTabs() {
 		if t.id == tab {
 			fmt.Fprintf(w, `<h2>%s</h2>`, html.EscapeString(t.title))
 		}
@@ -359,40 +471,81 @@ func (f *Feature) settingsPage(ctx context.Context, w http.ResponseWriter, token
 		stationsSection(w, token)
 		musicSection(ctx, w, token)
 		streamingSection(w, token)
-		fmt.Fprint(w, `<h3>Voice</h3>`)
-		brainSection(w, token)
-		musePairingSection(w, token)
-		listeningSection(w, token)
-		houseSection(w, token)
+		// A device that cannot hear has no voice assistant, wake words or listening to set up: only the
+		// announcements it plays and its sounds are left of the group.
+		if layout.HasMicrophone() {
+			fmt.Fprint(w, `<h3>Voice</h3>`)
+			brainSection(w, token)
+			musePairingSection(w, token)
+			replyPlayerSection(w, token)
+			realtimeSection(w, token)
+			listeningSection(w, token)
+			houseSection(w, token)
+			phoneBookSection(w, token)
+			wakeCallSection(w, token)
+			wakeWordsSection(w, token)
+			scoresSection(w)
+			takesSection(w, token)
+			historySection(w, token)
+		} else {
+			fmt.Fprint(w, `<h3>Announcements and sounds</h3>`)
+			houseSection(w, token)
+		}
+		soundsSection(w, token)
 	case "alarms":
 		alarmsSection(w, token)
 	case "connections":
 		if wifi.Available() {
 			f.wifiSection(w, token, scan)
+			addressSection(w, token)
 		} else {
 			fmt.Fprint(w, `<fieldset><legend>Wi-Fi</legend><p class="note" style="margin:0">This device's network
 			 is not one this page can change.</p></fieldset>`)
 		}
+		bluetoothSection(w, token)
+		haCamerasSection(w, token)
 		reolinkSection(w, token)
-		talkBackSection(w, token)
+		go2rtcSection(w, token)
+		cameraListSection(w, token)
+		cameraButtonsSection(w, token)
+		doorbellSection(w, token)
+		tailscaleSection(w, token)
+		netbirdSection(w, token)
+		if layout.HasMicrophone() {
+			talkBackSection(w, token) // the microphones to a camera's speaker
+		}
 		dashboardSection(w, token)
 	case "photos":
 		screenSection(w, token)
+		themeSection(w, token)
+		ownFontsSection(w, token)
 		dashboardPanelSection(w, token)
 		deckSection(w, token)
 		videoSection(w, token)
+		immichSection(w, token)
 		photosSection(w, token)
 	case "weather":
 		placeSection(w, token)
 		calendarLinksSection(w, token)
+		calendarLookSection(w, token)
+		todoSection(w, token)
 	case "privacy":
 		lockSection(w, token)
+		camStreamSection(w, token)
+		babySection(w, token)
 		privacySection(w)
+		remoteSection(w, token)
 	case "general":
 		nameSection(w, token)
 		updatesSection(w, token)
 		timezoneSection(w, token)
+		timeServerSection(w, token)
 		homeAssistantSection(w, token)
+		if firstrun.CanReset() {
+			resetSection(w, token)
+		}
+		settingsFileSection(w, token)
+		shareSection(w, token)
 		diagnosticsSection(w)
 	}
 	fmt.Fprint(w, `</section></div></div>`)
@@ -400,11 +553,27 @@ func (f *Feature) settingsPage(ctx context.Context, w http.ResponseWriter, token
 
 // timezoneSection is which zone the clock shows.
 func timezoneSection(w http.ResponseWriter, token string) {
-	cur := timezone.Get().Current()
 	fmt.Fprint(w, `<form method="post" action="/setup/save"><fieldset><legend>Time zone</legend>`)
 	hidden(w, token, "timezone", "general")
+	zoneSelect(w)
+	fmt.Fprint(w, `<p class="note">The device's clock keeps time on its own; this is only
+	 which zone it shows.</p><p><button type="submit">Save</button></p></fieldset></form>`)
+}
+
+// zoneSelect is the list of zones, the one in force chosen: the General tab's and first run's.
+func zoneSelect(w io.Writer) {
+	cur := timezone.Get().Current()
 	fmt.Fprint(w, `<label for="zone">Zone</label><select id="zone" name="zone">`)
 	fmt.Fprintf(w, `<option value=""%s>Follow Home Assistant</option>`, selected(!timezone.Get().SetHere()))
+	if !timezone.HasDatabase() {
+		// An image without the zone database still puts the common zones in force (timezone.Common).
+		fmt.Fprint(w, `<optgroup label="Common">`)
+		for _, full := range timezone.Common {
+			fmt.Fprintf(w, `<option value="%s"%s>%s</option>`,
+				html.EscapeString(full), selected(full == cur && timezone.Get().SetHere()), html.EscapeString(full))
+		}
+		fmt.Fprint(w, `</optgroup>`)
+	}
 	for _, region := range timezone.Regions() {
 		fmt.Fprintf(w, `<optgroup label="%s">`, html.EscapeString(region))
 		for _, z := range timezone.Zones(region) {
@@ -414,8 +583,23 @@ func timezoneSection(w http.ResponseWriter, token string) {
 		}
 		fmt.Fprint(w, `</optgroup>`)
 	}
-	fmt.Fprint(w, `</select><p class="note">The device's clock keeps time on its own; this is only
-	 which zone it shows.</p><p><button type="submit">Save</button></p></fieldset></form>`)
+	fmt.Fprint(w, `</select>`)
+}
+
+// timeServerSection is a time server of the home's own, asked before the internet's.
+func timeServerSection(w http.ResponseWriter, token string) {
+	if !timezone.ServerSettable {
+		return
+	}
+	fmt.Fprint(w, `<form method="post" action="/setup/save"><fieldset><legend>Time server</legend>`)
+	hidden(w, token, "timeserver", "general")
+	fmt.Fprintf(w, `<label for="ntp">Your own time server (optional)</label>
+	 <input id="ntp" name="server" value="%s" placeholder="192.168.1.1" maxlength="253" autocomplete="off">
+	 <p class="note">The device sets its clock from time servers on the internet. A device that cannot
+	  reach them can use one on your network, like your router: it is asked first, and the internet's
+	  after it. %s Leave it empty for the internet's only. Without any time server, the clock is set
+	  from Home Assistant's when it connects.</p>
+	 <p><button type="submit">Save</button></p></fieldset></form>`, html.EscapeString(timezone.Server()), timezone.ServerWhen)
 }
 
 // privacySection says what the device has open, and what this page will never do. It shows and does
@@ -429,15 +613,30 @@ func privacySection(w http.ResponseWriter) {
 		}
 		return "off"
 	}
+	// A panel has no SSH and no camera page at all (privacy_panel.go): "off" would send somebody
+	// looking for a switch that is not there.
+	ssh, camera, missing := onOff(s.SSH), onOff(s.Camera), ""
+	if !sshHere {
+		ssh = "not available on this device"
+	}
+	if !cameraWebHere {
+		camera = "not available on this device"
+	}
+	if !sshHere || !cameraWebHere {
+		missing = " " + notHereWhy
+	}
 	fmt.Fprintf(w, `<fieldset><legend>What is switched on</legend>
 	 <p style="margin:0">SSH: %s · Camera on the network: %s · Screen on the network: %s</p>
 	 <p class="note">Shown here, not changed here. Change them on the device's own screen, or in Home
-	  Assistant.</p></fieldset>`, onOff(s.SSH), onOff(s.Camera), onOff(s.Screen))
+	  Assistant.%s</p></fieldset>`, ssh, camera, onOff(s.Screen), missing)
 	fmt.Fprint(w, `<fieldset><legend>This page</legend>
 	 <p class="note" style="margin:0">It opens only after a press on the device, and closes itself when it
 	  is left alone. It is on your own network, without encryption. It never touches SSH keys or the
 	  software the device runs, and never shows the Home Assistant key. It can let a Home Assistant add
-	  the device for 15 minutes (General), which sets a new key.</p></fieldset>`)
+	  the device for 15 minutes (General), which sets a new key. It can record takes of a word from the
+	  microphones (Sound &amp; Voice) only while Record takes of a word is switched on, and only after a
+	  press on the device for each recording; the takes stay in memory, and come to you over this page.
+	  It shows the baby monitor's link, and can replace it, but cannot switch the monitor on.</p></fieldset>`)
 }
 
 // wifiSection is the networks: what the device is on, what it remembers, and how to add another.
@@ -504,9 +703,10 @@ func (f *Feature) wifiSection(w http.ResponseWriter, token string, scan bool) {
 func diagnosticsSection(w http.ResponseWriter) {
 	fmt.Fprint(w, `<fieldset><legend>Something wrong?</legend>
 	 <p><a href="/setup/diagnostics.txt">Download diagnostics</a> — what this device knows about
-	  itself, the last of its log, and what it is set to.</p>
+	  itself, the last of its log, its recent wake words, and what it is set to.</p>
 	 <p class="note">Addresses, network names, keys and serial numbers are replaced before you get it,
 	  so it can go straight into an issue. Worth a look before you send it all the same.</p>
+	 <p><a href="/setup/log">Follow the log live</a> — the same log, with the same parts replaced, as it is written.</p>
 	 </fieldset>`)
 }
 
@@ -549,8 +749,6 @@ func stationsSection(w http.ResponseWriter, token string) {
 	 <p><button type="submit">Save stations</button></p></form></fieldset>`)
 }
 
-// saveStations takes the rows the form posted, in the order they were in. Names and addresses come
-// back as two lists of the same length, one row each.
 // playRow plays the row whose Play button was pressed, with the name and address as they stand in
 // the form. A row with nothing in it is a press on the spare row at the bottom, which is somebody
 // asking for nothing.
@@ -576,17 +774,25 @@ func playRow(r *http.Request) string {
 	return ""
 }
 
+// saveStations takes the rows the form posted, in the order they were in. Names and addresses come
+// back as two lists of the same length, one row each. A row whose name was cleared on a station
+// already kept is left out, whatever its address still says: that is how the note under the form
+// says a station is taken out. A new address typed without a name is a mistake, and said to be.
 func saveStations(r *http.Request) string {
 	names, urls := r.PostForm["name"], r.PostForm["url"]
 	if len(names) != len(urls) {
 		return "that form did not arrive whole"
 	}
+	kept := map[string]bool{}
+	for _, s := range home.OwnStations() {
+		kept[s.URL] = true
+	}
 	var list []config.Station
 	for i := range names {
 		name, u := strings.TrimSpace(names[i]), strings.TrimSpace(urls[i])
 		switch {
-		case name == "" && u == "":
-			continue // an empty row is one that was never filled in, or one being taken out
+		case name == "" && (u == "" || kept[u]):
+			continue // a row never filled in, or one being taken out
 		case name == "":
 			return "a station needs a name as well as an address"
 		case u == "":
@@ -666,11 +872,56 @@ func houseSection(w http.ResponseWriter, token string) {
 	 <p class="note">Type the <strong>same word on every device in this house</strong>. They then find
 	  each other on the network, and speaking to one plays it on the others. Anything that does not
 	  have the word is ignored.</p>
+	 <p class="note">Case-sensitive: it has to match the other devices' exactly, capitals included.</p>%s
 	 <p class="note">Leave it empty to turn announcements and intercom calls off here: the device takes
 	  neither. The other devices can still see it on the network, but what they send it is refused.
 	  Reminders set to go off on other devices use it too.</p>
+	 <p class="note">Make it a long phrase, %d characters or more. What the devices send each other is
+	  signed with it, and anything on the network that hears them can try words until one fits.</p>%s
 	 <p><button type="submit">Save</button></p></form></fieldset>`,
-		html.EscapeString(word))
+		html.EscapeString(word), otherWordNote(announce.OtherWords()), longHouseWord,
+		shortWordNote(word)+nearestWordNote(word, config.Get().Nearest.Enabled()))
+}
+
+// nearestWordNote is the warning for Nearest device answers switched on with no house word, which
+// leaves it doing nothing: the claims the devices send each other are signed with the word.
+func nearestWordNote(word string, nearest bool) string {
+	if word != "" || !nearest {
+		return ""
+	}
+	return `
+	 <p class="note"><strong>Nearest device answers is on, but it does nothing until this device has a
+	  house word.</strong> Set the same word here as on the other devices.</p>`
+}
+
+// otherWordNote names the devices here that refused this one's announcements in the last hour, for
+// having another house word.
+func otherWordNote(names []string) string {
+	if len(names) == 0 {
+		return ""
+	}
+	devices := "other devices here use"
+	if len(names) == 1 {
+		devices = "other device here uses"
+	}
+	return fmt.Sprintf(`
+	 <p class="note"><strong>%d %s a different house word: %s.</strong> They refuse what this one
+	  sends them. Check the word on each, capitals included.</p>`,
+		len(names), devices, html.EscapeString(strings.Join(names, ", ")))
+}
+
+// longHouseWord is how long a house word has to be before the page stops saying it is short. A short
+// one still works: it is a warning, not a refusal.
+const longHouseWord = 16
+
+// shortWordNote is the warning for a house word that is set and short.
+func shortWordNote(word string) string {
+	if word == "" || len([]rune(word)) >= longHouseWord {
+		return ""
+	}
+	return `
+	 <p class="note"><strong>This word is short.</strong> It works, but it is easy to guess: a longer one
+	  keeps the announcements, the intercom and the other devices' messages yours.</p>`
 }
 
 // saveHouse keeps the word, and then tells the web feature to look again: the port announcements
@@ -726,4 +977,9 @@ func deviceName() string {
 		return n
 	}
 	return layout.DefaultName
+}
+
+// sameToken is whether a form's token is the page's, compared in the same time whatever it holds.
+func sameToken(got, token string) bool {
+	return subtle.ConstantTimeCompare([]byte(got), []byte(token)) == 1
 }

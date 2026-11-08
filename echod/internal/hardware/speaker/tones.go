@@ -33,6 +33,12 @@ var (
 	TonePairing    = []Note{{Freq: 523, Ms: 70}, {Freq: 659, Ms: 70}, {Freq: 988, Ms: 140}}
 	TonePairingOff = []Note{{Freq: 988, Ms: 70}, {Freq: 659, Ms: 70}, {Freq: 523, Ms: 140}}
 
+	// ToneBTConnect and ToneBTDisconnect are a Bluetooth device (earbuds, a speaker, a phone)
+	// connecting and going: two notes, a fifth apart and higher than mute's, rising for on and falling
+	// for off.
+	ToneBTConnect    = []Note{{Freq: 659, Ms: 70}, {Freq: 988, Ms: 110}}
+	ToneBTDisconnect = []Note{{Freq: 988, Ms: 70}, {Freq: 659, Ms: 110}}
+
 	// TonePaired is pairing mode having worked: the pairing chime's top note twice, ending higher.
 	TonePaired = []Note{{Freq: 988, Ms: 90}, {Ms: 60}, {Freq: 1319, Ms: 200}}
 
@@ -64,17 +70,25 @@ var alarmSounds = []struct {
 	}},
 }
 
+// OwnAlarmSound is the alarm sound that is a recording of the owner's own (ClipAlarm, sent from the setup
+// page's Sounds of your own). Offered last; until there is a recording it rings with the first sound.
+const OwnAlarmSound = "Your own"
+
 // AlarmSounds lists the alarm sounds' names in the order they are offered.
 func AlarmSounds() []string {
-	names := make([]string, len(alarmSounds))
+	names := make([]string, len(alarmSounds), len(alarmSounds)+1)
 	for i, s := range alarmSounds {
 		names[i] = s.name
 	}
-	return names
+	return append(names, OwnAlarmSound)
 }
 
-// AlarmSound is one round of the named alarm sound; an unknown name is the first.
+// AlarmSound is one round of the named alarm sound; an unknown name is the first. The owner's own is
+// read as it rings, so a recording sent after the choice was made is the one heard.
 func AlarmSound(name string) []Note {
+	if name == OwnAlarmSound {
+		return ownOr(ClipAlarm, alarmSounds[0].notes)
+	}
 	for _, s := range alarmSounds {
 		if s.name == name {
 			return s.notes
@@ -142,6 +156,24 @@ func FailureSound() []Note { return ownOr(ClipFailure, ToneTrouble) }
 
 // CancelSound is what a request dropped on purpose sounds like: the owner's recording, or ToneCancel.
 func CancelSound() []Note { return ownOr(ClipCanceled, ToneCancel) }
+
+// VolumeSound is the click a volume change makes, ButtonSound a button held, BTConnectSound a
+// Bluetooth device connecting, and DropInSound the chime that comes before a Drop In: each the owner's
+// recording where there is one, else its notes. ListenEndSound is silent unless there is one.
+func VolumeSound() []Note    { return ownOr(ClipVolume, ToneVolume) }
+func ButtonSound() []Note    { return ownOr(ClipButton, ToneMuteHold) }
+func BTConnectSound() []Note { return ownOr(ClipBTConnect, ToneBTConnect) }
+func ListenEndSound() []Note { return ownOr(ClipListenEnd, nil) }
+func DropInSound() []Note {
+	return ownOr(ClipDropIn, []Note{{Freq: 880, Ms: 160}, {Freq: 0, Ms: 70}, {Freq: 1100, Ms: 220}})
+}
+
+// ToneAnnounce is what an announcement arrives with: two notes rising, distinct from the alarm's.
+var ToneAnnounce = []Note{{Freq: 659, Ms: 90}, {Freq: 988, Ms: 160}}
+
+// AnnounceSound is the chime before an announcement: the owner's recording where there is one, else
+// ToneAnnounce.
+func AnnounceSound() []Note { return ownOr(ClipAnnounce, ToneAnnounce) }
 
 func ownOr(c *Clip, notes []Note) []Note {
 	if n, ok := c.ownNote(); ok {

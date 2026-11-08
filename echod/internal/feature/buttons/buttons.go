@@ -1,4 +1,4 @@
-// Package buttons is the four buttons as Home Assistant sees them.
+// Package buttons is the four buttons, and a power key where there is one, as Home Assistant sees them.
 //
 // The device acts on a press itself; these are so an automation can act on one as well, including
 // the buttons the device does nothing with.
@@ -26,8 +26,16 @@ const (
 	LongHold = "long_hold"
 )
 
-// order is the buttons as Home Assistant lists them, since a map has none.
-var order = []buttons.Name{buttons.Action, buttons.Mute, buttons.VolumeDown, buttons.VolumeUp}
+// order is the buttons as Home Assistant lists them, since a map has none. The power key is listed
+// only where there is one: every Echo has the other four's entities, but a power key on a device
+// without one would sit at unknown for good.
+var order = func() []buttons.Name {
+	o := []buttons.Name{buttons.Action, buttons.Mute, buttons.VolumeDown, buttons.VolumeUp}
+	if buttons.Has(buttons.Power) {
+		o = append(o, buttons.Power)
+	}
+	return o
+}()
 
 type Events struct {
 	events map[buttons.Name]*esphome.Event
@@ -62,7 +70,12 @@ func Get() *Events {
 
 func (e *Events) Name() string { return "button events" }
 
+// Entities are none on a device without buttons of its own (a panel): events that can never fire
+// would only sit at unknown in Home Assistant.
 func (e *Events) Entities() []esphome.Entity {
+	if !buttons.Here {
+		return nil
+	}
 	out := make([]esphome.Entity, 0, len(order))
 	for _, name := range order {
 		out = append(out, e.events[name])

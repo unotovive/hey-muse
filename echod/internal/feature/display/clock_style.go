@@ -36,6 +36,9 @@ const (
 	styleWorld     = "world"
 	styleAgenda    = "agenda"
 	styleGlow      = "glow"
+	styleNixie     = "nixie"
+	styleStack     = "stack"
+	styleOverlap   = "overlap"
 )
 
 // clockStyles are the choices, as the screen and Home Assistant name them, with what the config keeps.
@@ -54,6 +57,9 @@ var clockStyles = []struct {
 	{"World", styleWorld},
 	{"Agenda", styleAgenda},
 	{"Glow", styleGlow},
+	{"Nixie", styleNixie},
+	{"Stack", styleStack},
+	{"Overlap", styleOverlap},
 }
 
 func clockStyleIndex() int {
@@ -79,12 +85,12 @@ func clockStyleOptions() []string {
 
 // clockStyleRow is the setting on the screen, under Display.
 func clockStyleRow() settingRow {
-	return settingRow{id: "clockstyle", label: "Clock style", sub: "How the clock looks all day", kind: ctlChoice,
+	return settingRow{id: "clockstyle", label: tr("clock_style_label"), sub: tr("clock_style_description"), kind: ctlChoice,
 		value: clockStyles[clockStyleIndex()].label}
 }
 
 func clockStylePicker() (pickerView, bool) {
-	return pickerView{title: "Clock style", opts: clockStyleOptions(), cur: clockStyleIndex()}, true
+	return pickerView{title: tr("clock_style_label"), opts: clockStyleOptions(), cur: clockStyleIndex()}, true
 }
 
 // setClockStyle saves the clock's look and shows it at once, so it can be chosen while looking.
@@ -179,7 +185,12 @@ func styleFactsFor(style string, now time.Time) (f styleFacts) {
 		f.rise, f.set, f.sunOK = home.Get().SunTimes(now)
 	case styleDashboard:
 		f.days = home.Get().Forecast()
-		f.next = upcomingEvents(now, 3)
+		f.next = upcomingEvents(now, 8) // the style draws as many as fit above the coming days: 4 on a Show 5, 7 on a Show 8
+		if config.Get().Calendar.DashboardToday {
+			f.next = onlyToday(f.next, now)
+			events, _ := home.Get().EventsOn(now)
+			f.hadToday = slices.ContainsFunc(events, func(e hass.Event) bool { return !e.End.After(now) })
+		}
 	case styleAgenda:
 		f.next = upcomingEvents(now, 8)
 		events, _ := home.Get().EventsOn(now)
@@ -206,6 +217,22 @@ const maxWorld = 3
 var worldZones struct {
 	mu   sync.Mutex
 	locs map[string]*time.Location
+}
+
+// cachedZone is a time zone by its name, read once and kept with the style's (worldZones): the World
+// clock plugin's tiles (tessera_plugins.go) ask for theirs every frame too. Nil for a name not known.
+func cachedZone(z string) *time.Location {
+	worldZones.mu.Lock()
+	defer worldZones.mu.Unlock()
+	if worldZones.locs == nil {
+		worldZones.locs = map[string]*time.Location{}
+	}
+	loc, seen := worldZones.locs[z]
+	if !seen {
+		loc, _ = time.LoadLocation(z)
+		worldZones.locs[z] = loc
+	}
+	return loc
 }
 
 // worldPlaces is the places named, those whose zone is known, at most maxWorld; none named are the
@@ -273,6 +300,17 @@ func binaryDigits(now time.Time) [6]int {
 // to 2 (hours) or 5.
 var binaryBits = [6]int{2, 4, 3, 4, 3, 4}
 
+// stackLead is the space between the Stack style's two lines, as a share of the figures' height: close,
+// so the hours and the minutes stand as one block.
+const stackLead = 0.16
+
+// stackDigits is the time's four figures for the Stack style, the hours as the clock format has them:
+// on a 12-hour clock too the hours keep their 0 ("02" over "07"), so the two lines stand as one block.
+func stackDigits(now time.Time) [4]int {
+	d := binaryDigits(now)
+	return [4]int(d[:4])
+}
+
 // style is the frame's clock style: the one the facts were gathered for, or the one in force.
 func (f styleFacts) style() string {
 	if f.chosen {
@@ -281,10 +319,13 @@ func (f styleFacts) style() string {
 	return clockStyle()
 }
 
-// upcomingEvents is up to n of today's and tomorrow's events that have not ended, soonest first.
+// upcomingDays is how far ahead the Dashboard looks for its next events, today the first.
+const upcomingDays = 7
+
+// upcomingEvents is up to n of the coming week's events that have not ended, soonest first.
 func upcomingEvents(now time.Time, n int) []hass.Event {
 	var out []hass.Event
-	for d := range 2 {
+	for d := range upcomingDays {
 		events, _ := home.Get().EventsOn(now.AddDate(0, 0, d))
 		for _, e := range events {
 			if e.End.After(now) && !slices.ContainsFunc(out, func(o hass.Event) bool { return o.Summary == e.Summary && o.Start.Equal(e.Start) }) {
@@ -292,8 +333,24 @@ func upcomingEvents(now time.Time, n int) []hass.Event {
 			}
 		}
 	}
+	// Not those of a calendar hidden with the calendar page's chips: hidden on this screen, they are
+	// hidden on its clock too.
+	out = visibleEvents(out, hiddenHere(config.Get().Calendar))
 	slices.SortStableFunc(out, func(a, b hass.Event) int { return a.Start.Compare(b.Start) })
 	return out[:min(len(out), n)]
+}
+
+// onlyToday is the events that start before the next local midnight: the Dashboard's "Today only", where
+// one on since an earlier day still counts.
+func onlyToday(events []hass.Event, now time.Time) []hass.Event {
+	tomorrow := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, now.Location())
+	var out []hass.Event
+	for _, e := range events {
+		if e.Start.Before(tomorrow) {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 // numberWords are the numbers the words style says.

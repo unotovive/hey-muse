@@ -5,6 +5,7 @@ package display
 import (
 	"fmt"
 	"image"
+	"image/color"
 	"image/draw"
 
 	"github.com/HuskerMinion/techo5/echod/internal/feature/media"
@@ -43,9 +44,9 @@ func (r *roundRenderer) videoFace(s roundScene) (over image.Rectangle) {
 	r.videoZones = nil
 	r.zmu.Unlock()
 	if s.videoLive {
-		draw.Draw(r.dst, r.dst.Rect, image.Transparent, image.Point{}, draw.Src)
+		fillCanvas(r.dst, color.Transparent)
 	} else {
-		draw.Draw(r.dst, r.dst.Rect, image.Black, image.Point{}, draw.Src)
+		fillCanvas(r.dst, color.Black)
 		r.videoWordsSpot(s)
 	}
 	if s.videoControls && s.video.Active() {
@@ -61,9 +62,9 @@ func (r *roundRenderer) videoWordsSpot(s roundScene) {
 	if name == "" {
 		name = v.Host
 	}
-	head, sub := "Loading video…", name
+	head, sub := tr("loading_video"), name
 	if !v.Active() && v.Err != "" {
-		head, sub = "Can't play it", v.Err
+		head, sub = tr("ui_can_t_play_it"), v.Err
 	}
 	r.centered(r.title, head, 180, colText)
 	lines := r.paint.wrapLines(r.small, sub, 360)
@@ -74,7 +75,7 @@ func (r *roundRenderer) videoWordsSpot(s roundScene) {
 		r.centered(r.small, l, 222+i*30, colDim)
 	}
 	if !v.Active() {
-		r.centered(r.tiny, "Tap to go back", 400, colDim)
+		r.centered(r.tiny, tr("tap_to_go_back"), 400, colDim)
 	}
 }
 
@@ -110,9 +111,9 @@ func (r *roundRenderer) videoControlsSpot(s roundScene) image.Rectangle {
 	}
 	switch {
 	case s.showVolume:
-		at = fmt.Sprintf("Volume %d%%", s.volume*100/media.VolumeSteps)
+		at = fmt.Sprintf("%s %d%%", tr("volume"), s.volume*100/media.VolumeSteps)
 	case s.video.Phase == video.Loading || !s.video.Frames:
-		at = "Loading…"
+		at = tr("ui_loading")
 	}
 	r.centered(r.small, at, videoTimeYSpot, colDim)
 	r.zmu.Lock()
@@ -136,14 +137,14 @@ func (r *roundRenderer) videoTappedSpot(at image.Point) videoTap {
 // videoAskFace is the question about a DLNA video, the setup page's question's way: Not now above,
 // Allow below, where the circle is widest.
 func (r *roundRenderer) videoAskFace(s roundScene) {
-	r.centered(r.title, "Video", 120, colText)
-	r.centered(r.small, "Show a video from", 166, colDim)
+	r.centered(r.title, tr("ui_video"), 120, colText)
+	r.centered(r.small, tr("ui_video_request_prompt"), 166, colDim)
 	r.centered(r.small, s.videoAsk.from+"?", 196, colText)
 	if s.videoAsk.title != "" {
 		r.centered(r.tiny, r.paint.fit(r.tiny, s.videoAsk.title, 320), 226, colDim)
 	}
 	fc := r.faces()
 	right := func(label string) int { return center + (r.paint.width(fc.button, label)+44)/2 }
-	r.pillButton(right("Not now"), askNoY, "Not now", btnSecondary)
-	r.pillButton(right("Allow"), askYesY, "Allow", btnPrimary)
+	r.pillButton(right(tr("not_now")), askNoY, tr("not_now"), btnSecondary)
+	r.pillButton(right(tr("ui_allow")), askYesY, tr("ui_allow"), btnPrimary)
 }

@@ -9,7 +9,12 @@ import (
 	"time"
 
 	"github.com/HuskerMinion/techo5/echod/internal/config"
+	"github.com/HuskerMinion/techo5/echod/internal/feature/announce"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/dashboard"
+	"github.com/HuskerMinion/techo5/echod/internal/feature/home"
+	"github.com/HuskerMinion/techo5/echod/internal/feature/notify"
+	"github.com/HuskerMinion/techo5/echod/internal/feature/remind"
+	"github.com/HuskerMinion/techo5/echod/internal/feature/video"
 	"github.com/HuskerMinion/techo5/echod/internal/hardware/touch"
 )
 
@@ -46,19 +51,56 @@ func (d *Display) openDashboard() bool {
 		return false
 	}
 	d.mu.Lock()
-	d.dash, d.dashHeld, d.dashTouched = true, false, time.Now()
+	d.dash, d.dashHeld, d.dashTouched, d.dashNight = true, false, time.Now(), false
 	d.drawer, d.sheet, d.deckUp = false, false, false
+	// A custom screen opened by hand gives way too: the dashboard, asked for or opened, comes first.
+	d.customs.up = ""
 	d.mu.Unlock()
 	slog.Info("dashboard up", "mode", dashboard.Get().Mode())
 	d.wake()
 	return true
 }
 
+// openNightDashboard is openDashboard from a tap on the night screen: the dashboard then shows over the
+// night clock until it goes (dashNight).
+func (d *Display) openNightDashboard() bool {
+	if !d.openDashboard() {
+		return false
+	}
+	d.mu.Lock()
+	d.dashNight = true
+	d.mu.Unlock()
+	return true
+}
+
+// overNight is whether something is up over the night screen (a camera, an announcement, a reminder,
+// a notification, a page Home Assistant asked for), which a tap there is for rather than for the
+// dashboard.
+func (d *Display) overNight() bool {
+	d.mu.Lock()
+	asked := d.askedUp(time.Now())
+	d.mu.Unlock()
+	if asked {
+		return true
+	}
+	if _, up := home.Get().Camera(); up {
+		return true
+	}
+	if _, up := notify.Get().Showing(); up {
+		return true
+	}
+	if _, up := announce.Get().Showing(); up {
+		return true
+	}
+	_, up := remind.Get().Showing()
+	return up
+}
+
 // closeDashboard takes the dashboard down: back to the clock, and when the dashboard is the idle page,
 // the clock for a while.
 func (d *Display) closeDashboard() {
 	d.mu.Lock()
-	d.dash, d.dashEdge = false, edgeNone
+	d.dash, d.dashEdge, d.dashNight = false, edgeNone, false
 	if dashboard.Get().Idle() {
 		d.dashAwayUntil = time.Now().Add(dashAway)
 	}
@@ -73,7 +115,7 @@ func (d *Display) closeDashboard() {
 func (d *Display) dashboardAsked(up bool) {
 	d.mu.Lock()
 	if up {
-		d.dash, d.dashHeld, d.dashTouched, d.dashAwayUntil = true, true, time.Now(), time.Time{}
+		d.dash, d.dashHeld, d.dashTouched, d.dashAwayUntil, d.dashNight = true, true, time.Now(), time.Time{}, false
 		d.deckUp = false
 		d.mu.Unlock()
 		d.wake()
@@ -96,22 +138,33 @@ func (d *Display) dashScene(s *scene, sheetOrDrawer bool) {
 	if d.dash && !d.dashHeld && dashForgotten(d.dashTouched) {
 		d.dash = false
 	}
-	asked := d.dash
+	if !d.dash {
+		d.dashNight = false
+	}
+	asked, overNight := d.dash, d.dash && d.dashNight
+	// Under the red night clock a dashboard is not seen: one not opened from the night screen is put
+	// by rather than fetched and redrawn all night for nobody.
+	hidden := s.redClock && !overNight
 	away := time.Now().Before(d.dashAwayUntil)
 	d.mu.Unlock()
 
-	want := mode != config.DashboardOff && s.phase == "idle" && !sheetOrDrawer &&
-		!s.showCamera && !s.showWeather && !s.showRadar && !s.showCalendar && !s.showDeck && !s.showWifi && !s.bt.Pairing &&
+	want := mode != config.DashboardOff && s.phase == "idle" && !sheetOrDrawer && !hidden &&
+		!s.showCamera && !s.showWeather && !s.showRadar && !s.showCalendar && !s.showDeck && s.custom.name == "" && !s.showWifi && !s.bt.Pairing &&
 		(asked || (f.Idle() && !away && !s.nowPlaying))
-	s.showDash, s.dashMode = want, mode
+	s.showDash, s.dashMode, s.dashAsked = want, mode, want && overNight
 
 	streamed := want && mode == config.DashboardStreamed
 	if streamed && d.r != nil {
 		s.dash = f.Stream(d.r.w, d.r.h)
 	}
+	if want && mode == config.DashboardTessera {
+		d.tessScene(s)
+		d.tessSheetViews(s)
+	}
 	if want && mode == config.DashboardDrawn {
 		s.drawn = f.Drawn(d.r.w)
 		s.dashTiles = config.Get().Dashboard.Tiles
+		s.dashLayout = config.Get().Dashboard.Layout
 		d.mu.Lock()
 		// A different dashboard starts at its top, and none is scrolled past its end: a short one
 		// chosen after a long one scrolled down would otherwise be all above the screen.
@@ -121,10 +174,14 @@ func (d *Display) dashScene(s *scene, sheetOrDrawer bool) {
 		if _, content := d.r.dash(); content > 0 {
 			d.dashScroll = min(d.dashScroll, max(content-d.r.h, 0))
 		}
-		s.dashScroll, s.dashAdjust = d.dashScroll, d.dashAdjust
+		s.dashScroll, s.dashAdjust, s.dashColor = d.dashScroll, d.dashAdjust, d.dashColor
 		d.mu.Unlock()
+		s.dashMedia = d.mediaViewNow()
+		s.dashClimate = d.climateViewNow()
+		s.dashFan = d.fanViewNow()
 	}
 
+	over := d.overDashboard(s)
 	d.mu.Lock()
 	d.dashShowing = want
 	// Either way the page wants every finger as it moves: streamed, to scroll the page under it;
@@ -132,11 +189,60 @@ func (d *Display) dashScene(s *scene, sheetOrDrawer bool) {
 	follow := want
 	changed := follow != d.dashFollow
 	d.dashFollow = follow
+	// Drawn, a finger held still on a light is a long press for its colors (color_sheet.go), which
+	// needs holds reported; the color sheet goes with the page. Not while something that takes only a
+	// tap is drawn over the page (overDashboard): with holds on, a slow press on it would be a hold
+	// and a release, which it does not answer, and which the page under it would.
+	// The Tessera page's long press opens the same sheets.
+	sheeted := want && (mode == config.DashboardDrawn || mode == config.DashboardTessera)
+	holds := sheeted && !over
+	holdsChanged := holds != d.dashHolds
+	d.dashHolds = holds
+	if !sheeted {
+		d.dashColor, d.dashMedia, d.dashClimate, d.dashFan = nil, nil, nil, nil
+	}
 	d.mu.Unlock()
 	if changed {
 		touch.Get().SetFollow(follow)
 	}
+	if holdsChanged {
+		d.applyHolds()
+	}
 }
+
+// overDashboard is whether something that acts on a tap alone is drawn over the dashboard: a
+// reminder's or a notification's card, an event's pop-up, the PIN pad, the setup page's Allow and Deny, an announcement
+// arriving or being recorded, a DLNA video asking to be shown, or the video page.
+func (d *Display) overDashboard(s *scene) bool {
+	_, announcing := announce.Get().Showing()
+	_, reminding := remind.Get().Showing()
+	_, notifying := notify.Get().Card()
+	_, _, _, videoAsking := video.Get().Asking()
+	// The video's own state, not videoUp: that is what the last frame drew, and videoScene runs after
+	// this one, so the first frame of a video would still hold. The alert page is drawn in the
+	// dashboard's place (alertScene runs before this).
+	return s.pin.open || asksAtDevice() || announce.Get().Recording() || announcing || reminding || notifying ||
+		d.popupUp() != nil || videoAsking || d.videoUp() || video.Get().State().Active() || s.showAlert
+}
+
+// applyHolds tells the touchscreen whether to report a finger held still: for the night light's way up
+// (gesture) or the drawn dashboard's long press. What is wanted is read and set in one step under
+// holdsMu, so of two changes at once the later one is what the touchscreen is left with.
+func (d *Display) applyHolds() {
+	d.holdsMu.Lock()
+	defer d.holdsMu.Unlock()
+	d.mu.Lock()
+	holds := d.holdsWanted()
+	d.mu.Unlock()
+	touch.Get().SetHolds(holds)
+}
+
+// holdsWanted is whether a finger held still is to be reported: for the night light, and for the
+// drawn dashboard only while the panel is lit. Dark, the dashboard's own wish is left over from before
+// (dashScene does not run while the panel is off), and the dark panel wakes on a tap: with holds on, a
+// slow press there - a half-asleep hand on a night alarm - would be a hold and a release, and nothing.
+// Called with mu held.
+func (d *Display) holdsWanted() bool { return d.nightGlow || ((d.dashHolds || d.clockHolds) && d.on) }
 
 // dashGesture is a finger on the dashboard. It goes to the page as it moves, except a finger that
 // starts at one of the screen's edges: the left takes the dashboard away, the top brings the
@@ -152,12 +258,16 @@ func (d *Display) dashGesture(g touch.Gesture) {
 	edge := d.r.drawerEdge()
 	f := dashboard.Get()
 	streamed := f.Mode() == config.DashboardStreamed
+	tess := f.Mode() == config.DashboardTessera
 
 	switch g.Kind {
 	case touch.Tap:
-		if streamed {
+		switch {
+		case streamed:
 			f.Touch("tap", g.X, g.Y)
-		} else {
+		case tess:
+			d.tessTap(g.X, g.Y)
+		default:
 			d.drawnTap(g.X, g.Y)
 		}
 	case touch.Hold:
@@ -182,9 +292,12 @@ func (d *Display) dashGesture(g touch.Gesture) {
 		d.dashDrag = drawnDrag{startScroll: d.dashScroll}
 		d.mu.Unlock()
 		if from == edgeNone {
-			if streamed {
+			switch {
+			case streamed:
 				f.Touch("down", g.X, g.Y)
-			} else {
+			case tess:
+				d.tessHold(g.X, g.Y)
+			default:
 				d.drawnHold(g.X, g.Y)
 			}
 		}
@@ -195,9 +308,12 @@ func (d *Display) dashGesture(g touch.Gesture) {
 		if from != edgeNone {
 			return
 		}
-		if streamed {
+		switch {
+		case streamed:
 			f.Touch("move", g.X, g.Y)
-		} else {
+		case tess:
+			d.tessMove(g.X, g.Y)
+		default:
 			d.drawnMove(g.X, g.Y)
 		}
 	case touch.Release:
@@ -208,10 +324,13 @@ func (d *Display) dashGesture(g touch.Gesture) {
 		far := d.r.s(80)
 		switch from {
 		case edgeNone:
-			if streamed {
+			switch {
+			case streamed:
 				f.Touch("up", g.X, g.Y)
-			} else {
-				d.drawnRelease()
+			case tess:
+				d.tessRelease(g.X, g.Y)
+			default:
+				d.drawnRelease(g.X, g.Y)
 			}
 		case edgeLeft:
 			if g.X-start.X > far {
@@ -239,13 +358,25 @@ func (d *Display) openDrawerOver() {
 
 // drawnDashboard is the drawn dashboard over the whole panel.
 func (r *renderer) drawnDashboard(s scene) {
-	r.dashPage(s.drawn, s.dashScroll, s.dashAdjust, r.dst.Rect, s.dashTiles)
+	r.dashPage(s.drawn, s.dashScroll, s.dashAdjust, r.dst.Rect, s.dashTiles, s.dashLayout)
+	r.colorSheet(s.dashColor, s.drawn.Theme)
+	r.mediaSheet(s.dashMedia, s.drawn.Theme)
+	r.climateSheet(s.dashClimate, s.drawn.Theme)
+	r.fanSheet(s.dashFan, s.drawn.Theme)
 }
 
 // dashboardPage draws the dashboard over the whole panel.
 func (r *renderer) dashboardPage(s scene) {
-	if s.dashMode == config.DashboardDrawn {
+	switch s.dashMode {
+	case config.DashboardDrawn:
 		r.drawnDashboard(s)
+		return
+	case config.DashboardTessera:
+		r.tesseraPage(s.tessera, s.tessOn, s.tessPage, s.dashAdjust, s.now)
+		r.colorSheet(s.dashColor, dashboard.Theme{})
+		r.mediaSheet(s.dashMedia, dashboard.Theme{})
+		r.climateSheet(s.dashClimate, dashboard.Theme{})
+		r.fanSheet(s.dashFan, dashboard.Theme{})
 		return
 	}
 	v := s.dash

@@ -44,6 +44,12 @@ func reolinkClient() (*reolink.Client, error) {
 }
 
 func reolinkSnap(entity string) ([]byte, error) {
+	fw, _ := cameraFrameSize()
+	return reolinkSnapAt(entity, fw)
+}
+
+// reolinkSnapAt is a Reolink camera's snapshot about width wide, as the recorder makes it.
+func reolinkSnapAt(entity string, width int) ([]byte, error) {
 	ch, err := strconv.Atoi(strings.TrimPrefix(entity, reolinkPrefix))
 	if err != nil {
 		return nil, fmt.Errorf("not a Reolink camera: %s", entity)
@@ -54,7 +60,7 @@ func reolinkSnap(entity string) ([]byte, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	return c.Snap(ctx, ch, cameraFrameW)
+	return c.Snap(ctx, ch, width)
 }
 
 // SetReolink sets up a recorder: it is found and logged in to, its certificate pinned, and its cameras

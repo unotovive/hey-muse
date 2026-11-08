@@ -5,6 +5,7 @@ import (
 	"html"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -110,6 +111,9 @@ func alarmDrawer(w http.ResponseWriter, token string, a config.Alarm) {
 		if m := config.Get().Alarms.SunriseFor(a); m > 0 {
 			where += fmt.Sprintf(" · light %d min", m)
 		}
+		if a.LightOnly {
+			where += " · light only"
+		}
 	}
 	cls := ""
 	if !a.On {
@@ -131,6 +135,9 @@ func alarmDrawer(w http.ResponseWriter, token string, a config.Alarm) {
 		ringOnField(w, "r"+a.ID, strings.Join(a.RingOn, ", "))
 	} else {
 		sunriseField(w, "s"+a.ID, a.Sunrise)
+		if !a.Silent {
+			lightOnlyField(w, a.LightOnly)
+		}
 	}
 	toggle := "Turn off"
 	if !a.On {
@@ -157,8 +164,12 @@ func addDrawer(w http.ResponseWriter, token string) {
 	daysField(w, config.DaysOnce)
 	ringOnField(w, "addring", "")
 	sunriseField(w, "addsun", 0)
+	// Light only is for an alarm; the page hides it while Reminder or Timer is chosen (.alarmonly).
+	fmt.Fprint(w, `<div class="alarmonly">`)
+	lightOnlyField(w, false)
+	fmt.Fprint(w, `</div>`)
 	fmt.Fprint(w, `<p class="note">Repeat days are for alarms and reminders at a time of day; "in" is once. Other
-	 devices are for reminders; the wake light is for alarms.</p>
+	 devices are for reminders; the wake light and light only are for alarms.</p>
 	 <div class="btns"><button type="submit">Add</button></div></form></div></details>`)
 }
 
@@ -174,6 +185,14 @@ func prefsSection(w http.ResponseWriter, token string) {
 	for _, s := range speaker.AlarmSounds() {
 		fmt.Fprintf(w, `<option%s>%s</option>`, selected(s == alarm.Get().Sound()), html.EscapeString(s))
 	}
+	fmt.Fprint(w, `</select></div><div><label for="say">Said as it rings</label><select id="say" name="say">`)
+	for _, v := range config.AlarmSays() {
+		fmt.Fprintf(w, `<option value="%s"%s>%s</option>`, html.EscapeString(string(v)), selected(v == alarm.Get().Say()), html.EscapeString(v.Label()))
+	}
+	fmt.Fprint(w, `</select></div></div><div class="row"><div><label for="rise">Gets louder</label><select id="rise" name="rise">`)
+	for _, v := range config.AlarmRises() {
+		fmt.Fprintf(w, `<option value="%s"%s>%s</option>`, html.EscapeString(string(v)), selected(v == alarm.Get().Rise()), html.EscapeString(v.Label()))
+	}
 	fmt.Fprint(w, `</select></div><div><label for="sunrise">Wake with light, by default</label><select id="sunrise" name="sunrise">`)
 	fmt.Fprintf(w, `<option value="0"%s>Off</option>`, selected(c.Alarms.SunriseMinutes <= 0))
 	for _, m := range wakeLights {
@@ -181,7 +200,9 @@ func prefsSection(w http.ResponseWriter, token string) {
 	}
 	fmt.Fprint(w, `</select></div></div>
 	 <p class="note">Ring volume is only for alarms and timers, not the music. At 0 they make no sound. The
-	  default wake light is for alarms that don't choose their own.</p>
+	  default wake light is for alarms that don't choose their own. Gets louder starts an alarm 30 dB under its
+	  ring volume and brings it up to it. What an alarm says is spoken by Home
+	  Assistant, after the first chime.</p>
 	 <div class="btns"><button type="submit">Save</button></div></form></fieldset>`)
 }
 
@@ -226,6 +247,19 @@ func sunriseField(w http.ResponseWriter, id string, cur int) {
 	}
 	fmt.Fprint(w, `</select>`)
 }
+
+// lightOnlyField is an alarm's Light only box (#164).
+func lightOnlyField(w http.ResponseWriter, cur bool) {
+	checked := ""
+	if cur {
+		checked = " checked"
+	}
+	fmt.Fprintf(w, `<p><label><input type="checkbox" name="light_only" value="yes" style="width:auto"%s> Light only:
+	 no sound and nothing to stop; at its time the night ends, and the screen is back as by day</label></p>`, checked)
+}
+
+// lightOnlyOf is the Light only box as sent.
+func lightOnlyOf(r *http.Request) bool { return r.PostFormValue("light_only") == "yes" }
 
 // alarmSave takes this tab's forms, and reports whether what was one of them.
 func alarmSave(r *http.Request, what string, problem *string) bool {
@@ -292,8 +326,8 @@ func addFromPage(r *http.Request) string {
 		if err != nil {
 			return err.Error()
 		}
-		if s := sunriseOf(r); s != al.Sunrise {
-			al.Sunrise = s
+		if s, only := sunriseOf(r), lightOnlyOf(r); s != al.Sunrise || only != al.LightOnly {
+			al.Sunrise, al.LightOnly = s, only
 			if err := alarm.Get().Put(al); err != nil {
 				return err.Error()
 			}
@@ -336,8 +370,12 @@ func editFromPage(r *http.Request) string {
 				return "a reminder needs words to say"
 			}
 			al.RingOn = names(r.PostFormValue("ring_on"))
+			al.LightOnly = false // a reminder is said, never a light alone
 		} else {
 			al.Sunrise = sunriseOf(r)
+			if !al.Silent {
+				al.LightOnly = lightOnlyOf(r)
+			}
 		}
 		al.On = true
 	}
@@ -358,6 +396,18 @@ func prefsFromPage(r *http.Request) string {
 	alarm.Get().SetRingVolume(vol, false)
 	if s := r.PostFormValue("sound"); s != alarm.Get().Sound() {
 		alarm.Get().SetSound(s, false)
+	}
+	if v := config.AlarmSay(r.PostFormValue("say")); v != alarm.Get().Say() {
+		if !slices.Contains(config.AlarmSays(), v) {
+			return "that is not one of the choices for what an alarm says"
+		}
+		alarm.Get().SetSay(v)
+	}
+	if v := config.AlarmRise(r.PostFormValue("rise")); v != alarm.Get().Rise() {
+		if !slices.Contains(config.AlarmRises(), v) {
+			return "that is not one of the choices for how an alarm gets louder"
+		}
+		alarm.Get().SetRise(v)
 	}
 	if sunrise != 0 && !contains(wakeLights, sunrise) {
 		return "that is not one of the wake light choices"

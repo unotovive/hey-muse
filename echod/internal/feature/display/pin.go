@@ -4,6 +4,7 @@ package display
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,9 +13,10 @@ import (
 	"github.com/HuskerMinion/techo5/echod/internal/feature/setup"
 )
 
-// The PIN pad: what the settings screen shows first while the settings lock is on (security/lock.go). A
-// right PIN opens the settings; Cancel, or half a minute of nothing, puts the pad away. The same pad is
-// drawn on the Show and on the Spot, each to its own shape.
+// The PIN pad: what a setting behind the settings lock (security/lock.go) shows first while the lock is
+// on. A right PIN changes the setting that was tapped, and leaves the rest open for a while; Cancel, or
+// half a minute of nothing, puts the pad away. The same pad is drawn on the Show and on the Spot, each
+// to its own shape.
 
 const pinIdle = 30 * time.Second
 
@@ -26,6 +28,7 @@ type pinView struct {
 	digits int    // how many have been typed; the pad shows dots, never the digits
 	msg    string // what went wrong last, or empty
 	title  string // what the pad is asking for
+	what   string // the setting the PIN is for, or empty for the settings as a whole
 }
 
 var pinPad struct {
@@ -35,6 +38,7 @@ var pinPad struct {
 	msg   string
 	at    time.Time
 	after func() // what opens once the PIN is right
+	what  string // the setting it is for, shown on the pad
 
 	// setting is a new PIN being chosen rather than one being asked for: typed, then typed again, with
 	// first the first of the two.
@@ -43,20 +47,12 @@ var pinPad struct {
 }
 
 // openPIN puts the pad up for a tap on the device, with after to run once the right PIN is in: the
-// person at the device decides what the PIN is for.
-func openPIN(after func()) { putPINUp(after, false) }
-
-// openPINRemote is openPIN for a request from elsewhere (Home Assistant, a link): it leaves a pad that
-// is already up as it is, since the PIN being typed there is for what the person at the device asked.
-func openPINRemote(after func()) { putPINUp(after, true) }
-
-func putPINUp(after func(), keepOpen bool) {
+// person at the device decides what the PIN is for. what names it on the pad, so whoever types the
+// PIN can see what it will change, since that may not be what they think it is for.
+func openPIN(what string, after func()) {
 	pinPad.mu.Lock()
-	if keepOpen && pinPad.open && time.Since(pinPad.at) <= pinIdle {
-		pinPad.mu.Unlock()
-		return
-	}
 	pinPad.open, pinPad.entry, pinPad.msg, pinPad.at, pinPad.after = true, "", "", time.Now(), after
+	pinPad.what = what
 	pinPad.setting, pinPad.first = false, ""
 	pinPad.mu.Unlock()
 }
@@ -65,6 +61,7 @@ func putPINUp(after func(), keepOpen bool) {
 func openPINSet() {
 	pinPad.mu.Lock()
 	pinPad.open, pinPad.entry, pinPad.msg, pinPad.at, pinPad.after = true, "", "", time.Now(), nil
+	pinPad.what = ""
 	pinPad.setting, pinPad.first = true, ""
 	pinPad.mu.Unlock()
 }
@@ -76,24 +73,80 @@ func pinNow(now time.Time) pinView {
 	if pinPad.open && now.Sub(pinPad.at) > pinIdle {
 		pinPad.open, pinPad.entry, pinPad.msg, pinPad.after = false, "", "", nil
 	}
-	title := "Enter the PIN"
+	title := tr("pin_enter")
 	switch {
 	case pinPad.setting && pinPad.first == "":
-		title = "A new PIN, 4 to 8 digits"
+		title = tr("pin_new")
 	case pinPad.setting:
-		title = "The same PIN again"
+		title = tr("pin_again")
 	}
-	return pinView{open: pinPad.open, digits: len(pinPad.entry), msg: pinPad.msg, title: title}
+	return pinView{open: pinPad.open, digits: len(pinPad.entry), msg: pinPad.msg, title: title, what: pinPad.what}
 }
 
 func pinIsOpen() bool { return pinNow(time.Now()).open }
 
+// everyday is whether the settings row id is part of using the device rather than setting it up, and
+// so open to everyone while the lock is on: the alarms and timers, the alarm editor, the volume, the
+// tone, the headphones, the microphone, the wake sound, the sleep timer, and the brightness. Everything
+// else is behind the PIN, including rows added later: a row is open only by being named here.
+func everyday(id string) bool {
+	for _, prefix := range []string{"alarm:", "timer:", "e."} {
+		if strings.HasPrefix(id, prefix) {
+			return true
+		}
+	}
+	switch id {
+	case "snoozed", "snooze", "ringvol", "alarmsound", "alarmwords", "alarmrise", "sunrise", "sunface", "allalarms", "newtimer", // Alarms & Timers
+		"volume", "voicevol", "callvol", "bass", "treble", "output", "mic", "waketone", "sleep", // Sound
+		"brightness", "auto", "dimmest": // Display
+		return true
+	}
+	return false
+}
+
+// rowLocked is whether a tap on the row id asks for the PIN first.
+func rowLocked(id string) bool { return id != "" && !everyday(id) && security.Locked() }
+
+// gate runs tap, a tap on the settings row id, now, or once the PIN is right when the row is behind the
+// lock; what is the row's name for the pad. Taps on a locked row only put the pad up: they are no tries
+// at the PIN, so they never count toward the wait. A nil tap is the PIN opening the lock and nothing
+// more.
+//
+// up says whether the settings are still showing when the PIN comes in. If they are not (closed behind
+// the pad by a timeout, a page Home Assistant put up, anything), the tap is not what anybody can see
+// any more, and the lock goes back on: a right PIN must not leave every setting open for whoever opens
+// the screen next.
+func gate(id, what string, up func() bool, tap func()) {
+	if !rowLocked(id) {
+		if tap != nil {
+			tap()
+		}
+		return
+	}
+	openPIN(what, func() {
+		if !up() {
+			security.Relock()
+			return
+		}
+		if tap != nil {
+			tap()
+		}
+	})
+}
+
+// stillHere keeps an open lock open while the settings are being touched, everyday rows and scrolling
+// included: it comes back two minutes after the last touch, not two minutes after the PIN.
+func stillHere() {
+	if security.LockSet() {
+		security.KeepOpen()
+	}
+}
+
 // sheetWasOpen is whether the settings were open at the last frame.
 var sheetWasOpen atomic.Bool
 
-// relockOnClose puts the lock back on as the settings close, however they closed. Only as they close:
-// relocking on every frame they are shut would take back the PIN just typed before the settings it
-// was typed for could open.
+// relockOnClose puts the lock back on as the settings close, however they closed: a PIN typed for one
+// setting does not leave the rest open behind a screen that has gone.
 func relockOnClose(open bool) {
 	if sheetWasOpen.Swap(open) && !open {
 		security.Relock()
@@ -103,18 +156,21 @@ func relockOnClose(open bool) {
 // answerSetup answers a browser asking to be let in to the setup page. Allow is behind the settings
 // lock too: the setup page is every setting and more.
 //
-// The PIN lets in the browser that was asking when Allow was tapped, and no other: one that asked
-// while the PIN was being typed was never seen. Nor does the PIN leave the settings open behind it.
-func answerSetup(allow bool) {
-	if allow && security.Locked() {
-		asking := setup.Get().Asking()
-		openPIN(func() {
+// Allow lets in asking, the browser whose page was tapped, and no other, with the PIN or without: one
+// that asked while the PIN was being typed, or since the page was drawn, was never seen. Nor does the
+// PIN leave the settings open behind it.
+func answerSetup(allow bool, asking string) {
+	switch {
+	case !allow:
+		setup.Get().Answer(false)
+	case security.Locked():
+		openPIN(tr("ui_setup_page"), func() {
 			setup.Get().AllowAsking(asking)
 			security.Relock()
 		})
-		return
+	default:
+		setup.Get().AllowAsking(asking)
 	}
-	setup.Get().Answer(allow)
 }
 
 // pinPress is a key on the pad: a digit, back, ok, or cancel.
@@ -139,7 +195,7 @@ func pinPress(key string) {
 	case "ok":
 		if len(pinPad.entry) < 4 {
 			// Too short to be any PIN: not a wrong try, so it does not count toward the wait.
-			pinPad.msg = "At least 4 digits"
+			pinPad.msg = tr("pin_too_short")
 			pinPad.mu.Unlock()
 			return
 		}
@@ -163,9 +219,9 @@ func pinPress(key string) {
 	ok, wait := security.TryPIN(entry)
 	pinPad.mu.Lock()
 	if !ok {
-		pinPad.msg = "Wrong PIN"
+		pinPad.msg = tr("pin_wrong")
 		if wait > 0 {
-			pinPad.msg = fmt.Sprintf("Try again in %s", waitWords(wait))
+			pinPad.msg = fmt.Sprintf(tr("pin_try_again_in"), waitWords(wait))
 		}
 		pinPad.mu.Unlock()
 		return
@@ -180,9 +236,9 @@ func pinPress(key string) {
 
 func waitWords(d time.Duration) string {
 	if d < time.Minute {
-		return fmt.Sprintf("%d s", int((d+time.Second-1)/time.Second))
+		return fmt.Sprintf(tr("pin_wait_seconds"), int((d+time.Second-1)/time.Second))
 	}
-	return fmt.Sprintf("%d min", int((d+time.Minute-1)/time.Minute))
+	return fmt.Sprintf(tr("pin_wait_minutes"), int((d+time.Minute-1)/time.Minute))
 }
 
 // pinSetting is OK while a new PIN is being chosen: the first time it is kept, the second it has to
@@ -191,11 +247,11 @@ func pinSetting(entry string) {
 	pinPad.mu.Lock()
 	switch {
 	case len(entry) < 4:
-		pinPad.msg = "At least 4 digits"
+		pinPad.msg = tr("pin_too_short")
 	case pinPad.first == "":
 		pinPad.first, pinPad.msg = entry, ""
 	case entry != pinPad.first:
-		pinPad.first, pinPad.msg = "", "They did not match"
+		pinPad.first, pinPad.msg = "", tr("pin_no_match")
 	default:
 		// Saving writes the config and tells its listeners: not with the pad's lock held.
 		pinPad.mu.Unlock()
@@ -206,7 +262,7 @@ func pinSetting(entry string) {
 		}
 		pinPad.mu.Lock()
 		if err != nil {
-			pinPad.msg = "Could not save it"
+			pinPad.msg = tr("pin_not_saved")
 		} else {
 			pinPad.open, pinPad.setting, pinPad.first, pinPad.msg = false, false, "", ""
 		}

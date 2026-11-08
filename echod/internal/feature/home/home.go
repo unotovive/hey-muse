@@ -25,7 +25,9 @@ import (
 	"github.com/HuskerMinion/techo5/echod/internal/feature/media"
 	"github.com/HuskerMinion/techo5/echod/internal/lib/hass"
 	"github.com/HuskerMinion/techo5/echod/internal/lib/hook"
+	"github.com/HuskerMinion/techo5/echod/internal/lib/locale"
 	"github.com/HuskerMinion/techo5/echod/internal/lib/openmeteo"
+	"github.com/HuskerMinion/techo5/echod/internal/lib/radiometa"
 	"github.com/HuskerMinion/techo5/echod/internal/lib/safe"
 )
 
@@ -69,9 +71,13 @@ type Radio struct {
 type Feature struct {
 	// Changed fires when anything shown changes; listeners must not block.
 	Changed hook.Hook[struct{}]
+	// Hint fires with a note for the screen (hint.go); listeners must not block.
+	Hint hook.Hook[Hint]
 
 	mu     sync.Mutex
 	chosen string
+
+	loops sync.WaitGroup // the goroutines a camera or picture view started (spawn); a test waits on it
 
 	// others are the entities followed for something besides the glance strip, and chips the glance
 	// strip's chips as last sent on Changed (glance.go, redraw).
@@ -90,8 +96,9 @@ type Feature struct {
 
 	// weatherSel picks the weather entity; weathers is Home Assistant's list of them, fetched at
 	// weathersAt.
-	weatherSel *esphome.Select
-	radarSel   *esphome.Select // where the rain map's radar comes from (radar_setting.go)
+	weatherSel  *esphome.Select
+	weatherOpts *component.Options // weatherSel's options
+	radarSel    *esphome.Select    // where the rain map's radar comes from (radar_setting.go)
 
 	// alerts are the NWS's weather alerts at home and nearby (alerts.go); alertsSw turns them on and off.
 	alerts     alertState
@@ -101,9 +108,10 @@ type Feature struct {
 
 	// followSel picks another media player for Now Playing to follow; players is Home Assistant's list of
 	// them, fetched at playersAt (follow.go).
-	followSel *esphome.Select
-	players   []hass.Entity
-	playersAt time.Time
+	followSel  *esphome.Select
+	followOpts *component.Options // followSel's options
+	players    []hass.Entity
+	playersAt  time.Time
 
 	lyricsSw *esphome.Switch // the words on Now Playing (lyrics.go)
 
@@ -118,13 +126,42 @@ type Feature struct {
 
 	// radar is the rain map; see radar.go.
 	radar   radarState
-	url     string // the stream playing, from the media player
-	urlName string // its station name once found
+	url     string    // the stream playing, from the media player
+	urlAt   time.Time // when it started
+	urlName string    // its station name once found
 
 	// asked is the last station this device asked to play and askedAt when, which is what a dropped
 	// stream is put back on with.
 	asked   string
 	askedAt time.Time
+
+	// claiming is a station asked for whose stream has not started yet, and stationURL the url that
+	// started for the last one: what plays from it is live radio (liveURL).
+	// claimName is the station claimed for, claimAt when the claim was made and claimFor how long it
+	// holds, and claimedAt when a stream was last taken for one. ownURL is the last stream this device
+	// played itself for a station (playingOwn).
+	claiming   bool
+	stationURL string
+	claimName  string
+	claimAt    time.Time
+	claimFor   time.Duration
+	claimedAt  time.Time
+	ownURL     string
+	// claimByScript is a claim made because the station script turned on (stationStarted), and
+	// byScript a stream taken for a station that way: the name the text gives may still be the station
+	// before, so a name arriving just after replaces it, and the stream is put back by its url.
+	claimByScript, byScript bool
+	// stationGen counts the stations asked for and forgotten, so a put-back waiting its seconds can
+	// tell a Stop or another station came in between (putBack).
+	stationGen uint64
+
+	// startSeq counts the stations asked of Home Assistant through the radio script, heardAt is when it
+	// last gave a sign of starting one, and hinted is a note up that said it did not (hint.go).
+	startSeq uint64
+	heardAt  time.Time
+	hinted   bool
+	// external stands in for whether Music Assistant plays on the device, in a test (externalPlaying).
+	external func() bool
 
 	// resumed counts how many times a dropped stream has been put back on lately, and resumedAt when
 	// the last of those was, so a station that will not stay up is eventually left off (resume.go).
@@ -146,6 +183,19 @@ type Feature struct {
 
 	// cam is the camera view in progress; see camera.go.
 	cam CameraView
+	// viewSeq numbers the views put up (CameraView.View).
+	viewSeq uint64
+	// stillCancel gives up the fetch of the still on the view (picture.go), when there is one.
+	stillCancel context.CancelFunc
+	// waiting is a still that waits for the camera view up to end (picture.go), nil for none.
+	waiting *waitingStill
+	// endedID and endedWhy are the last notification's view that went other than by running out, and
+	// how (PictureEnded).
+	endedID, endedWhy string
+	// camGen numbers the camera views whose frames are fetched (CameraView.gen), and camCancel ends what
+	// the one up fetches with.
+	camGen    uint64
+	camCancel context.CancelFunc
 
 	// camSound is the camera whose sound this view has, camOver the media player's token for the request
 	// it was asked with, and camMuted whether that sound was silenced from the screen. camSound stays for
@@ -156,10 +206,16 @@ type Feature struct {
 	// Assistant (radio_sensors.go).
 	radioStationTxt, radioArtistTxt, radioTitleTxt *esphome.TextSensor
 
+	// nowSourceTxt, nowTitleTxt, nowArtistTxt, nowAlbumTxt and nowStateTxt are what is played to the
+	// device, for Home Assistant; nowPoke asks for them to be looked at again (nowplaying_sensors.go).
+	nowSourceTxt, nowTitleTxt, nowArtistTxt, nowAlbumTxt, nowStateTxt *esphome.TextSensor
+	nowPoke                                                           chan struct{}
+
 	camSound      string
 	camOver       media.OverToken
 	camMuted      bool
 	cameraSoundSw *esphome.Switch
+	cameraLiveSw  *esphome.Switch
 
 	// slideshowSel picks the display mode, slideshowOverlaySel the screensaver's clock/date size,
 	// slideshowIdleNum the screensaver's idle wait; slideshow is the fetch state. See slideshow.go.
@@ -179,7 +235,20 @@ type Feature struct {
 	slideshowSubfoldersSw *esphome.Switch
 	// slideshowWholeSw shows photos whole, with blurred sides, instead of cropped to fill.
 	slideshowWholeSw *esphome.Switch
-	slideshow        slideshowState
+	// slideshowPairsSw puts two tall photos side by side; slideshowCaptionSw writes when and where an
+	// Immich photo was taken over it.
+	slideshowPairsSw   *esphome.Switch
+	slideshowCaptionSw *esphome.Switch
+	// immichFavoritesSw, immichPersonTxt, immichFromTxt and immichToTxt narrow an Immich source.
+	immichFavoritesSw *esphome.Switch
+	immichPersonTxt   *esphome.Text
+	immichFromTxt     *esphome.Text
+	immichToTxt       *esphome.Text
+
+	slideshow slideshowState
+	// slideshowGen counts the slideshow's changes of source (changeSlideshow, ResetImmich), so a list
+	// gathered for the source before is not kept for the one after.
+	slideshowGen uint64
 }
 
 // forecastEvery is how often the forecast is refreshed while there is a weather entity.
@@ -187,7 +256,11 @@ const forecastEvery = 30 * time.Minute
 
 // Run keeps the forecast current. Nothing to do without a token or a weather entity.
 func (f *Feature) Run(ctx context.Context) error {
+	// A station this device asked for is live radio: a drop is fetched again (media resume.go), where
+	// a song would start over.
+	media.SetLive(f.liveURL)
 	go f.metaLoop(ctx)
+	go f.nowPlayingLoop(ctx)
 	if hasScreen {
 		go f.slideshowLoop(ctx)
 	}
@@ -197,6 +270,7 @@ func (f *Feature) Run(ctx context.Context) error {
 		f.refreshForecast()
 		select {
 		case <-ctx.Done():
+			f.stopWaiting()
 			return nil
 		case <-f.poke:
 		case <-time.After(forecastEvery):
@@ -241,18 +315,30 @@ var (
 
 func Get() *Feature {
 	once.Do(func() {
-		shared = &Feature{poke: make(chan struct{}, 1), metaPoke: make(chan struct{}, 1)}
+		shared = &Feature{poke: make(chan struct{}, 1), metaPoke: make(chan struct{}, 1), nowPoke: make(chan struct{}, 1)}
 		shared.buildWeatherSelect()
 		shared.buildFollowSelect()
 		shared.buildLyricsSwitch()
 		shared.buildRadarSelect()
 		shared.buildAlertsSwitch()
 		shared.buildCameraSoundSwitch()
+		shared.buildCameraLiveSwitch()
 		shared.buildSlideshowSelect()
 		shared.buildRadioSensors()
+		shared.buildNowPlayingSensors()
 		hastate.Get().Changed.Listen(shared.stateChanged)
+		hastate.Get().Changed.Listen(shared.stationStarted)
+		hastate.Get().Changed.Listen(shared.todoChanged)
 		media.Get().OnPlay.Listen(shared.played)
+		// Stopped anywhere (the voice assistant, the setup page, the action button, Home Assistant):
+		// the station is over, and a put-back on its way is not made.
+		media.Get().OnStop.Listen(func(struct{}) {
+			shared.mu.Lock()
+			shared.stopped()
+			shared.mu.Unlock()
+		})
 		media.Get().OnEnd.Listen(shared.ended)
+		media.Get().OnNowPlaying.Listen(func(struct{}) { shared.pokeNowPlaying() })
 		media.Get().OnResumeRemote.Listen(func(struct{}) { safe.Go("resume music assistant", resumeMusicAssistant) })
 		media.Get().OnTakeOver.Listen(func(struct{}) { safe.Go("leave the group", leaveGroup) })
 	})
@@ -262,8 +348,10 @@ func Get() *Feature {
 // played is a new stream starting: whatever was tapped is no longer the answer to "what is
 // this", so its name is looked up from the URL.
 func (f *Feature) played(url string) {
+	f.streamArrived()
 	f.mu.Lock()
 	f.url, f.urlName, f.chosen = url, "", ""
+	f.urlAt = time.Now()
 	if f.listed != "" && time.Since(f.listedAt) < listedFor {
 		f.urlName, f.listed = f.listed, ""
 		f.mu.Unlock()
@@ -362,11 +450,14 @@ func (f *Feature) Name() string { return "home" }
 
 // Restore registers what to follow from the saved configuration, before Home Assistant connects.
 func (f *Feature) Restore(c config.Config) {
-	f.weatherSel.Options = weatherOptions(c.Home)
+	if id, ok := strings.CutPrefix(c.Home.Slideshow.Source, ImmichAlbumPrefix); ok && c.Home.Immich.Set() && c.Home.Immich.AlbumID != id {
+		// Kept before the album's id was kept with its name: asked for once the network is up.
+		naming.Add(1)
+		safe.Go("immich album name at start", func() { defer naming.Done(); f.nameImmichAlbumSoon(id) })
+	}
+	f.weatherOpts.Restore(weatherOptions(c.Home))
 	f.weatherSel.Set(chosenOption(c.Home))
-	f.mu.Lock()
-	f.followSel.Options = followOptions(c.Home)
-	f.mu.Unlock()
+	f.followOpts.Restore(followOptions(c.Home))
 	f.followSel.Set(followOption(c.Home))
 	f.lyricsSw.Set(c.Home.Lyrics)
 	if hasScreen {
@@ -375,7 +466,11 @@ func (f *Feature) Restore(c config.Config) {
 	f.radarSel.Set(radarChoices[RadarSourceIndex()].label)
 	f.alertsSw.Set(!c.Home.AlertsOff)
 	f.showRadio(meta{}) // nothing plays at a start; the poller fills them in
+	// Nor is anything played to it. All of them are written, though the four names hold "" already, so
+	// none of them starts out unknown in Home Assistant.
+	f.showNowPlaying(nil, nothingPlaying)
 	f.cameraSoundSw.Set(c.Home.CameraSound)
+	f.cameraLiveSw.Set(c.Home.CameraLive)
 	if hasScreen {
 		f.slideshowSel.Set(slideshowLabelFor(c.Home.Slideshow.Mode))
 		f.slideshowOverlaySel.Set(slideshowOverlayLabelFor(c.Home.Slideshow.Overlay))
@@ -390,6 +485,12 @@ func (f *Feature) Restore(c config.Config) {
 		f.slideshowArtSw.Set(c.Home.Slideshow.Art)
 		f.slideshowSubfoldersSw.Set(!c.Home.Slideshow.TopOnly)
 		f.slideshowWholeSw.Set(c.Home.Slideshow.WholePhoto)
+		f.slideshowPairsSw.Set(c.Home.Slideshow.Pairs && PairsHere())
+		f.slideshowCaptionSw.Set(c.Home.Slideshow.Caption)
+		f.immichFavoritesSw.Set(c.Home.Slideshow.ImmichFavorites)
+		f.immichPersonTxt.Set(c.Home.Slideshow.ImmichPerson)
+		f.immichFromTxt.Set(c.Home.Slideshow.ImmichFrom)
+		f.immichToTxt.Set(c.Home.Slideshow.ImmichTo)
 	}
 	f.want(c.Home)
 }
@@ -408,6 +509,17 @@ func (f *Feature) want(h config.Home) {
 	}
 	if h.Radio.Now != "" {
 		keys = append(keys, hastate.Key{Entity: h.Radio.Now})
+	}
+	// The script that plays a station: it turns on whenever a station is started with it, from here
+	// or anywhere in the house (stationStarted), the same station again too, which changes no text.
+	if s := h.Radio.Service; strings.HasPrefix(s, "script.") {
+		keys = append(keys, hastate.Key{Entity: s})
+	}
+	// The to-do lists shown: a list's state is how many items are open, so it changes whenever they do.
+	if hasScreen {
+		for _, l := range config.Get().Todo.Lists {
+			keys = append(keys, hastate.Key{Entity: l})
+		}
 	}
 	others := make(map[string]bool, len(keys))
 	for _, k := range keys {
@@ -451,13 +563,14 @@ func (f *Feature) locationAction() *esphome.Action {
 // Actions are how Home Assistant configures this: which weather entity to show, and how the
 // radio page is wired. Both persist and take effect at the next connection.
 func (f *Feature) Actions() []*esphome.Action {
-	actions := append(f.cameraActions(), f.accessAction())
+	actions := append(append(f.cameraActions(), f.gridActions()...), f.accessAction(), f.go2rtcAction())
 	if hasScreen {
-		actions = append(actions, f.slideshowAction(), f.calendarAction(), f.locationAction())
+		actions = append(actions, f.slideshowAction(), f.calendarAction(), f.todoAction(), f.locationAction(), f.cameraButtonsAction())
 	}
 	if hasGlance {
 		actions = append(actions, f.glanceAction())
 	}
+	actions = append(actions, f.stationAction())
 	return append(actions, []*esphome.Action{
 		{
 			Name: "home_weather",
@@ -531,8 +644,16 @@ func (f *Feature) accessAction() *esphome.Action {
 		Name: "home_assistant",
 		Args: []esphome.Arg{{Name: "url", Type: esphome.ArgString}, {Name: "token", Type: esphome.ArgString}},
 		Run: func(c esphome.Call) (any, error) {
+			was := hass.Get().Address()
 			if err := hass.Get().Set(c.String("url"), c.String("token")); err != nil {
 				return nil, err
+			}
+			// Realtime voice's token is for the Home Assistant it was given for: another address does
+			// not get it. The first address, at setup, does: a token typed in before it is for it, and
+			// a device that left its last Home Assistant cleared the token then (api's leave).
+			if now := hass.Get().Address(); was != "" && now != was && config.Get().Realtime.MCPToken != "" {
+				_ = config.Set().Realtime().SetMCPToken("")
+				slog.Warn("home: Home Assistant's address changed; realtime voice's token for it was cleared")
 			}
 			slog.Info("home: home assistant access stored")
 			f.wake()
@@ -573,34 +694,31 @@ func (f *Feature) Radio() Radio {
 	h := config.Get().Home.Radio
 	sources := RadioSources()
 	r := Radio{Configured: len(sources) > 0, Source: radioSource(), Sources: len(sources)}
-	if !r.Configured {
-		// No list to show, but the page is shown for a carried stream all the same, and it has to name
-		// what is playing: the same last word the configured path ends with.
-		return withFollowed(carried(r))
-	}
 	t := hastate.Get()
-	if r.Source == config.RadioFavorites {
-		r.Stations = favoriteNames(h)
-	}
-	// Favorites that turn out to hold no stations (lists not in Home Assistant yet) fall back to
-	// the stations near home, when there are any to fall back to.
-	if r.Source == config.RadioFavorites && len(r.Stations) == 0 && r.Sources > 1 {
-		r.Source = config.RadioLocal
-	}
-	if r.Source == config.RadioOwn {
-		for _, st := range OwnStations() {
-			r.Stations = append(r.Stations, st.Name)
+	if r.Configured {
+		if r.Source == config.RadioFavorites {
+			r.Stations = favoriteNames(h)
 		}
-	}
-	if r.Source != config.RadioFavorites && r.Source != config.RadioOwn {
-		f.fetchList(r.Source)
-		f.mu.Lock()
-		l := f.list(r.Source)
-		for _, st := range l.stations {
-			r.Stations = append(r.Stations, st.Name)
+		// Favorites that turn out to hold no stations (lists not in Home Assistant yet) fall back to
+		// the stations near home, when there are any to fall back to.
+		if r.Source == config.RadioFavorites && len(r.Stations) == 0 && r.Sources > 1 {
+			r.Source = config.RadioLocal
 		}
-		r.Loading, r.Problem = l.busy && len(l.stations) == 0, l.err
-		f.mu.Unlock()
+		if r.Source == config.RadioOwn {
+			for _, st := range OwnStations() {
+				r.Stations = append(r.Stations, st.Name)
+			}
+		}
+		if r.Source != config.RadioFavorites && r.Source != config.RadioOwn {
+			f.fetchList(r.Source)
+			f.mu.Lock()
+			l := f.list(r.Source)
+			for _, st := range l.stations {
+				r.Stations = append(r.Stations, st.Name)
+			}
+			r.Loading, r.Problem = l.busy && len(l.stations) == 0, l.err
+			f.mu.Unlock()
+		}
 	}
 	// Both from the music's own state, which is what the page is drawn from: a remote's track paused from
 	// here is held with play offered rather than playing, and the list needs to know that as the page does.
@@ -633,41 +751,67 @@ func (f *Feature) Radio() Radio {
 // Receiving() is not the name of it. That names a phone over Bluetooth, which is a stream of this
 // player's own rather than a remote's; the only thing that takes the speaker this way is Sendspin, and
 // what runs the server it talks to here is Music Assistant, so that is what the page calls it.
+//
+// Whose song it is comes from whosePlaying, the order the now-playing sensors go by too.
 func carried(r Radio) Radio {
-	// A receiver this device runs (AirPlay, Spotify Connect: feature/streaming) is playing to it: the
-	// page names the app, and the song and its cover where it gave them.
-	if from, title, artist, album := media.Get().ReceivedTrack(); Receiver(from) {
+	s := snapshotOf(media.Get())
+	switch whosePlaying(s, false) {
+	case playingOwn:
+		if s.titled {
+			// A track Home Assistant named before it played it (media_title): the page names what it
+			// was told, not the station last chosen here or Home Assistant's "last station" text, which
+			// went on saying "Radio" over a recording with an old station's song.
+			r.Chosen = ""
+			r.Playing, r.Paused = s.ownPlaying, s.ownPaused
+			r.Now = titledSource(s.own, locale.Text(config.Get().Screen.Language, "media_playback"))
+			r.Title, r.Artist, r.Album = s.own.Title, s.own.Subtitle, ""
+			r.Art, r.Thumb = nil, nil
+			r.Logo, r.Music = false, false
+			break
+		}
+		if !bluetoothFrom(s.recvFrom) {
+			break
+		}
+		// A phone playing over Bluetooth is a stream of this player's own, but not the radio's: the page
+		// names the phone, not the station last chosen here or Home Assistant's "last station" text,
+		// which went on naming a station while a phone played (and after the strip was closed and the
+		// phone played again). The song only if the device was told one; nothing reads one from a phone
+		// yet.
 		r.Chosen = ""
-		r.Playing, r.Paused = media.Get().Playing()
-		r.Now, r.Title, r.Artist, r.Album = from, title, artist, album
-		r.Art, r.Thumb = receivedArt(from)
+		r.Playing, r.Paused = s.ownPlaying, s.ownPaused
+		r.Now, r.Title, r.Artist, r.Album = s.recvFrom, s.recvTitle, s.recvArtist, s.recvAlbum
+		r.Art, r.Thumb = nil, nil
 		r.Logo, r.Music = false, true
-		return r
-	}
-	if !media.Get().Carried() {
+	case playingReceived:
+		// A receiver this device runs (AirPlay, Spotify Connect: feature/streaming) is playing to it: the
+		// page names the app, and the song and its cover where it gave them.
+		r.Chosen = ""
+		r.Playing, r.Paused = s.ownPlaying, s.ownPaused
+		r.Now, r.Title, r.Artist, r.Album = s.recvFrom, s.recvTitle, s.recvArtist, s.recvAlbum
+		r.Art, r.Thumb = receivedArt(s.recvFrom)
+		r.Logo, r.Music = false, true
+	case playingHeld:
 		// A remote's track paused from here is still the page's, with play on it, after the remote
 		// has let it go.
-		if title, artist, album, ok := media.Get().Held(); ok {
-			r.Playing, r.Now = false, "Music Assistant"
-			r.Title, r.Artist, r.Album = title, artist, album
-			r.Art, r.Thumb = remoteArt()
-			r.Logo = false
-			r.Music = true
-		}
-		return r
+		r.Playing, r.Now = false, "Music Assistant"
+		r.Title, r.Artist, r.Album = s.heldTitle, s.heldArtist, s.heldAlbum
+		r.Art, r.Thumb = remoteArt()
+		r.Logo = false
+		r.Music = true
+	case playingCarried:
+		// Nothing of this device's is starting while a remote is what the room hears. A station tapped
+		// just before Music Assistant took the speaker never plays - the remote ends it - and the list
+		// went on reading "Starting…" for it for as long as the remote carried on.
+		r.Chosen = ""
+		r.Playing, r.Now = true, "Music Assistant"
+		r.Title, r.Artist, r.Album = s.extTitle, s.extArtist, s.extAlbum
+		// Music Assistant's own picture for the track when it sent one. Without one the page draws a
+		// stand-in of its own, so the last station's cover and logo must not be left behind somebody
+		// else's.
+		r.Art, r.Thumb = remoteArt()
+		r.Logo = false
+		r.Music = true
 	}
-	trackTitle, trackArtist, trackAlbum := media.Get().Track()
-	// Nothing of this device's is starting while a remote is what the room hears. A station tapped just
-	// before Music Assistant took the speaker never plays - the remote ends it - and the list went on
-	// reading "Starting…" for it for as long as the remote carried on.
-	r.Chosen = ""
-	r.Playing, r.Now = true, "Music Assistant"
-	r.Title, r.Artist, r.Album = trackTitle, trackArtist, trackAlbum
-	// Music Assistant's own picture for the track when it sent one. Without one the page draws a
-	// stand-in of its own, so the last station's cover and logo must not be left behind somebody else's.
-	r.Art, r.Thumb = remoteArt()
-	r.Logo = false
-	r.Music = true
 	return r
 }
 
@@ -695,11 +839,20 @@ func favoriteNames(h config.Radio) []string {
 
 // Play plays a station of the list shown on this device: a favorite through Home Assistant's
 // script, a Radio Browser station through the device's own player entity.
-func (f *Feature) Play(station string) {
+func (f *Feature) Play(station string) { f.play(station, nil) }
+
+// play is Play; with gen, only while the station's generation still is *gen (a put-back, which a Stop
+// or another station since cancels: putBack).
+func (f *Feature) play(station string, gen *uint64) {
 	// What was asked for, in the words the lists use, so a stream that drops can be asked for again:
 	// the name worked out from a URL afterwards is often the stream's host, which no list has.
 	f.mu.Lock()
-	f.asked, f.askedAt = station, time.Now()
+	if gen != nil && f.stationGen != *gen {
+		f.mu.Unlock()
+		return
+	}
+	f.askStation(station)
+	g := f.stationGen
 	f.mu.Unlock()
 
 	source := radioSource()
@@ -708,9 +861,12 @@ func (f *Feature) Play(station string) {
 		source = config.RadioLocal
 	}
 	if source == config.RadioOwn {
-		if f.playOwn(station) {
+		if f.playOwn(station, &g) {
 			f.Changed.Emit(struct{}{})
 			f.pokeMeta()
+		} else {
+			slog.Info("radio: the station is not one kept on the device; not played", "station", station)
+			f.unask(station)
 		}
 		return
 	}
@@ -718,31 +874,33 @@ func (f *Feature) Play(station string) {
 		if f.playListed(source, station) {
 			f.Changed.Emit(struct{}{})
 			f.pokeMeta()
+		} else {
+			slog.Info("radio: the station is not on the list the radio page shows; not played", "station", station, "list", source)
+			f.unask(station)
 		}
 		return
 	}
 	h := config.Get().Home.Radio
 	if !h.Configured() {
+		f.unask(station)
 		return
 	}
 	f.mu.Lock()
 	f.chosen = station
 	f.mu.Unlock()
-	f.callFavorite(h, station)
+	// Watched only when somebody asked for it (hint.go): a put-back, after a stream dropped, is the
+	// device's own doing, and a note about it would be about nothing anybody did.
+	f.callFavorite(h, station, gen == nil)
 	f.Changed.Emit(struct{}{})
 	f.pokeMeta()
 }
 
 // askFor is the station name to hand the finder: a list label like "101.1 WXYZ on iHeartRadio"
-// was written for Alexa, which took the whole phrase; a search wants just "101.1 WXYZ".
+// was written for Alexa, which took the whole phrase; a search wants just "101.1 WXYZ". The same
+// splitter resolves the label, so the two cannot drift apart.
 func askFor(label string) string {
-	l := strings.TrimSpace(label)
-	for _, tail := range []string{" on iHeartRadio", " on iHeart", " on TuneIn", " on Tune In"} {
-		if strings.HasSuffix(strings.ToLower(l), strings.ToLower(tail)) {
-			return strings.TrimSpace(l[:len(l)-len(tail)])
-		}
-	}
-	return l
+	name, _ := radiometa.SplitName(label)
+	return name
 }
 
 // Stop ends whatever is playing, whoever is playing it.
@@ -772,6 +930,7 @@ func (f *Feature) Stop() {
 	media.Get().Stop()
 	f.mu.Lock()
 	f.chosen = ""
+	f.forgetStation()
 	f.mu.Unlock()
 	f.Changed.Emit(struct{}{})
 	f.pokeMeta()

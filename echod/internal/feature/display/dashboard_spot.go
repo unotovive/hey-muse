@@ -178,7 +178,7 @@ func (d *Display) dashGestureSpot(g touch.Gesture) {
 			if streamed {
 				f.Touch("up", at.X, at.Y)
 			} else {
-				d.drawnRelease()
+				d.drawnRelease(g.X, g.Y)
 			}
 			d.mu.Lock()
 			d.openMenu(modeMain, itemDashboard)
@@ -189,14 +189,14 @@ func (d *Display) dashGestureSpot(g touch.Gesture) {
 			if streamed {
 				f.Touch("up", at.X, at.Y)
 			} else {
-				d.drawnRelease()
+				d.drawnRelease(g.X, g.Y)
 				d.drawnTap(at.X, at.Y)
 			}
 		default:
 			if streamed {
 				f.Touch("up", g.X, g.Y)
 			} else {
-				d.drawnRelease()
+				d.drawnRelease(g.X, g.Y)
 			}
 		}
 	}
@@ -205,14 +205,14 @@ func (d *Display) dashGestureSpot(g touch.Gesture) {
 // dashFace draws the dashboard over the round panel.
 func (r *roundRenderer) dashFace(s roundScene) {
 	if s.dashMode == config.DashboardDrawn {
-		r.dashPage(s.drawn, s.dashScroll, s.dashAdjust, spotDashArea, "")
+		r.dashPage(s.drawn, s.dashScroll, s.dashAdjust, spotDashArea, "", "")
 		return
 	}
 	v := s.dash
 	drawn := v.Ready && dashboard.Get().DrawStream(r.dst)
 	msg := v.Problem
 	if msg == "" && !drawn {
-		msg = "Connecting to the dashboard…"
+		msg = tr("drawer_connecting")
 	}
 	if msg == "" {
 		return

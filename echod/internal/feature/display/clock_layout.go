@@ -11,16 +11,37 @@ import (
 	"github.com/HuskerMinion/techo5/echod/internal/config"
 )
 
-// Where the home screen's clock sits, and the date's color: for a photo behind the clock, whose
-// subject is so often in the middle. The center and the date's usual color stay the default.
+// Where the home screen's clock and weather sit, and the date's color: for a photo behind the clock,
+// whose subject is so often in the middle. The center, the weather top left and the date's usual
+// color stay the default.
 
 // clockPositions are the choices, with what the config keeps for each; the center is kept as nothing.
-var clockPositions = []struct {
-	label, value string
-}{
+var clockPositions = []clockPosition{
 	{"Center", ""},
 	{"Bottom left", "bottom-left"},
+	{"Bottom center", "bottom-center"},
 	{"Bottom right", "bottom-right"},
+}
+
+// weatherPositions are Weather position's choices, with what the config keeps for each; the top left,
+// where the weather has always been, is kept as nothing.
+var weatherPositions = []clockPosition{
+	{"Top left", ""},
+	{"Top right", "top-right"},
+}
+
+// glanceSizes are Glance chip size's choices, with what the config keeps for each; Automatic, the
+// strip's own pick between the small and tiny faces, is kept as nothing.
+var glanceSizes = []clockPosition{
+	{"Automatic", ""},
+	{"Small", "small"},
+	{"Tiny", "tiny"},
+}
+
+// glanceMusic are Chips while music plays' choices: Hide, as the chips always did, is kept as nothing.
+var glanceMusic = []clockPosition{
+	{"Hide", ""},
+	{"Above the strip", "above"},
 }
 
 // dateColors are the date's colors; Default is the theme's own.
@@ -36,16 +57,6 @@ var dateColors = []struct {
 	{"Rose", "rose", color.RGBA{255, 140, 170, 255}},
 }
 
-func clockPositionIndex() int {
-	v := config.Get().Screen.ClockPosition
-	for i, p := range clockPositions {
-		if p.value == v {
-			return i
-		}
-	}
-	return 0
-}
-
 func dateColorIndex() int {
 	v := config.Get().Screen.DateColor
 	for i, c := range dateColors {
@@ -56,14 +67,6 @@ func dateColorIndex() int {
 	return 0
 }
 
-func clockPositionOptions() []string {
-	out := make([]string, len(clockPositions))
-	for i, p := range clockPositions {
-		out[i] = p.label
-	}
-	return out
-}
-
 func dateColorOptions() []string {
 	out := make([]string, len(dateColors))
 	for i, c := range dateColors {
@@ -72,12 +75,118 @@ func dateColorOptions() []string {
 	return out
 }
 
+func weatherPositionIndex() int {
+	v := config.Get().Screen.WeatherPosition
+	for i, p := range weatherPositions {
+		if p.value == v {
+			return i
+		}
+	}
+	return 0
+}
+
+func weatherPositionOptions() []string {
+	out := make([]string, len(weatherPositions))
+	for i, p := range weatherPositions {
+		out[i] = p.label
+	}
+	return out
+}
+
+func glanceSizeIndex() int {
+	v := config.Get().Screen.GlanceChipSize
+	for i, p := range glanceSizes {
+		if p.value == v {
+			return i
+		}
+	}
+	return 0
+}
+
+func glanceSizeOptions() []string {
+	out := make([]string, len(glanceSizes))
+	for i, p := range glanceSizes {
+		out[i] = p.label
+	}
+	return out
+}
+
+// glanceSize is the glance strip's chosen size: "" for Automatic, "small" or "tiny".
+func glanceSize() string { return glanceSizes[glanceSizeIndex()].value }
+
+func setGlanceSize(s *esphome.Select, i int) {
+	if i < 0 || i >= len(glanceSizes) {
+		return
+	}
+	if err := config.Set().Screen().GlanceChipSize(glanceSizes[i].value); err != nil {
+		slog.Error("saving the glance chip size failed", "err", err)
+		return
+	}
+	if s != nil {
+		s.Set(glanceSizes[i].label)
+	}
+}
+
+func glanceMusicIndex() int {
+	v := config.Get().Screen.GlanceWithMusic
+	for i, p := range glanceMusic {
+		if p.value == v {
+			return i
+		}
+	}
+	return 0
+}
+
+func glanceMusicOptions() []string {
+	out := make([]string, len(glanceMusic))
+	for i, p := range glanceMusic {
+		out[i] = p.label
+	}
+	return out
+}
+
+// glanceOverStrip is whether the glance chips sit in a row over the music strip while it is up.
+func glanceOverStrip() bool { return glanceMusic[glanceMusicIndex()].value == "above" }
+
+func setGlanceMusic(s *esphome.Select, i int) {
+	if i < 0 || i >= len(glanceMusic) {
+		return
+	}
+	if err := config.Set().Screen().GlanceWithMusic(glanceMusic[i].value); err != nil {
+		slog.Error("saving chips while music plays failed", "err", err)
+		return
+	}
+	if s != nil {
+		s.Set(glanceMusic[i].label)
+	}
+}
+
+// weatherOnRight is whether the home screen's weather sits at the top right.
+func weatherOnRight() bool {
+	return weatherPositions[weatherPositionIndex()].value == "top-right"
+}
+
+func setWeatherPosition(s *esphome.Select, i int) {
+	if i < 0 || i >= len(weatherPositions) {
+		return
+	}
+	if err := config.Set().Screen().WeatherPosition(weatherPositions[i].value); err != nil {
+		slog.Error("saving the weather position failed", "err", err)
+		return
+	}
+	if s != nil {
+		s.Set(weatherPositions[i].label)
+	}
+}
+
 // clockAlign is where the clock sits across: -1 on the left, 0 centered, 1 on the right; and whether
 // it sits at the foot rather than across the middle.
 func clockAlign() (align int, foot bool) {
 	switch clockPositions[clockPositionIndex()].value {
 	case "bottom-left":
 		return -1, true
+	case "bottom-center":
+		return 0, true
 	case "bottom-right":
 		return 1, true
 	}
@@ -93,19 +202,6 @@ func dateColor(fallback color.RGBA) color.Color {
 	return fallback
 }
 
-func setClockPosition(s *esphome.Select, i int) {
-	if i < 0 || i >= len(clockPositions) {
-		return
-	}
-	if err := config.Set().Screen().ClockPosition(clockPositions[i].value); err != nil {
-		slog.Error("saving the clock position failed", "err", err)
-		return
-	}
-	if s != nil {
-		s.Set(clockPositions[i].label)
-	}
-}
-
 func setDateColor(s *esphome.Select, i int) {
 	if i < 0 || i >= len(dateColors) {
 		return
@@ -119,32 +215,47 @@ func setDateColor(s *esphome.Select, i int) {
 	}
 }
 
-// clockLayoutRows are the two settings on the screen, under Display.
+// clockLayoutRows are the five settings on the screen, under Display.
 func clockLayoutRows() []settingRow {
 	return []settingRow{
-		{id: "clockpos", label: "Clock position", sub: "Out of a photo's way", kind: ctlChoice, value: clockPositions[clockPositionIndex()].label},
-		{id: "datecolor", label: "Date color", sub: "The date and AM/PM", kind: ctlChoice, value: dateColors[dateColorIndex()].label},
+		{id: "clockpos", label: tr("ui_clock_position"), sub: tr("ui_not_for_dashboard_agenda_or_world"), kind: ctlChoice, value: clockPositions[clockPositionIndex()].label},
+		{id: "weatherpos", label: tr("ui_weather_position"), sub: tr("ui_the_weather_s_corner_over_the_clock"), kind: ctlChoice, value: weatherPositions[weatherPositionIndex()].label},
+		{id: "datecolor", label: tr("ui_date_color"), sub: tr("ui_the_date_and_am_pm"), kind: ctlChoice, value: dateColors[dateColorIndex()].label},
+		{id: "glancesize", label: tr("ui_glance_chip_size"), sub: tr("ui_the_text_under_the_clock"), kind: ctlChoice, value: glanceSizes[glanceSizeIndex()].label},
+		{id: "glancemusic", label: tr("ui_chips_while_music_plays"), sub: tr("ui_chips_while_music_plays_sub"), kind: ctlChoice, value: glanceMusic[glanceMusicIndex()].label},
 	}
 }
 
-// clockLayoutPicker is the list for either setting.
+// clockLayoutPicker is the list for any of them.
 func clockLayoutPicker(id string) (pickerView, bool) {
 	switch id {
 	case "clockpos":
-		return pickerView{title: "Clock position", opts: clockPositionOptions(), cur: clockPositionIndex()}, true
+		return pickerView{title: tr("ui_clock_position"), opts: clockPositionOptions(), cur: clockPositionIndex()}, true
+	case "weatherpos":
+		return pickerView{title: tr("ui_weather_position"), opts: weatherPositionOptions(), cur: weatherPositionIndex()}, true
 	case "datecolor":
-		return pickerView{title: "Date color", opts: dateColorOptions(), cur: dateColorIndex()}, true
+		return pickerView{title: tr("ui_date_color"), opts: dateColorOptions(), cur: dateColorIndex()}, true
+	case "glancesize":
+		return pickerView{title: tr("ui_glance_chip_size"), opts: glanceSizeOptions(), cur: glanceSizeIndex()}, true
+	case "glancemusic":
+		return pickerView{title: tr("ui_chips_while_music_plays"), opts: glanceMusicOptions(), cur: glanceMusicIndex()}, true
 	}
 	return pickerView{}, false
 }
 
-// chooseClockLayout takes a choice from either list, and says whether id was one of them.
+// chooseClockLayout takes a choice from any of the lists, and says whether id was one of them.
 func (d *Display) chooseClockLayout(id string, i int) bool {
 	switch id {
 	case "clockpos":
 		setClockPosition(d.clockPos, i)
+	case "weatherpos":
+		setWeatherPosition(d.weatherPos, i)
 	case "datecolor":
 		setDateColor(d.dateCol, i)
+	case "glancesize":
+		setGlanceSize(d.glanceSz, i)
+	case "glancemusic":
+		setGlanceMusic(d.glanceMus, i)
 	default:
 		return false
 	}
@@ -152,21 +263,23 @@ func (d *Display) chooseClockLayout(id string, i int) bool {
 	return true
 }
 
-// clockLayoutSelects are Clock position and Date color in Home Assistant.
-func clockLayoutSelects(wake func()) (position, date *esphome.Select) {
-	position = &esphome.Select{
+// clockLayoutSelects are Clock position, Date color, Weather position, Glance chip size and Chips while
+// music plays in Home Assistant.
+func clockLayoutSelects(wake func()) (position, date, weather, glance, music *esphome.Select) {
+	position = clockPositionSelect(wake)
+	weather = &esphome.Select{
 		Base: esphome.Base{
-			ObjectID: "screen_clock_position",
-			Name:     "Clock position",
-			Icon:     "mdi:clock-outline",
+			ObjectID: "screen_weather_position",
+			Name:     "Weather position",
+			Icon:     "mdi:weather-partly-cloudy",
 			Category: esphome.CategoryConfig,
 		},
-		Options: clockPositionOptions(),
+		Options: weatherPositionOptions(),
 	}
-	position.OnCommand = func(v string) {
-		for i, p := range clockPositions {
+	weather.OnCommand = func(v string) {
+		for i, p := range weatherPositions {
 			if p.label == v {
-				setClockPosition(position, i)
+				setWeatherPosition(weather, i)
 				wake()
 				return
 			}
@@ -190,5 +303,41 @@ func clockLayoutSelects(wake func()) (position, date *esphome.Select) {
 			}
 		}
 	}
-	return position, date
+	glance = &esphome.Select{
+		Base: esphome.Base{
+			ObjectID: "screen_glance_chip_size",
+			Name:     "Glance chip size",
+			Icon:     "mdi:format-size",
+			Category: esphome.CategoryConfig,
+		},
+		Options: glanceSizeOptions(),
+	}
+	glance.OnCommand = func(v string) {
+		for i, p := range glanceSizes {
+			if p.label == v {
+				setGlanceSize(glance, i)
+				wake()
+				return
+			}
+		}
+	}
+	music = &esphome.Select{
+		Base: esphome.Base{
+			ObjectID: "screen_glance_with_music",
+			Name:     "Chips while music plays",
+			Icon:     "mdi:music-box-outline",
+			Category: esphome.CategoryConfig,
+		},
+		Options: glanceMusicOptions(),
+	}
+	music.OnCommand = func(v string) {
+		for i, p := range glanceMusic {
+			if p.label == v {
+				setGlanceMusic(music, i)
+				wake()
+				return
+			}
+		}
+	}
+	return position, date, weather, glance, music
 }

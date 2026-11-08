@@ -5,6 +5,7 @@ package display
 import (
 	"fmt"
 	"image"
+	"image/color"
 	"image/png"
 	"math"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"github.com/HuskerMinion/techo5/echod/internal/feature/alarm"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/announce"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/home"
+	"github.com/HuskerMinion/techo5/echod/internal/feature/notify"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/phone"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/remind"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/timer"
@@ -70,6 +72,7 @@ func testPicture() *image.RGBA {
 // Every scene draws without panicking; with SPOT_PREVIEW set to a directory, each is written there as
 // a PNG to look at.
 func TestRoundScenesDraw(t *testing.T) {
+	previewFont(t)
 	at := time.Date(2026, 9, 16, 14, 7, 0, 0, time.Local)
 	sky := home.Weather{Condition: "partlycloudy", Temp: "72°"}
 	var week []hass.Day
@@ -125,6 +128,28 @@ func TestRoundScenesDraw(t *testing.T) {
 		"announcement":  {now: at, phase: "idle", showAnnouncement: true, announcement: announce.Message{From: "Guest's Desk", Text: "dinner is ready, come down"}},
 		"announcement-voice": {now: at, phase: "idle", showAnnouncement: true,
 			announcement: announce.Message{From: "Laundry Room"}},
+		"notification": {now: at, phase: "idle", weather: sky, showNotification: true,
+			notification: notify.Notification{Kind: notify.Text, Title: "Washer", Icon: "mdi:washing-machine", Message: "The washing machine is done"}},
+		"notification-under-camera": {now: at, phase: "idle", showCamera: true, camera: home.CameraView{Entity: "camera.front_door", Name: "Front door", Frame: testPicture()},
+			showNotification: true, notification: notify.Notification{Kind: notify.Text, Title: "Washer", Message: "The washing machine is done"}},
+		// The device's own notes (home/hint.go): a station Home Assistant never started, the star refused.
+		"notification-radio-hint": {now: at, phase: "idle", weather: sky, showNotification: true,
+			notification: notify.Notification{Kind: notify.Text, Title: "Radio", Message: home.NoStartHint, Own: true}},
+		"notification-favorite-hint": {now: at, phase: "idle", weather: sky, showNotification: true,
+			notification: notify.Notification{Kind: notify.Text, Title: "Favorites", Message: home.FavoriteHint, Own: true}},
+		"notification-bare": {now: at, phase: "idle", showNotification: true,
+			notification: notify.Notification{Kind: notify.Text, Message: "Done"}},
+		"notification-longest": {now: at, phase: "idle", showNotification: true,
+			notification: notify.Notification{Kind: notify.Text, Title: "A title that runs on and on past the face",
+				Message: "Move the washing to the dryer, then put the towels on the rack by the back door and the sheets on the line"}},
+		"camera-captioned": {now: at, phase: "idle", showCamera: true, camera: home.CameraView{Entity: "camera.front_door",
+			Name: "Front door", Frame: testPicture(), Caption: &home.Caption{ID: "1", Title: "Doorbell", Message: "Someone is at the front door, and has been for a while"}}},
+		"camera-captioned-long-title": {now: at, phase: "idle", showCamera: true, camera: home.CameraView{Entity: "camera.front_door",
+			Name: "Front door", Frame: testPicture(), Caption: &home.Caption{ID: "1", Title: "Somebody has been standing at the front door for a very long time", Message: "Come and see"}}},
+		"camera-wordless": {now: at, phase: "idle", showCamera: true, camera: home.CameraView{Entity: "camera.front_door",
+			Name: "Front door", Frame: testPicture(), Caption: &home.Caption{ID: "1"}}},
+		"camera-captioned-error": {now: at, phase: "idle", showCamera: true, camera: home.CameraView{Entity: "/local/a.png",
+			Name: "Notification", Error: "404 Not Found", Caption: &home.Caption{ID: "1", Message: "The picture could not be fetched"}}},
 		"reminder": {now: at, phase: "idle", showReminder: true,
 			reminder: remind.Reminder{Label: "Take the trash out"}},
 		// Longer than the box: the words scroll rather than stopping after two lines, at rest and
@@ -154,6 +179,11 @@ func TestRoundScenesDraw(t *testing.T) {
 			return s
 		}(),
 	}
+	// Bluetooth's rows, Secure Connections among them (#183): on, as it comes, and turned off.
+	scenes["settings-connections"] = spotScene(catConnections)
+	scOff := spotScene(catConnections)
+	scOff.sheet.st.btSCOff, scOff.sheet.st.cardScroll = true, 1000
+	scenes["settings-connections-sc-off"] = scOff
 	// Weather alerts: the clock's pill, the alert face (a second one, scrolled), the rain map's pill.
 	wind := home.Alert{ID: "a", Event: "Wind Advisory", Severity: "Moderate", Sender: "NWS Omaha/Valley NE",
 		Ends: at.Add(20 * time.Hour), Color: home.AlertColor("Wind Advisory", ""), Here: true,
@@ -168,6 +198,15 @@ func TestRoundScenesDraw(t *testing.T) {
 	scenes["alert-face-2"] = roundScene{now: at, phase: "idle", showAlert: true, alertIdx: 1, alertScroll: 2, alerts: alerts}
 	scenes["radar-alert"] = roundScene{now: at, phase: "idle", menuOpen: true, menuMode: modeWeather, radarOn: true, alerts: alerts,
 		radar: home.RadarView{Frames: []home.RadarFrame{{Image: testPicture(), At: at}}}}
+
+	// The red night clock in its three looks, at 3:47 in the morning, muted, and with four figures.
+	late := time.Date(2026, 9, 17, 3, 47, 0, 0, time.Local)
+	for name, style := range map[string]string{"red": nightStylePlain, "led": nightStyleLED, "flip": nightStyleFlip} {
+		scenes["night-"+name] = roundScene{now: late, phase: "idle", redClock: true, redStyle: style}
+	}
+	scenes["night-red-muted"] = roundScene{now: late, phase: "idle", redClock: true, muted: true}
+	scenes["night-flip-four"] = roundScene{now: late.Add(19 * time.Hour), phase: "idle", redClock: true, redStyle: nightStyleFlip}
+	scenes["night-led-four"] = roundScene{now: late.Add(19 * time.Hour), phase: "idle", redClock: true, redStyle: nightStyleLED}
 
 	// The light before an alarm on the round face, frame by frame.
 	wake := at.Add(20 * time.Minute)
@@ -200,10 +239,22 @@ func TestRoundScenesDraw(t *testing.T) {
 		scenes["turn-"+style+"-night"] = roundScene{now: at, phase: "replying", heard: "Turn off the bedroom light", reply: "Bedroom light is off.",
 			eq: &eqView{level: night, peak: nightPk, night: true, wave: wave}}
 	}
+	// The pictures of turn_visual.go, which take the turn's phase.
+	for _, style := range []string{"vu", "orb", "hal", "face"} {
+		think := eqFor("thinking", false, at)
+		think.style, think.phase = style, "thinking"
+		scenes["turn-"+style+"-listening"] = roundScene{now: at, phase: "listening", eq: &eqView{level: listen, peak: listenPk, style: style, phase: "listening"}}
+		scenes["turn-"+style+"-thinking"] = roundScene{now: at, phase: "thinking", heard: "What's the weather tomorrow?", eq: think}
+		scenes["turn-"+style+"-replying"] = roundScene{now: at, phase: "replying", heard: "What's the weather tomorrow?",
+			reply: "Tomorrow will be sunny, with a high of 74 and a low of 51.", eq: &eqView{level: reply, peak: replyPk, style: style, phase: "replying"}}
+		scenes["turn-"+style+"-night"] = roundScene{now: at, phase: "replying", heard: "Turn off the bedroom light", reply: "Bedroom light is off.",
+			eq: &eqView{level: night, peak: nightPk, night: true, style: style, phase: "replying"}}
+	}
 
 	dir := os.Getenv("SPOT_PREVIEW")
 	for name, s := range scenes {
 		img := image.NewRGBA(image.Rect(0, 0, side, side))
+		faceState.set = false // each a face of its own, not the last one's easing toward it
 		newRoundRenderer(img).draw(s)
 		if dir == "" {
 			continue
@@ -288,5 +339,28 @@ func TestTheCameraSoundControlIsWhereItIsDrawnOnTheSpot(t *testing.T) {
 		if b := cameraSoundBox(r.width(r.label, label) + 24); b.Dx() < r.width(r.label, label) {
 			t.Errorf("%q does not fit the bar it is drawn in", label)
 		}
+	}
+}
+
+// The idle ring's gray track goes with the setting, and a timer still draws its rim (#431).
+func TestIdleRingHidden(t *testing.T) {
+	previewFont(t)
+	at := time.Date(2026, 9, 16, 14, 7, 0, 0, time.Local)
+	foot := image.Pt(center, center+(rimIn+rimOut)/2)
+	rimAt := func(s roundScene) color.RGBA {
+		img := image.NewRGBA(image.Rect(0, 0, side, side))
+		faceState.set = false
+		newRoundRenderer(img).draw(s)
+		return img.RGBAAt(foot.X, foot.Y)
+	}
+	if got := rimAt(roundScene{now: at, phase: "idle"}); got != colTrack {
+		t.Errorf("idle rim = %v, want the track %v", got, colTrack)
+	}
+	if got := rimAt(roundScene{now: at, phase: "idle", noIdleRing: true}); got == colTrack {
+		t.Errorf("idle rim with the ring hidden is still the track")
+	}
+	countdown := []timer.Countdown{{Left: 30 * time.Second, Total: time.Minute}}
+	if got := rimAt(roundScene{now: at, phase: "idle", noIdleRing: true, timers: countdown}); got == colBackground {
+		t.Errorf("a timer's rim was hidden with the idle ring")
 	}
 }

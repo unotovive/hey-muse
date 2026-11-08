@@ -16,10 +16,14 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/HuskerMinion/techo5/echod/internal/layout"
 )
 
+// iface is the Wi-Fi interface: wlan0 on every Echo, mlan0 on the Surface RT.
+var iface = layout.WifiInterface
+
 const (
-	iface   = "wlan0"
 	ctrlDir = "/run/wpa"
 
 	// SetupFlag, while present, tells the boot scripts' network keeper that someone is setting the
@@ -55,7 +59,7 @@ func Available() bool {
 func cli(ctx context.Context, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "wpa_cli", append([]string{"-p", ctrlDir, "-i", iface}, args...)...).CombinedOutput()
+	out, err := exec.CommandContext(ctx, "wpa_cli", append([]string{"-p", ctrlDir, "-i", iface()}, args...)...).CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("wpa_cli %s: %w: %s", args[0], err, strings.TrimSpace(string(out)))
 	}
@@ -108,7 +112,7 @@ func Current(ctx context.Context) Status {
 
 // address is the interface's IPv4 address, empty without one.
 func address() string {
-	i, err := net.InterfaceByName(iface)
+	i, err := net.InterfaceByName(iface())
 	if err != nil {
 		return ""
 	}
@@ -189,11 +193,11 @@ func Join(ctx context.Context, ssid, passphrase string) error {
 			kept = append(kept, b)
 		}
 	}
-	if err := os.WriteFile(Conf, []byte(conf(kept)), 0o600); err != nil {
+	if err := writeFile(Conf, conf(kept)); err != nil {
 		return err
 	}
 	if len(old) > 0 {
-		_ = os.WriteFile(Conf+".prev", old, 0o600)
+		_ = writeFile(Conf+".prev", string(old))
 	}
 	if _, err := cli(ctx, "reconfigure"); err != nil {
 		return err
@@ -235,7 +239,7 @@ func Join(ctx context.Context, ssid, passphrase string) error {
 	}
 	// Back to what worked. The reconfigure re-reads the file, which undoes the select above with it.
 	if len(old) > 0 {
-		_ = os.WriteFile(Conf, old, 0o600)
+		_ = writeFile(Conf, string(old))
 	}
 	_, _ = cli(ctx, "reconfigure")
 	return fmt.Errorf("wifi: could not join %q (%s)", ssid, Current(ctx).State)
@@ -257,9 +261,25 @@ func networkID(ctx context.Context, ssid string) (string, error) {
 	return "", fmt.Errorf("wifi: %q is not among the saved networks", ssid)
 }
 
-// renewLease pokes udhcpc for a new lease on the new network.
+// RenewLease gets an address on the network joined now, as a join does (#384).
+func RenewLease() { renewLease() }
+
+// renewLease gets the address on the new network: through techo5-net when the setting is a fixed
+// address (address.go), which decides whether it holds there; otherwise by poking udhcpc for a lease,
+// as always. Never through a techo5-net that is not the one that knows fixed addresses (AddressSupported).
 func renewLease() {
-	pid, err := os.ReadFile("/run/udhcpc.pid")
+	if AddressSupported() && LoadAddress().Fixed {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		if out, err := exec.CommandContext(ctx, netTool, "renew").CombinedOutput(); err != nil {
+			slog.Warn("wifi: techo5-net renew failed", "err", err, "out", strings.TrimSpace(string(out)))
+		}
+		return
+	}
+	if startDHCP() {
+		return // a client just started asks for its lease by itself
+	}
+	pid, err := os.ReadFile(dhcpPid)
 	if err != nil {
 		return
 	}

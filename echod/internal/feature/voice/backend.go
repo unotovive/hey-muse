@@ -30,19 +30,43 @@ type backend interface {
 // excuser is a backend that can say why it is not ready, in words for the room.
 type excuser interface{ Excuse() string }
 
-// ha is Home Assistant's pipeline.
-type ha struct{ vs *esphome.VoiceSatellite }
+// ha is Home Assistant's pipeline. watch opens a run at the wake word stage instead (hawake.go), and
+// ready stands in for the satellite's subscription where a test has none, as start does for the
+// request that opens a turn.
+type ha struct {
+	vs    *esphome.VoiceSatellite
+	watch func(phrase string) error
+	ready func() bool
+	start func(phrase string) error
+}
 
-func (h ha) Ready() bool               { return h.vs.Subscribed() }
-func (h ha) Start(phrase string) error { return h.vs.StartTurn(phrase, audioSettings()) }
-func (h ha) Audio(frame []byte) error  { return h.vs.SendAudio(frame) }
-func (h ha) End() error                { return h.vs.EndAudio() }
-func (h ha) Stop() error               { return h.vs.StopTurn() }
-func (h ha) Name() string              { return "home assistant" }
+func (h ha) Ready() bool {
+	if h.ready != nil {
+		return h.ready()
+	}
+	return h.vs.Subscribed()
+}
+
+func (h ha) Start(phrase string) error {
+	if h.start != nil {
+		return h.start(phrase)
+	}
+	return h.vs.StartTurn(phrase, audioSettings())
+}
+
+func (h ha) Audio(frame []byte) error { return h.vs.SendAudio(frame) }
+func (h ha) End() error               { return h.vs.EndAudio() }
+func (h ha) Stop() error              { return h.vs.StopTurn() }
+func (h ha) Name() string             { return "home assistant" }
 
 // backendFor is which one a new turn runs against: the direct pipeline when it is chosen and set up,
 // Muse when it is chosen, Home Assistant otherwise.
-func (c *conversation) backendFor() backend {
+func (c *conversation) backendFor(slot int) backend {
+	// A slot chosen for realtime voice is answered by it, whatever the brain: not ready (not set up, or
+	// the day's minutes used), the turn says so rather than going to another assistant unasked.
+	if w := config.Get().Wake.Words; slot >= 0 && slot < len(w) && w[slot].Realtime {
+		return c.realtime
+	}
 	b := config.Get().Brain
 	switch {
 	case b.Direct():
@@ -51,4 +75,20 @@ func (c *conversation) backendFor() backend {
 		return c.muse
 	}
 	return c.ha
+}
+
+// onHA is whether the turn is Home Assistant's pipeline's.
+func (c *conversation) onHA() bool {
+	_, on := c.be.(ha)
+	return on
+}
+
+// stopsAtOnce is whether the turn's backend stops the moment it is told, with nothing more to come from
+// it: the device's own, not Home Assistant's run.
+func (c *conversation) stopsAtOnce() bool {
+	switch c.be.(type) {
+	case *direct, *rtBackend:
+		return true
+	}
+	return false
 }

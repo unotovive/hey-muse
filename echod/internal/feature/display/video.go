@@ -25,7 +25,9 @@ import (
 
 // videoCovered is whether something in the scene goes over the video, so it is not the page.
 func videoCovered(s scene) bool {
-	turn := s.phase == "listening" || s.phase == "thinking" || s.phase == "replying"
+	// A cue's light, and its captions while they stay: the video stays paused until they are gone.
+	turn := s.phase == "listening" || s.phase == "thinking" || s.phase == "replying" || cueLit(s.cue) ||
+		(s.cue != "" && cueWords(s.cue, s.heard, s.reply) != "")
 	return s.call.Phase != phone.Idle || s.ring.any() || s.pin.open || s.setupAsking || s.showVideoAsk || s.bt.Pairing ||
 		s.showWifi || s.showCamera || s.showSheet || turn
 }
@@ -39,7 +41,7 @@ func (d *Display) videoScene(s *scene, now time.Time) {
 	}
 	// What draw() puts over the question (render.go) leaves it undrawn, and so unanswerable.
 	drawnAsk := uint64(0)
-	if s.showVideoAsk && s.call.Phase == phone.Idle && !s.ring.any() && !s.pin.open && !s.setupAsking {
+	if s.showVideoAsk && !s.callPageUp() && !s.ring.any() && !s.pin.open && !s.setupAsking {
 		drawnAsk = s.videoAsk.id
 	}
 	d.vask.drawn(drawnAsk, now)
@@ -58,6 +60,7 @@ func (d *Display) videoScene(s *scene, now time.Time) {
 	s.videoControls = controls
 	s.videoLive = s.showVideo && up && st.Frames
 	d.videoOnScreen = s.showVideo
+	d.videoLive = s.videoLive
 	d.mu.Unlock()
 }
 

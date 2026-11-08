@@ -13,6 +13,10 @@
 #                        each slot installed without one (etc/techo5/boot.sh keeps it)
 #   rescue               present: the next boot stays in the initramfs, then removed
 #
+# .techo5-store may name the board the store belongs to (board=athena): a store that does refuses
+# a root filesystem made for another board (its etc/techo5/device.conf says T5_BOARD=), since one
+# would boot with another device's partitions and drivers. A store naming none takes any rootfs.
+#
 # The initramfs writes the name of the slot it booted into /run/techo5/slot.
 #
 # A newly installed slot is on trial for three boots. The initramfs takes one
@@ -21,6 +25,12 @@
 # in-place updates. A slot that runs out of tries is marked bad and the other
 # slot, if good, is booted; with no good slot the initramfs stays up as the
 # rescue environment, reachable over SSH.
+#
+# The boot layer (U-Boot with abboot, github.com/nuno407/u-boot-amazon-echo, opt-in) changes who
+# decides: where it is installed it keeps an A/B record in the misc partition, picks the slot,
+# counts its tries and starts that slot's own kernel. slotctl still keeps the files above, and tells
+# the boot layer the same through bootctl. Without a record (every unit without the boot layer)
+# bootctl changes nothing and slotctl works on the files alone, exactly as before.
 #
 # Under a running slot the store is mounted read-only (the root is a bind mount
 # of one slot, so the whole partition shares the flag); every write here
@@ -36,13 +46,18 @@ usage: slotctl [-s store] <command>
   install <rootfs.tar.gz> unpack into the inactive slot, put it on trial, make it active
                           (--keep-active: install without switching)
   commit                  mark the booted slot good (no-op if it is)
-  switch <a|b>            boot this slot next; a bad slot goes back on trial
+  switch <a|b>            boot this slot next; a bad slot goes back on trial (with the boot
+                          layer, any slot switched to is on trial until it commits again)
   rollback                mark the booted slot bad and boot the other, good, one next
+  follow                  with the boot layer: name the slot it booted active, after it fell
+                          back from the active one (run at every boot)
   rescue [off]            stay in the initramfs at the next boot (one boot only)
   next                    initramfs: choose the slot to boot and take a try; prints its name
   rw | ro                 remount the store
   mkstore <device> --i-know-this-erases-it
                           format a partition as an empty store (mounts it at the store path)
+  grow <device>           grow the store's filesystem, online, to fill its partition <device>
+                          (athena: the store is written smaller than the partition)
 EOF
 	exit 1
 }
@@ -81,6 +96,146 @@ booted() { cat /run/techo5/slot 2>/dev/null; }
 other() { case "$1" in a) echo b;; b) echo a;; *) echo a;; esac; }
 release() { cat "$STORE/slots/$1/etc/techo5-release" 2>/dev/null || echo "-"; }
 valid_slot() { case "$1" in a|b) return 0;; esac; return 1; }
+# The board the store is for (.techo5-store: board=<name>), empty for any.
+store_board() { sed -n 's/^board=//p' "$STORE/.techo5-store" 2>/dev/null | tail -1; }
+
+# --- The boot layer: its A/B record, through bootctl (beside slotctl, or installed with it).
+# SLOTCTL_MISC names the misc device (tests).
+[ -n "${SLOTCTL_MISC:-}" ] && export BOOTCTL_MISC="$SLOTCTL_MISC"
+BOOTCTL=
+for f in "$(dirname "$0")/bootctl" /usr/local/sbin/bootctl; do
+	[ -f "$f" ] && { BOOTCTL=$f; break; }
+done
+# Whether there is a valid A/B record: the boot layer is installed.
+has_record() { [ -n "$BOOTCTL" ] && sh "$BOOTCTL" -q status >/dev/null 2>&1; }
+# The slot the boot layer booted (ab.slot=), empty if none. Only that slot is ever marked good in
+# the record: a slot booted by slotctl next on the boot layer's rescue kernel is not, since its own
+# kernel may be what failed.
+boot_layer_slot() { [ -n "$BOOTCTL" ] && sh "$BOOTCTL" current 2>/dev/null; }
+# bootctl, quiet without a record; "no record" (3) is not a failure here.
+bootctl_q() {
+	[ -n "$BOOTCTL" ] || return 0
+	sh "$BOOTCTL" -q "$@"
+	r=$?
+	[ $r = 3 ] && return 0
+	[ $r = 0 ] || echo "slotctl: bootctl $* failed ($r); the boot layer's record may not match the files" >&2
+	return 0
+}
+
+# The slot convention (u-boot-amazon-echo SPEC.md): the boot layer starts slot <x>'s kernel from
+# slots/<x>/boot/boot.img and shows slots/<x>/boot/label in its menu. A rootfs carries its kernel
+# at usr/share/techo5/kernel/boot-<board>.img; it is linked into boot/ (the same file, no copy),
+# and the label is the rootfs's build date ("28 Oct 2026", from etc/techo5-release). A rootfs with
+# no kernel of its own (a device whose kernel lives only in the boot partition, an older release)
+# keeps the kernel the unit runs with now: the booted slot's boot/boot.img, else the other slot's,
+# as both slots share one kernel today. Only where the boot layer is installed; run while the
+# store is writable.
+#
+# The boot layer gives the kernel the previous bootloader's command line with the slot image's own
+# header command line in its place, so the image can name its root. A rootfs whose kernel needs
+# that (athena: its bootloader names no root on a recovery boot) carries
+# usr/share/techo5/kernel/boot-header-args, the words to add to the image's header command line,
+# with @STORE_PARTUUID@ for the store partition's GPT GUID: the unit's own, read here, never in a
+# release. boot/boot.img is then a copy with those words, and the rootfs's own image stays as
+# released.
+HDR_ARGS=usr/share/techo5/kernel/boot-header-args
+
+# le_hex <hex bytes, no spaces> <count> <offset>: those bytes as a little-endian hex number
+le_hex() { echo "$1" | cut -c$(( $3 * 2 + 1 ))-$(( ($3 + $2) * 2 )) | sed 's/\(..\)/\1 /g' |
+	awk '{ for (i = NF; i > 0; i--) printf "%s", $i }'; }
+
+# The store partition's GPT unique GUID (lower case), from the GPT of the disk it is on.
+store_partuuid() {
+	if [ -n "${SLOTCTL_STORE_DISK:-}" ]; then	# tests: a disk image and a partition number
+		dev=$SLOTCTL_STORE_DISK n=$SLOTCTL_STORE_PARTN
+	else
+		# busybox prints the numbers but exits 1 when the store is the root (athena): trust the output
+		mm=$(mountpoint -d "$STORE" 2>/dev/null); [ -n "$mm" ] || return 1
+		sys=/sys/dev/block/$mm
+		n=$(cat "$sys/partition" 2>/dev/null) || return 1
+		dev=/dev/$(basename "$(readlink -f "$sys/..")")
+		[ -b "$dev" ] || return 1
+	fi
+	h=$(dd if="$dev" bs=512 skip=1 count=1 2>/dev/null | od -An -tx1 -v | tr -d ' \n')
+	[ "$(echo "$h" | cut -c1-16)" = 4546492050415254 ] || return 1	# "EFI PART"
+	lba=$((0x$(le_hex "$h" 8 72)))
+	esz=$((0x$(le_hex "$h" 4 84)))
+	off=$(( lba * 512 + (n - 1) * esz ))
+	e=$(dd if="$dev" bs=512 skip=$(( off / 512 )) count=1 2>/dev/null | od -An -tx1 -v | tr -d ' \n' |
+		cut -c$(( (off % 512 + 16) * 2 + 1 ))-$(( (off % 512 + 32) * 2 )))
+	[ ${#e} = 32 ] || return 1
+	b() { echo "$e" | cut -c$(( $1 * 2 + 1 ))-$(( $1 * 2 + 2 )); }
+	echo "$(b 3)$(b 2)$(b 1)$(b 0)-$(b 5)$(b 4)-$(b 7)$(b 6)-$(b 8)$(b 9)-$(b 10)$(b 11)$(b 12)$(b 13)$(b 14)$(b 15)"
+}
+
+# The byte offset of a boot image's Android header: 0x400 behind a 1 KB stub, else 0.
+hdr_off() { [ "$(dd if="$1" bs=1 skip=1024 count=8 2>/dev/null)" = "ANDROID!" ] && echo 1024 || echo 0; }
+hdr_cmdline() { dd if="$1" bs=1 skip=$(( $(hdr_off "$1") + 64 )) count=512 2>/dev/null | tr -d '\000'; }
+
+# boot_image_with_args <image> <copy> <words>: the copy, with the words added to its header command
+# line. Fails, and writes nothing, if the line would not fit its 512 bytes.
+boot_image_with_args() {
+	cl=$(hdr_cmdline "$1")
+	new="${cl:+$cl }$3"
+	[ ${#new} -lt 512 ] || { echo "slotctl: the header command line would be too long" >&2; return 1; }
+	cp "$1" "$2.tmp" &&
+		printf '%s' "$new" | dd of="$2.tmp" bs=1 seek=$(( $(hdr_off "$1") + 64 )) conv=notrunc 2>/dev/null &&
+		mv -f "$2.tmp" "$2" || { rm -f "$2.tmp"; return 1; }
+}
+
+# Whether the slot's boot/boot.img lacks the header words its rootfs asks for.
+boot_img_stale() {
+	[ -f "$1/$HDR_ARGS" ] && [ -f "$1/boot/boot.img" ] || return 1
+	case " $(hdr_cmdline "$1/boot/boot.img") " in *" root="*) return 1;; esac
+	return 0
+}
+
+# slot_boot_files <slot>: boot/boot.img and boot/label, where missing (or the image stale).
+slot_boot_files() {
+	x=$1
+	r=$STORE/slots/$x
+	if [ ! -e "$r/boot/boot.img" ] || boot_img_stale "$r"; then
+		set -- "$r"/usr/share/techo5/kernel/boot-*.img
+		if [ $# -eq 1 ] && [ -f "$1" ]; then
+			mkdir -p "$r/boot"
+			args=
+			if [ -f "$r/$HDR_ARGS" ]; then
+				if u=$(store_partuuid); then
+					args=$(sed "s/@STORE_PARTUUID@/$u/g" "$r/$HDR_ARGS" | tr '\n' ' ' | sed 's/ *$//')
+				else
+					echo "slotctl: the store's partition GUID could not be read: boot/boot.img without its root" >&2
+				fi
+			fi
+			if [ -n "$args" ] && boot_image_with_args "$1" "$r/boot/boot.img" "$args"; then
+				echo "slotctl: boot/boot.img: the slot's kernel, its header with \"$args\""
+			else
+				rm -f "$r/boot/boot.img"
+				ln -f "$1" "$r/boot/boot.img" 2>/dev/null || cp "$1" "$r/boot/boot.img" ||
+					echo "slotctl: the slot's kernel could not be put at boot/boot.img" >&2
+			fi
+		else
+			for o in $(booted) $(other $x); do
+				[ "$o" != "$x" ] && [ -f "$STORE/slots/$o/boot/boot.img" ] || continue
+				mkdir -p "$r/boot"
+				ln -f "$STORE/slots/$o/boot/boot.img" "$r/boot/boot.img" 2>/dev/null ||
+					cp "$STORE/slots/$o/boot/boot.img" "$r/boot/boot.img" || continue
+				echo "slotctl: slot $x: no kernel in this rootfs; boot/boot.img: slot $o's, the kernel the unit runs with now"
+				break
+			done
+			[ -f "$r/boot/boot.img" ] ||
+				echo "slotctl: slot $x: no kernel in this rootfs or in the other slot; the boot layer cannot start this slot" >&2
+		fi
+	fi
+	[ -d "$r/boot" ] || return 0
+	if [ ! -s "$r/boot/label" ]; then
+		d=$(sed -n 's/.* built \([0-9][0-9][0-9][0-9]\)-\([0-9][0-9]\)-\([0-9][0-9]\).*/\3 \2 \1/p' "$r/etc/techo5-release" 2>/dev/null | head -1)
+		set -- $d
+		if [ $# -eq 3 ]; then
+			m=$(echo "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec" | cut -d' ' -f$(( ${2#0} )) 2>/dev/null)
+			[ -n "$m" ] && put "$r/boot/label" "${1#0} $m $3"
+		fi
+	fi
+}
 
 cmd_status() {
 	[ -e "$STORE/.techo5-store" ] || die "$STORE is not a store"
@@ -95,6 +250,10 @@ cmd_status() {
 			echo "slot $s: empty"
 		fi
 	done
+	if [ -n "$BOOTCTL" ] && out=$(sh "$BOOTCTL" -q status 2>&1); then
+		echo "boot layer (bootctl status; it decides which slot boots):"
+		echo "$out" | sed 's/^/  /'
+	fi
 }
 
 cmd_next() {
@@ -149,7 +308,17 @@ cmd_install() {
 	a=$(active)
 	if [ -z "$a" ]; then t=a; else t=$(other $a); fi
 	[ "$t" != "$(booted)" ] || die "slot $t is the running root; refusing to overwrite it"
+	# Checked in the tarball, before the other slot (the one to fall back on) is emptied.
+	want=$(store_board)
+	if [ -n "$want" ]; then
+		got=$({ tar $z -xOf "$tar" ./etc/techo5/device.conf || tar $z -xOf "$tar" etc/techo5/device.conf; } 2>/dev/null |
+			sed -n 's/^T5_BOARD=//p' | tail -1)
+		[ "$got" = "$want" ] ||
+			die "this store is for board $want and $tar is for ${got:-another board (it names none)}; nothing installed"
+	fi
 	writable
+	# With the boot layer, the slot is marked bad before its files change, so it is never booted half written.
+	bootctl_q mark-bad $t
 	rm -rf "$STORE/slots/$t" "$STORE/slots/$t.state"
 	mkdir -p "$STORE/slots/$t"
 	echo "slotctl: unpacking $tar into slot $t"
@@ -157,31 +326,47 @@ cmd_install() {
 	for f in sbin/init usr/local/bin/techo5 etc/techo5/boot.sh etc/inittab; do
 		[ -e "$STORE/slots/$t/$f" ] || { rm -rf "$STORE/slots/$t"; done_writing; die "not a techo5 rootfs: $f missing"; }
 	done
+	# athena's /init pivots into the slot and puts the store at the slot's /store.
+	if [ -n "$want" ] && [ ! -d "$STORE/slots/$t/store" ]; then
+		rm -rf "$STORE/slots/$t"; done_writing; die "not a techo5 rootfs: store missing"
+	fi
 	# Images carry no vendor tree: the slot gets the unit's own, so every boot image's rescue
-	# environment finds the drivers in the slot too.
-	if [ -d "$STORE/vendor/lib" ] && [ -z "$(ls -A "$STORE/slots/$t/vendor" 2>/dev/null)" ]; then
+	# environment finds the drivers in the slot too. Not on a unit whose drivers stay on a vendor
+	# partition of their own (VENDOR_DEV, athena): there the store's vendor/ is only that partition's
+	# mount point, and copying it would put the whole partition into the slot.
+	if [ -d "$STORE/vendor/lib" ] && [ -z "$(ls -A "$STORE/slots/$t/vendor" 2>/dev/null)" ] &&
+		! grep -q '^VENDOR_DEV=' "$STORE/slots/$t/etc/techo5/device.conf" 2>/dev/null; then
 		mkdir -p "$STORE/slots/$t/vendor"
 		cp -a "$STORE/vendor/." "$STORE/slots/$t/vendor/" || { rm -rf "$STORE/slots/$t"; done_writing; die "copying the vendor tree into slot $t failed"; }
 		echo "slotctl: slot $t: vendor tree from the store"
 	fi
+	has_record && slot_boot_files $t
 	set_state $t "trial $TRIES"
 	[ -n "$keep" ] || set_active $t
 	done_writing
 	echo "slotctl: slot $t: $(release $t) — trial $TRIES; active: $(active)"
+	if [ -n "$keep" ]; then bootctl_q set $t priority=14 tries=$TRIES successful=0
+	else bootctl_q set-active $t; fi
 }
 
 cmd_commit() {
 	s=$(booted)
 	[ -n "$s" ] || die "not booted from a slot"
 	case "$(state $s)" in
-	good) echo "slotctl: slot $s is already good"; return 0;;
+	good) echo "slotctl: slot $s is already good"
+		[ "$(boot_layer_slot)" = "$s" ] && bootctl_q mark-good $s
+		return 0;;
 	trial*) ;;
 	*) die "slot $s is $(state $s); use switch to put it back on trial";;
 	esac
 	writable
 	set_state $s good
+	# A slot installed before the boot layer was may lack its boot files.
+	has_record && slot_boot_files $s
 	done_writing
 	echo "slotctl: slot $s committed (good)"
+	[ "$(boot_layer_slot)" = "$s" ] && bootctl_q mark-good $s
+	return 0
 }
 
 cmd_switch() {
@@ -196,6 +381,7 @@ cmd_switch() {
 	set_active $s
 	done_writing
 	echo "slotctl: next boot: slot $s ($(state $s))"
+	bootctl_q set-active $s
 }
 
 cmd_rollback() {
@@ -208,6 +394,28 @@ cmd_rollback() {
 	set_active $o
 	done_writing
 	echo "slotctl: slot $s marked bad; next boot: slot $o"
+	bootctl_q mark-bad $s
+}
+
+# With the boot layer, the slot it booted is the one the store names active. When it fell back
+# from the active slot (that slot used up its tries and the record marks it bad), the store is
+# told: otherwise it still names the slot that failed, and the next install, into "the other
+# slot", is refused as the running root. Run at every boot (etc/techo5/boot.sh); without the
+# boot layer, or when the store already agrees, nothing changes.
+cmd_follow() {
+	s=$(booted)
+	[ -n "$s" ] && [ "$(boot_layer_slot)" = "$s" ] || return 0
+	o=$(other $s)
+	[ "$(active)" = "$o" ] || return 0
+	writable
+	why=
+	if sh "$BOOTCTL" -q status 2>/dev/null | grep -q "^slot $o: .*(bad)" && [ "$(state $o)" != bad ]; then
+		set_state $o bad
+		why=" and marks slot $o bad, as the boot layer has it"
+	fi
+	set_active $s
+	done_writing
+	echo "slotctl: the boot layer booted slot $s, not slot $o: the store names slot $s active$why"
 }
 
 cmd_rescue() {
@@ -234,6 +442,77 @@ cmd_mkstore() {
 	echo "slotctl: $dev is an empty store, mounted at $STORE"
 }
 
+# grow: the store's filesystem out to the end of its partition, while it is mounted (online: the
+# kernel adds the block groups; resize2fs only asks it to). On athena the store is the root the
+# kernel booted, written smaller than the partition so that it installs quickly; the second slot
+# needs the rest. Run by athena's /init on every boot before anything else writes to the store, so
+# it happens once, at the first boot, and is a no-op after; or by hand from the rescue shell.
+#
+# Careful, because the store holds the only working system:
+#  - a filesystem whose last write was not finished cleanly (state other than "clean") is left
+#    alone: growing one that may be inconsistent could make it worse. e2fsck from TWRP first.
+#  - the group descriptors the bigger filesystem needs must fit in the blocks mke2fs reserved
+#    for them (resize_inode), so the kernel never has to change the layout (to meta_bg): the store
+#    stays the kind of filesystem Amazon's kernel already mounts. A partition too big for that is
+#    refused.
+#  - only where the store is the root (STORE=/): under a running slot the root is a read-only
+#    bind of the slot, and the kernel would refuse the grow anyway.
+#  - no feature is added; the features are compared before and after and a change is reported.
+# What is not covered: a power cut in the middle of the grow, on a filesystem with no journal. It
+# takes a second or two; the way back is the installer, or e2fsck from TWRP.
+fs_field() { printf '%s\n' "$1" | sed -n "s/^$2:[[:space:]]*//p" | head -1; }
+
+cmd_grow() {
+	dev=$1
+	[ -b "$dev" ] || die "$dev is not a block device"
+	[ -e "$STORE/.techo5-store" ] || die "$STORE is not a store"
+	[ "$STORE" = / ] || die "grow runs where the store is the root: athena's /init at every boot, or the rescue shell (STORE=/ slotctl grow $dev)"
+	sectors=$(cat "/sys/class/block/${dev##*/}/size" 2>/dev/null)
+	[ -n "$sectors" ] && [ "$sectors" -gt 0 ] || die "cannot read the size of $dev"
+	info=$(dumpe2fs -h "$dev" 2>/dev/null) || die "cannot read the superblock on $dev"
+	count=$(fs_field "$info" 'Block count')
+	bsize=$(fs_field "$info" 'Block size')
+	per=$(fs_field "$info" 'Blocks per group')
+	first=$(fs_field "$info" 'First block')
+	rgdt=$(fs_field "$info" 'Reserved GDT blocks')
+	dsize=$(fs_field "$info" 'Group descriptor size')
+	fstate=$(fs_field "$info" 'Filesystem state')
+	features=$(fs_field "$info" 'Filesystem features')
+	[ -n "$count" ] && [ -n "$bsize" ] && [ -n "$per" ] || die "$dev holds no ext4 filesystem slotctl can read"
+	# The store this is run on has to be the filesystem on $dev, or this would grow another one.
+	[ "$(mountpoint -d "$STORE" 2>/dev/null)" = "$(cat "/sys/class/block/${dev##*/}/dev" 2>/dev/null)" ] ||
+		die "$dev is not the filesystem mounted at $STORE"
+	label=$(fs_field "$info" 'Filesystem volume name')
+	want=$((sectors / (bsize / 512)))
+	echo "slotctl: $dev: filesystem $((count * bsize / 1048576)) MiB, partition $((sectors / 2048)) MiB"
+	if [ $((want - count)) -lt $((4194304 / bsize)) ]; then
+		echo "slotctl: the store already fills $dev"
+		return 0
+	fi
+	[ "$fstate" = clean ] || die "the filesystem on $dev is '$fstate'; check it with e2fsck from TWRP before growing it"
+	case " $features " in *" resize_inode "*) ;; *) die "the filesystem on $dev has no room reserved to grow (no resize_inode); not growing it";; esac
+	# Descriptors per block: 32 bytes each without 64bit.
+	per_block=$((bsize / ${dsize:-32}))
+	groups_now=$(( (count - ${first:-0} + per - 1) / per ))
+	groups_then=$(( (want - ${first:-0} + per - 1) / per ))
+	gdt_now=$(( (groups_now + per_block - 1) / per_block ))
+	gdt_then=$(( (groups_then + per_block - 1) / per_block ))
+	[ "$gdt_then" -le $((gdt_now + ${rgdt:-0})) ] ||
+		die "growing to $((sectors / 2048)) MiB needs $gdt_then descriptor blocks and only $((gdt_now + ${rgdt:-0})) are reserved; not growing"
+	writable
+	echo "slotctl: growing $dev ($label) to fill its partition, $groups_now -> $groups_then block groups"
+	if ! resize2fs "$dev" > /tmp/slotctl-grow.log 2>&1; then
+		done_writing
+		cat /tmp/slotctl-grow.log >&2
+		die "resize2fs failed; the store is as it was (or check it with e2fsck from TWRP)"
+	fi
+	done_writing
+	info=$(dumpe2fs -h "$dev" 2>/dev/null)
+	after=$(fs_field "$info" 'Filesystem features')
+	[ "$after" = "$features" ] || echo "slotctl: NOTE: the features changed from '$features' to '$after'" >&2
+	echo "slotctl: the store is now $(( $(fs_field "$info" 'Block count') * bsize / 1048576 )) MiB, $(fs_field "$info" 'Inode count') inodes"
+}
+
 while [ $# -gt 0 ]; do
 	case "$1" in
 	-s) STORE=$2; shift 2;;
@@ -250,9 +529,11 @@ install) cmd_install "$@";;
 commit) cmd_commit;;
 switch) cmd_switch "$@";;
 rollback) cmd_rollback;;
+follow) cmd_follow;;
 rescue) cmd_rescue "$@";;
 rw) writable; WAS_RO=; echo "slotctl: $STORE writable";;
 ro) sync; mount -o remount,ro "$STORE" && echo "slotctl: $STORE read-only";;
 mkstore) cmd_mkstore "$@";;
+grow) [ $# -eq 1 ] || usage; cmd_grow "$1";;
 *) usage;;
 esac

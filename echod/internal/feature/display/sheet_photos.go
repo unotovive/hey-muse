@@ -4,8 +4,11 @@ package display
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
@@ -37,18 +40,30 @@ func slideshowRows(demo bool) []settingRow {
 	if demo && source != "" {
 		folder = "Photos" // folder names are often people and places
 	}
-	art := settingRow{id: "weatherart", label: "Weather art", sub: "A landscape for the weather, in place of photos", kind: ctlToggle, on: home.Get().SlideshowArt()}
+	art := settingRow{id: "weatherart", label: tr("ui_weather_art"), sub: tr("ui_a_landscape_for_the_weather_in_place_of_photos"), kind: ctlToggle, on: home.Get().SlideshowArt()}
 	if art.on {
 		return []settingRow{art} // the photos' own settings wait until it is off again
 	}
-	return []settingRow{
+	rows := []settingRow{
 		art,
-		{id: "photofolder", label: "Photo folder", kind: ctlChoice, value: folder},
-		{id: "photoevery", label: "Time per photo", kind: ctlChoice, value: everyOptions[everyIndex()]},
-		{id: "shuffle", label: "Shuffle photos", kind: ctlToggle, on: shuffle},
-		{id: "subfolders", label: "Include subfolders", sub: "Every folder inside the one chosen", kind: ctlToggle, on: subfolders},
-		{id: "wholephoto", label: "Show whole photo", sub: "All of it, with blurred sides; off fills the screen", kind: ctlToggle, on: home.Get().SlideshowWholePhoto()},
+		{id: "photofolder", label: tr("ui_photo_folder"), kind: ctlChoice, value: folder},
+		{id: "photoevery", label: tr("time_per_photo"), kind: ctlChoice, value: everyOptions[everyIndex()]},
+		{id: "shuffle", label: tr("ui_shuffle_photos"), kind: ctlToggle, on: shuffle},
+		{id: "subfolders", label: tr("ui_include_subfolders"), sub: tr("ui_every_folder_inside_the_one_chosen"), kind: ctlToggle, on: subfolders},
+		{id: "wholephoto", label: tr("ui_show_whole_photo"), sub: tr("ui_all_of_it_with_blurred_sides_off_fills_the_screen"), kind: ctlToggle, on: home.Get().SlideshowWholePhoto()},
 	}
+	if home.PairsHere() {
+		rows = append(rows, settingRow{id: "photopairs", label: tr("ui_photo_pairs"), sub: tr("ui_two_tall_photos_side_by_side"), kind: ctlToggle, on: home.Get().SlideshowPairs()})
+	}
+	if home.IsImmich(source) {
+		// Immich's own: the day and place it knows, and its favorites. A person and the days to show are
+		// set on the setup page or in Home Assistant, which have a keyboard.
+		rows = append(rows,
+			settingRow{id: "photocaption", label: tr("ui_date_and_place"), sub: tr("ui_on_the_screensaver_under_each_photo"), kind: ctlToggle, on: home.Get().SlideshowCaption()},
+			settingRow{id: "immichfav", label: tr("ui_favorites_only"), sub: tr("ui_the_photos_marked_as_favorites_in_immich"), kind: ctlToggle, on: home.Get().ImmichFavorites()},
+		)
+	}
+	return rows
 }
 
 // The Time per photo row's choices. everyIndex is the one in force, the nearest below a value set
@@ -72,10 +87,13 @@ func everyIndex() int {
 // folderLabel is a media source id as the Photo folder row names it: its last folder.
 func folderLabel(id string) string {
 	if id == "" {
-		return "None chosen"
+		return tr("ui_none_chosen")
 	}
 	if id == home.LocalPhotos {
-		return "On this device"
+		return tr("ui_on_this_device")
+	}
+	if home.IsImmich(id) {
+		return home.ImmichSourceName(id)
 	}
 	rest := strings.TrimRight(strings.TrimPrefix(id, "media-source://"), "/")
 	name := rest[strings.LastIndex(rest, "/")+1:]
@@ -83,7 +101,7 @@ func folderLabel(id string) string {
 		name = u
 	}
 	if name == "" || name == "media_source" {
-		return "All photos"
+		return tr("ui_all_photos")
 	}
 	return name
 }
@@ -97,22 +115,23 @@ func folderPicker(f folderView, demo bool) pickerView {
 	}
 	switch {
 	case f.loading:
-		return pickerView{title: title, opts: []string{"Opening…"}, cur: -1}
+		return pickerView{title: title, opts: []string{tr("ui_photo_picker_opening")}, cur: -1}
 	case f.problem != "":
-		return pickerView{title: title, opts: []string{"Couldn't open this folder", "‹ Back"}, cur: -1}
+		return pickerView{title: title, opts: []string{tr("ui_photo_picker_open_failed"), f.problem, "‹ " + tr("back")}, cur: -1}
 	}
-	use := "Use this folder"
+	use := tr("ui_photo_picker_use_folder")
 	switch {
 	case f.photos > 0 && len(f.folders) > 0:
-		use += fmt.Sprintf(" · %d photos + %d folders", f.photos, len(f.folders))
+		use += " · " + photosText(f.photos) +
+			" + " + foldersText(len(f.folders))
 	case f.photos > 0:
-		use += fmt.Sprintf(" · %d photos", f.photos)
+		use += " · " + photosText(f.photos)
 	case len(f.folders) > 0:
-		use += fmt.Sprintf(" · %d folders", len(f.folders))
+		use += " · " + foldersText(len(f.folders))
 	}
 	p := pickerView{title: title, opts: []string{use}, cur: 0}
 	if len(f.stack) > 0 {
-		p.opts = append(p.opts, "‹ Back")
+		p.opts = append(p.opts, "‹ "+tr("back"))
 	}
 	for i, c := range f.folders {
 		name := c.Title
@@ -122,6 +141,21 @@ func folderPicker(f folderView, demo bool) pickerView {
 		p.opts = append(p.opts, name+"  ›")
 	}
 	return p
+}
+
+// photosText and foldersText are "1 photo" or "3 photos", "1 folder" or "3 folders", in the screen's language.
+func photosText(n int) string {
+	if n == 1 {
+		return fmt.Sprintf(tr("ui_photo_picker_photo_one"), n)
+	}
+	return fmt.Sprintf(tr("ui_photo_picker_photos"), n)
+}
+
+func foldersText(n int) string {
+	if n == 1 {
+		return fmt.Sprintf(tr("ui_photo_picker_folder_one"), n)
+	}
+	return fmt.Sprintf(tr("ui_photo_picker_folders"), n)
 }
 
 // openFolder shows a folder in the list, asking Home Assistant for what is in it.
@@ -141,9 +175,12 @@ func (d *Display) openFolder(id string, stack []string) {
 			return // moved on meanwhile
 		}
 		d.folder.loading = false
-		if err != nil {
-			d.folder.problem = err.Error()
-		} else {
+		switch {
+		case err != nil && home.IsImmich(id):
+			d.folder.problem = err.Error() // Immich's own, not Home Assistant's
+		case err != nil:
+			d.folder.problem = folderProblem(err)
+		default:
 			if m.Title != "" && id != photosRoot {
 				d.folder.title = m.Title
 			}
@@ -161,6 +198,30 @@ func (d *Display) openFolder(id string, stack []string) {
 	}()
 }
 
+// folderProblem is the line under Couldn't open this folder: why, in words, for the reasons a folder
+// list most often fails - no Home Assistant access given yet, an address the device can't look up or
+// reach, a token Home Assistant turned down - and Home Assistant's own words for any other.
+func folderProblem(err error) string {
+	s := err.Error()
+	var dns *net.DNSError
+	var nerr net.Error
+	switch {
+	case strings.Contains(s, "no access configured"):
+		return tr("ui_home_assistant_isn_t_set_up_here")
+	case errors.As(err, &dns):
+		return tr("ui_address_not_found_use_its_ip")
+	case strings.Contains(s, "auth_invalid") || refusedStatus.MatchString(s):
+		return tr("ui_home_assistant_refused_the_token")
+	case errors.As(err, &nerr):
+		return tr("ui_can_t_reach_home_assistant")
+	}
+	return s
+}
+
+// refusedStatus is an HTTP status of 401 or 403 in an error, as "GET /api/...: 401 Unauthorized" has
+// it: a number standing alone, so a port like :8403 in an address is not taken for one.
+var refusedStatus = regexp.MustCompile(`(^|\s)40[13](\s|$)`)
+
 // folderChoice is a tap on the folder list's i'th line.
 func (d *Display) folderChoice(i int) {
 	d.mu.Lock()
@@ -175,7 +236,7 @@ func (d *Display) folderChoice(i int) {
 	case f.loading:
 		d.reopen("folder")
 	case f.problem != "":
-		if i == 1 {
+		if i == 2 {
 			up()
 			return
 		}

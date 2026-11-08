@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -68,12 +69,20 @@ type Player struct {
 	duck       *esphome.Number
 
 	// asp is the driver's tuning: on applies it, off sends the signal as it came.
-	asp          *esphome.Switch
+	asp *esphome.Switch
+	// stereo plays athena's two internal speakers in stereo; there only on a board that can.
+	stereo       *esphome.Switch
 	bass, treble *esphome.Number
+	gain         *esphome.Number
+	gainApply    func(int) error
+	gainMu       sync.Mutex
 	quiet        *esphome.Select
 
 	// night is the night volume, the most quiet hours play at (night.go).
 	night *esphome.Number
+
+	// voiceVol and callVol are the assistant's voice and a call's audio, as steps from the volume (lanes.go).
+	voiceVol, callVol *esphome.Number
 
 	// nearMiss ducks a playing track for a few seconds after a wake word that nearly fired, so the
 	// next try is heard; see feature/detect/nearmiss.go.
@@ -82,6 +91,13 @@ type Player struct {
 	// haSounds is the Home Assistant satellites' recorded sounds for muting and a finished timer, or
 	// TECHO5's own notes (hardware/speaker/clips.go).
 	haSounds *esphome.Switch
+	// louder is the Louder speech switch (Louder, #304).
+	louder *esphome.Switch
+	// clearer is the Clearer speech switch (speaker.Player.SetClearerSpeech, techo5-dot#25).
+	clearer *esphome.Switch
+	// top is the Louder top volume switch (speaker.Player.SetLouderTop, #304), nil where no tuning
+	// this build plays has a lift for it.
+	top *esphome.Switch
 
 	// sleep stops what is playing after a while, the way a clock radio does.
 	sleep *sleeper
@@ -131,6 +147,9 @@ type Player struct {
 	// Spotify Connect), for the screen, with the name of the track it belongs to.
 	recvTrack atomic.Value // receivedTrack
 
+	// nextTitle is what the next play_media is to be named, and when (title.go); nil for nothing.
+	nextTitle atomic.Pointer[pendingTitle]
+
 	// lastExt is the last track a remote named, kept when it stops naming one: Music Assistant clears
 	// the track just before it says it stopped, so what was playing has to come from here. Only just
 	// before: a name kept longer is whatever played hours ago, and a stream that never named its track
@@ -140,6 +159,11 @@ type Player struct {
 	// stoppedAt counts stops, so the timer that ends a stopped track knows whether a later stop or a
 	// play has come since.
 	stoppedAt atomic.Uint64
+
+	// toSender carries what is passed on to a received track's sender, one at a time and in order: a
+	// pause and the play straight after it must reach the phone that way round (tellSender). Only the
+	// latest play or pause, and the latest skip, wait behind the one under way (senderQueue).
+	toSender senderQueue
 
 	// step is the level, written by the buttons, Home Assistant, the setup page, Music Assistant,
 	// Spotify and the night volume alike.
@@ -152,6 +176,16 @@ type Player struct {
 	// OnVolume fires with the new step whenever the level is changed on purpose — a button, a swipe,
 	// Home Assistant — so a screen can show it. A restore is silent, as it is on the ring.
 	OnVolume hook.Hook[int]
+
+	// OnLevel fires with the new step whenever the level is applied, for any reason: a restore and
+	// night volume too, which OnVolume leaves out. It is for what keeps its own copy of the level, such
+	// as the Spotify app's slider.
+	OnLevel hook.Hook[int]
+
+	// OnMute fires with the new state whenever the speaker is muted or unmuted, by anyone: Home
+	// Assistant, a button that brings a muted speaker back, or a Music Assistant command. It is for
+	// what keeps its own copy, as OnLevel is.
+	OnMute hook.Hook[bool]
 
 	// OnPlay fires with the URL whenever a track (not an announcement) is started, so a screen can
 	// find out what it is.
@@ -169,6 +203,10 @@ type Player struct {
 	// it is a hook, like OnResumeRemote.
 	OnTakeOver hook.Hook[struct{}]
 
+	// OnStop fires when the track is stopped here (Stop: the screen, Home Assistant, the sleep timer), so
+	// what would otherwise pick something up again once the speaker is free knows somebody stopped it.
+	OnStop hook.Hook[struct{}]
+
 	// OnTransport fires when a track's own controls are asked for — the screen's buttons, or Home
 	// Assistant — so that whoever is playing the track hears. It is not an instruction to this player:
 	// see Transport.
@@ -178,6 +216,17 @@ type Player struct {
 	// stopped or replaced does not fire: the difference is the whole use of it, since a radio stream
 	// that ends by itself has been dropped and one that was stopped was stopped by somebody.
 	OnEnd hook.Hook[string]
+
+	// OnNowPlaying fires whenever what the room is playing, or the name of it, may have changed: a track
+	// starting, pausing or ending, a receiver's or a remote's song, a held track let go. It says only
+	// that something may have, not what, and fires for much that changes nothing - an announcement too
+	// - so a listener works out for itself whether anything did, on the far side of a channel.
+	OnNowPlaying hook.Hook[struct{}]
+
+	// OnReceiverPlays fires with a received track's name when its sender, having paused on its own,
+	// is heard playing again without saying so (senderPlaysAgain). Listeners must not block: it runs
+	// on the goroutine reading the sender's audio.
+	OnReceiverPlays hook.Hook[string]
 }
 
 var (
@@ -259,6 +308,14 @@ func build() *Player {
 				Category: esphome.CategoryConfig,
 			},
 		},
+		stereo: &esphome.Switch{
+			Base: esphome.Base{
+				ObjectID: "speaker_stereo",
+				Name:     "Stereo speakers",
+				Icon:     "mdi:speaker-multiple",
+				Category: esphome.CategoryConfig,
+			},
+		},
 		bass: &esphome.Number{
 			Base: esphome.Base{
 				ObjectID: "bass",
@@ -287,6 +344,22 @@ func build() *Player {
 				Category: esphome.CategoryConfig,
 			},
 		},
+		louder: &esphome.Switch{
+			Base: esphome.Base{
+				ObjectID: "louder_speech",
+				Name:     "Louder speech",
+				Icon:     "mdi:account-voice",
+				Category: esphome.CategoryConfig,
+			},
+		},
+		clearer: &esphome.Switch{
+			Base: esphome.Base{
+				ObjectID: "clearer_speech",
+				Name:     "Clearer speech",
+				Icon:     "mdi:account-voice",
+				Category: esphome.CategoryConfig,
+			},
+		},
 		nearMiss: &esphome.Switch{
 			Base: esphome.Base{
 				ObjectID: "duck_on_near_miss",
@@ -298,11 +371,34 @@ func build() *Player {
 	}
 	p.quiet = newQuiet()
 	p.night = newNight()
+	p.voiceVol = newLaneOffset("voice_volume", "Voice volume", "mdi:account-voice")
+	p.callVol = newLaneOffset("call_volume", "Call volume", "mdi:phone-in-talk")
 	p.layers = noiseLayers()
+	// Built wherever the amplifier may be (GainPossible), not only where the mixer has already said
+	// so: the card may not be up yet as this builds, and the saved gain is restored then all the same,
+	// for the speaker to write once it is sure. Whether it is there is asked again where it is shown.
+	if speaker.GainPossible() {
+		p.gain = &esphome.Number{
+			Base: esphome.Base{ObjectID: "speaker_gain", Name: "Speaker gain",
+				Icon: "mdi:volume-plus", Category: esphome.CategoryConfig,
+				DeviceID: component.DevicePlayback},
+			Min: 0, Max: config.SpeakerGainMax, Step: 1, Unit: "dB", Mode: esphome.NumberBox,
+		}
+		p.gainApply = speaker.Get().SetSpeakerGain
+		p.gain.OnCommand = p.commandSpeakerGain
+	}
+	if speaker.LouderTopPossible() {
+		p.top = &esphome.Switch{
+			Base: esphome.Base{ObjectID: "louder_top_volume", Name: "Louder top volume",
+				Icon: "mdi:volume-high", Category: esphome.CategoryConfig,
+				DeviceID: component.DevicePlayback},
+		}
+		p.top.OnCommand = p.SetLouderTop
+	}
 
 	// The player itself stays on the device: it is what people reach for. These are how it behaves.
 	bases := []*esphome.Base{&p.resampling.Base, &p.onTurn.Base, &p.duck.Base, &p.jack.Base, &p.asp.Base,
-		&p.bass.Base, &p.treble.Base, &p.quiet.Base, &p.night.Base, &p.nearMiss.Base, &p.haSounds.Base}
+		&p.bass.Base, &p.treble.Base, &p.quiet.Base, &p.night.Base, &p.voiceVol.Base, &p.callVol.Base, &p.nearMiss.Base, &p.haSounds.Base, &p.louder.Base, &p.clearer.Base}
 	if speaker.HasJack {
 		bases = append(bases, &p.output.Base)
 	}
@@ -341,7 +437,15 @@ func build() *Player {
 		// Switching waits out the codec (over a second), and Home Assistant's commands are carried
 		// out one at a time: done here, it would hold up every other one. What is applied is what is
 		// saved by then, so quick changes in a row end on the last.
-		safe.Go("audio output", func() { p.applyOutputMode(config.Get().Speaker.OutputMode) })
+		safe.Go("audio output", func() {
+			// Already on the speaker, the choice changes nothing, so it writes the path again (#142);
+			// coming from the jack, the switch has just written it.
+			again := mode == config.OutputModeSpeaker && speaker.HasJack && speaker.Get().Output() == speaker.OutputSpeaker
+			p.applyOutputMode(config.Get().Speaker.OutputMode)
+			if again {
+				speaker.Get().Reopen()
+			}
+		})
 	}
 	p.output.Set(outputAutomatic)
 	component.Bind(p.resampling, speaker.Resamplings(), speaker.Get().SetResampling,
@@ -359,6 +463,8 @@ func build() *Player {
 		}
 		slog.Info("setting changed", "setting", p.asp.ObjectID, "using", settled, "asked", want)
 	}
+
+	p.stereo.OnCommand = p.SetStereo
 
 	// Nothing to apply: the stream reads the setting when a turn begins, so changing it takes effect on
 	// the next one rather than in the middle of this one.
@@ -380,7 +486,11 @@ func build() *Player {
 	}
 
 	p.haSounds.OnCommand = p.SetHASounds
+	p.louder.OnCommand = p.SetLouderSpeech
+	p.clearer.OnCommand = p.SetClearerSpeech
 	p.night.OnCommand = func(v float32) { p.SetNightVolume(int(v)) }
+	p.voiceVol.OnCommand = func(v float32) { p.SetVoiceOffset(int(v)) }
+	p.callVol.OnCommand = func(v float32) { p.SetCallOffset(int(v)) }
 
 	p.nearMiss.OnCommand = func(v bool) {
 		p.nearMiss.Set(v)
@@ -413,6 +523,7 @@ func build() *Player {
 		p.applyTone()
 	}
 	p.stream = NewStream(speaker.Sound(), speaker.Get(), p.refresh, p.OnEnd.Emit)
+	p.stream.senderPlays = p.senderPlaysAgain
 	p.stream.handOff = handOff
 
 	// Volume acts on every tap and on every repeat, so a held button ramps.
@@ -465,11 +576,63 @@ func (p *Player) SetHASounds(on bool) {
 	slog.Info("setting changed", "setting", p.haSounds.ObjectID, "using", on)
 }
 
+// SetClearerSpeech turns Clearer speech on or off, from Home Assistant.
+func (p *Player) SetClearerSpeech(on bool) {
+	if err := config.Set().Speaker().ClearerSpeech(on); err != nil {
+		slog.Error("saving a setting failed", "setting", p.clearer.ObjectID, "err", err)
+		return
+	}
+	speaker.Get().SetClearerSpeech(on)
+	p.clearer.Set(on)
+	slog.Info("setting changed", "setting", p.clearer.ObjectID, "using", on)
+}
+
+// SetLouderTop turns Louder top volume on or off, from Home Assistant or the setup page.
+func (p *Player) SetLouderTop(on bool) {
+	if p.top == nil {
+		return
+	}
+	if err := config.Set().Speaker().LouderTop(on); err != nil {
+		slog.Error("saving a setting failed", "setting", p.top.ObjectID, "err", err)
+		return
+	}
+	speaker.Get().SetLouderTop(on)
+	p.top.Set(on)
+	slog.Info("setting changed", "setting", p.top.ObjectID, "using", on)
+}
+
+// LouderTopAvailable is whether the Louder top volume switch is put up on this build.
+func (p *Player) LouderTopAvailable() bool { return p.top != nil }
+
+// LouderTop is whether Louder top volume is on.
+func (p *Player) LouderTop() bool { return p.top != nil && p.top.Get() }
+
+// SetLouderSpeech turns Louder speech on or off, from Home Assistant, the setup page or the screen.
+func (p *Player) SetLouderSpeech(on bool) {
+	if err := config.Set().Speaker().LouderSpeech(on); err != nil {
+		slog.Error("saving a setting failed", "setting", p.louder.ObjectID, "err", err)
+		return
+	}
+	p.louder.Set(on)
+	slog.Info("setting changed", "setting", p.louder.ObjectID, "using", on)
+}
+
 func (p *Player) Entities() []esphome.Entity {
 	out := []esphome.Entity{p.mp, p.jack, p.resampling, p.onTurn, p.duck, p.asp, p.bass, p.treble,
-		p.quiet, p.night, p.nearMiss, p.haSounds, p.sleep.sel}
+		p.quiet, p.night, p.voiceVol, p.callVol, p.nearMiss, p.haSounds, p.louder, p.clearer, p.sleep.sel}
+	// Asked as the entities are listed (once, as the API starts): the mixer if it opens by then,
+	// which leaves out a board that turned out not to have the amplifier, or still may have it.
+	if p.gain != nil && (speaker.GainAvailable() || speaker.GainPossible()) {
+		out = append(out, p.gain)
+	}
+	if p.top != nil {
+		out = append(out, p.top)
+	}
 	if speaker.HasJack {
 		out = append(out, p.output)
+	}
+	if speaker.Get().CanStereo() {
+		out = append(out, p.stereo)
 	}
 	for _, sel := range p.layers {
 		out = append(out, sel)
@@ -554,17 +717,41 @@ func (p *Player) Restore(c config.Config) {
 	slog.Info("restored", "what", p.nearMiss.ObjectID, "using", c.Media.DuckOnNearMiss)
 	p.haSounds.Set(!c.Speaker.ClassicSounds)
 	slog.Info("restored", "what", p.haSounds.ObjectID, "using", !c.Speaker.ClassicSounds)
+	p.louder.Set(c.Speaker.LouderSpeech)
+	p.clearer.Set(c.Speaker.ClearerSpeech)
+	speaker.Get().SetClearerSpeech(c.Speaker.ClearerSpeech)
+	slog.Info("restored", "what", p.clearer.ObjectID, "using", c.Speaker.ClearerSpeech)
+	if p.top != nil {
+		p.top.Set(c.Speaker.LouderTop)
+		speaker.Get().SetLouderTop(c.Speaker.LouderTop)
+		slog.Info("restored", "what", p.top.ObjectID, "using", c.Speaker.LouderTop)
+	}
 
 	p.duck.Set(float32(c.Media.DuckDB))
 	slog.Info("restored", "what", p.duck.ObjectID, "using", c.Media.DuckDB)
 
 	want := c.Speaker.ASPWanted()
+	// Before or after the tuning makes no difference to the amplifier: SetASP only switches the
+	// tuning in the write loop, and nothing else writes the amplifier's gain control.
+	if p.gain != nil {
+		db := max(0, min(c.Speaker.GainDB, config.SpeakerGainMax))
+		if err := p.gainApply(db); err != nil {
+			slog.Error("restoring speaker gain failed", "err", err)
+		} else {
+			p.gain.Set(float32(db))
+			slog.Info("restored", "what", p.gain.ObjectID, "using", db)
+		}
+	}
 	settled := speaker.Get().SetASP(want)
 	p.asp.Set(settled)
 	slog.Info("restored", "what", p.asp.ObjectID, "using", settled, "asked", want)
+	p.stereo.Set(speaker.Get().SetStereo(c.Speaker.Stereo))
 
 	restoreQuiet(p.quiet, c)
 	p.night.Set(float32(c.Speaker.NightVolume))
+	p.voiceVol.Set(float32(c.Speaker.VoiceOffset))
+	p.callVol.Set(float32(c.Speaker.CallOffset))
+	p.pushLanes()
 	slog.Info("restored", "what", p.night.ObjectID, "using", c.Speaker.NightVolume, "daytime", c.Speaker.DayVolume)
 	p.bass.Set(float32(c.Speaker.Bass))
 	p.treble.Set(float32(c.Speaker.Treble))
@@ -642,10 +829,12 @@ func (p *Player) command(c esphome.MediaCommand) {
 			// (overlay.go). Not a track: it is not what the room chose, so it is not what the screen or the
 			// last-station memory is told is playing.
 		default:
+			// Taken before ours, which drops a title nothing used: this is what it was for.
+			title := p.nextTitle.Swap(nil).fresh()
 			p.ours()
 			// Home Assistant converts what it sends to what the device plays; one it did not is not
 			// handed on to the music library, which would be given Home Assistant's own address.
-			p.stream.PlayOnly(c.MediaURL)
+			p.stream.PlayTitled(c.MediaURL, title)
 			p.OnPlay.Emit(c.MediaURL)
 		}
 	}
@@ -667,6 +856,12 @@ func (p *Player) command(c esphome.MediaCommand) {
 		// kept as a pause, so the screen still shows what was playing and play picks it up again. A
 		// track left stopped that long is really over. A track somebody else is playing is theirs to
 		// stop, so the remote is asked to pause it instead.
+		//
+		// With nothing of its own playing or paused there is nothing to keep, and it is a stop like one
+		// here: what would start something again in a moment (a dropped station's put-back) is told.
+		if playing, paused := p.stream.Playing(); !playing && !paused {
+			p.OnStop.Emit(struct{}{})
+		}
 		p.fromHA(TransportPause)
 		n := p.stoppedAt.Add(1)
 		time.AfterFunc(stoppedFor, func() {
@@ -821,6 +1016,18 @@ func (p *Player) fromHA(t Transport) {
 	p.Transport(t)
 }
 
+// SkipReaches reports whether a next or previous asked for now would be passed on: to a remote whose
+// track it is (Music Assistant), or to a received track's sender that can be reached (ReceiverControl).
+// Otherwise Transport has nothing to skip to, and whoever plays one track at a time on the device has to
+// skip it themselves.
+func (p *Player) SkipReaches() bool {
+	if p.remoteIsTheTrack() {
+		return true
+	}
+	from := p.Receiving()
+	return from != "" && receiverControl(from) != nil
+}
+
 func (p *Player) Transport(t Transport) {
 	// A remote's track paused from here and since let go: play asks for it back, stop forgets it.
 	if _, _, _, ok := p.Held(); ok {
@@ -879,8 +1086,12 @@ func (p *Player) Transport(t Transport) {
 	case TransportStop:
 		p.Stop()
 	case TransportNext, TransportPrevious:
-		// Nothing to skip to: the tracks this player has are its own stations, and it plays one
-		// stream at a time.
+		// A received track's sender has a queue of its own, and one that can be reached is asked to skip
+		// (ReceiverControl). Otherwise there is nothing to skip to: the tracks this player has are its own
+		// stations, and it plays one stream at a time.
+		if from := p.Receiving(); from != "" {
+			p.tellSender(from, t)
+		}
 	}
 }
 
@@ -989,6 +1200,7 @@ func (c *claim) playing() bool {
 // that could not be turned off. The remote's track is what the room hears now; this device's is over.
 func (p *Player) External() uint64 {
 	p.remoteLast.Store(true)
+	p.nextTitle.Store(nil)
 	n := p.remote.take()
 	p.stream.Stop()
 	p.refresh()
@@ -1015,11 +1227,28 @@ func (p *Player) RemoteGone() {
 	// What the last session said about its stream is not what the next one's first stream is doing.
 	p.remoteState.Store("")
 	p.remoteGen.Add(1)
+	// Not a refresh, but what the room is carrying is read from that state, so whoever names it looks again.
+	p.OnNowPlaying.Emit(struct{}{})
 }
 
 // ExternalPlaying reports whether something this player did not start is using the speaker, which is
 // what the screen asks before it says what the room is playing.
 func (p *Player) ExternalPlaying() bool { return p.remote.playing() }
+
+// ExternalShowing is whether a remote holding the speaker has something for a screen to show: it is
+// playing, or has said nothing yet, or it is paused or stopped with its track still named. Music
+// Assistant goes on holding the speaker after its queue is emptied, with no track named and nothing
+// playing, and the page and the strip then have nothing left to offer (#150).
+func (p *Player) ExternalShowing() bool {
+	if !p.remote.playing() {
+		return false
+	}
+	if playing, _ := p.CarriedState(); playing {
+		return true
+	}
+	t, _ := p.extTrack.Load().(remoteTrack)
+	return t.Title != ""
+}
 
 // Carried reports whether what the room is hearing is somebody else's: a remote holds the speaker and is
 // the thing playing.
@@ -1049,9 +1278,17 @@ func (p *Player) ExternalTrack(title, artist, album string) {
 	p.extTrack.Store(remoteTrack{Title: title, Artist: artist, Album: album})
 	if title != "" {
 		p.lastExt.Store(lastTrack{remoteTrack: remoteTrack{Title: title, Artist: artist, Album: album}})
-	} else if l, _ := p.lastExt.Load().(lastTrack); l.Title != "" && l.clearedAt.IsZero() {
-		l.clearedAt = time.Now()
-		p.lastExt.Store(l)
+	} else {
+		if l, _ := p.lastExt.Load().(lastTrack); l.Title != "" && l.clearedAt.IsZero() {
+			l.clearedAt = time.Now()
+			p.lastExt.Store(l)
+		}
+		// Music Assistant keeps a stopped queue's track named, and clears it once the queue is emptied:
+		// a track held from a pause is over then (#150). The clear that comes with a pause comes within
+		// lastFor of its hold (after it, for a pause from the screen), so it leaves that alone.
+		if h, _ := p.held.Load().(heldTrack); !h.at.IsZero() && time.Since(h.at) > lastFor {
+			p.held.Store(heldTrack{})
+		}
 	}
 	p.refresh()
 }
@@ -1132,11 +1369,21 @@ func (p *Player) Track() (title, artist, album string) {
 // the speaker from.
 func (p *Player) Playing() (playing, paused bool) { return p.stream.Playing() }
 
-// Pause leaves the track where it is, so it can be picked up again. A received track whose sender no
-// pause reaches (StopOnPause) is stopped instead: held, it would hold the sender up mid-write while
-// the phone shows it playing, and the speaker with it.
+// Pause leaves the track where it is, so it can be picked up again. A received track whose sender a
+// pause reaches (ReceiverControl) is paused here and the sender told, so the phone pauses with it; one
+// already paused is left as it is, and its sender is not asked again: it has paused, or been asked to,
+// or has gone on to play somewhere else, which a pause from here would stop. One whose sender no pause
+// reaches (StopOnPause) is stopped instead: held, it would hold the sender up mid-write while the
+// phone shows it playing, and the speaker with it.
 func (p *Player) Pause() {
 	if from := p.Receiving(); from != "" {
+		if receiverControl(from) != nil {
+			if playing, _ := p.stream.Playing(); playing {
+				p.stream.Pause()
+				p.tellSender(from, TransportPause)
+			}
+			return
+		}
 		if _, ok := stopOnPause.Load(from); ok {
 			slog.Info("pausing a receiver that cannot be told: stopping it here", "from", from)
 			p.stream.Stop()
@@ -1146,19 +1393,214 @@ func (p *Player) Pause() {
 	p.stream.Pause()
 }
 
+// Audible reports whether music is what the room is hearing: this player's own track playing, or a
+// remote's track (Music Assistant over Sendspin) that this player carries and that says it is playing.
+// The stop word and the action button ask this, and Playing alone missed a remote's track: its audio
+// never goes through this player's stream, so "stop" over Music Assistant found nothing to stop.
+func (p *Player) Audible() bool {
+	if playing, _ := p.stream.Playing(); playing {
+		return true
+	}
+	playing, _ := p.RemotePlaying()
+	return playing && p.Carried()
+}
+
+// PauseAudible pauses what Audible found. A remote's track is the remote's to pause, so it is asked, as
+// the screen's own controls ask it (Transport); this player's own track is paused here (Pause).
+func (p *Player) PauseAudible() {
+	if p.remoteIsTheTrack() {
+		p.Transport(TransportPause)
+		return
+	}
+	p.Pause()
+}
+
 // stopOnPause holds the received sources that a pause here cannot reach (StopOnPause).
 var stopOnPause sync.Map
 
-// StopOnPause marks the received source name as one a pause on the device cannot reach: AirPlay and
-// Spotify Connect hear nothing back from the speaker, where a phone over Bluetooth is told.
+// StopOnPause marks the received source name as one a pause on the device cannot reach: Spotify
+// Connect hears nothing back from the speaker, where a phone over Bluetooth is told.
 func StopOnPause(name string) { stopOnPause.Store(name, true) }
 
-// Resume picks a paused track up again. (Stream.Resume is something else: it gives the speaker back
-// after a turn, and leaves a track the listener paused where it is.)
-func (p *Player) Resume() { p.stream.Unpause() }
+// receiverControls holds, for the received sources whose sender the device can reach, how to reach it
+// (ReceiverControl).
+var receiverControls sync.Map // name → func(Transport) func() bool
 
-// Stop ends the track, as Home Assistant's stop does.
-func (p *Player) Stop() { p.stream.Stop() }
+// ReceiverControl gives the received source name a way back to its sender, which a pause, a play and
+// a skip on the device go to: AirPlay's, which asks the phone over DACP. ctl is called as a command is
+// given, and binds it to the sender of the moment; what it gives back asks that sender and says whether
+// it took the command, and is called off the screen's and Home Assistant's goroutines, since the sender
+// is across the network. A track whose sender took a pause stays paused here, however long the sender
+// then sends nothing, until the sender plays again, it is stopped, or its receiver says the sender has
+// gone (ReceiverGone).
+func ReceiverControl(name string, ctl func(Transport) func() bool) { receiverControls.Store(name, ctl) }
+
+func receiverControl(name string) func(Transport) func() bool {
+	if ctl, ok := receiverControls.Load(name); ok {
+		return ctl.(func(Transport) func() bool)
+	}
+	return nil
+}
+
+// tellSender passes t on to the sender of the received track named from, after whatever was passed on
+// before it (senderQueue). A pause the sender takes is marked taken then (pauseTook). A pause the
+// sender does not take ends the track here instead, as for a sender no pause reaches (StopOnPause),
+// unless something has played it again meanwhile.
+func (p *Player) tellSender(from string, t Transport) {
+	ctl := receiverControl(from)
+	if ctl == nil {
+		return
+	}
+	ask := ctl(t)              // the sender there now, not whichever is by the time the ask's turn comes
+	seq := p.stream.pauseSeq() // the pause this asks for, should the answer come after another
+	p.toSender.put(t, func() {
+		if ask() {
+			if t == TransportPause {
+				p.stream.pauseTook(from, seq, time.Now()) // what a phone playing on is measured from (sendingOn)
+			}
+			return
+		}
+		slog.Info("the sender of a received track was not reached", "from", from, "transport", t)
+		if t == TransportPause {
+			p.stream.stopPaused(from)
+		}
+	})
+}
+
+// senderQueue runs what is passed on to a received track's sender one at a time and in order, on a
+// goroutine of its own while there is anything to run. A sender across the network can take seconds to
+// answer, or never answer, so little is kept waiting behind the one under way: a play or a pause
+// waiting gives way to the next play or pause, and a skip waiting to the next skip the same way, each
+// going to the back, while a skip the other way takes the waiting one back. The track here is already
+// where the last play or pause left it, and a skip asked of a phone that answers late is no use many
+// times over. A skip never takes the place of a play or a pause, nor the other way round: a pause, then
+// a play and a next while the pause is under way, leave the phone playing the next song. The zero
+// value is ready.
+type senderQueue struct {
+	mu      sync.Mutex
+	waiting []queued // oldest first: at most one play or pause, and one skip
+	running bool
+}
+
+// queued is one command waiting for the sender: which, whether it is a skip, and what asks for it.
+type queued struct {
+	t    Transport
+	skip bool
+	do   func()
+}
+
+func (q *senderQueue) put(t Transport, do func()) {
+	skip := t == TransportNext || t == TransportPrevious
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if i := slices.IndexFunc(q.waiting, func(w queued) bool { return w.skip }); skip && i >= 0 && q.waiting[i].t != t {
+		// A skip one way and one the other, pressed while the phone is slow to answer, cancel out: the
+		// one waiting is taken back, rather than the phone sent a song back.
+		q.waiting = slices.Delete(q.waiting, i, i+1)
+		return
+	}
+	q.waiting = slices.DeleteFunc(q.waiting, func(w queued) bool { return w.skip == skip })
+	q.waiting = append(q.waiting, queued{t: t, skip: skip, do: do})
+	if !q.running {
+		q.running = true
+		safe.Go("to sender", q.run)
+	}
+}
+
+// run does what is waiting until nothing is. running goes false in the same hold of mu that finds
+// nothing waiting, so a put just after it starts another; one that panics is let go of here, so the rest
+// still run.
+func (q *senderQueue) run() {
+	for {
+		q.mu.Lock()
+		if len(q.waiting) == 0 {
+			q.running = false
+			q.mu.Unlock()
+			return
+		}
+		w := q.waiting[0]
+		q.waiting = q.waiting[1:]
+		q.mu.Unlock()
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Error("recovered from a panic", "in", "to sender", "panic", r)
+				}
+			}()
+			w.do()
+		}()
+	}
+}
+
+// ReceiverGone is the sender of the received track named name gone for good, or its receiver stopped,
+// while the track waits paused here for it (ReceiverControl): an iPhone that ended its session as it
+// paused and has not come back, one that ended it without saying it paused, or AirPlay turned off.
+// Nothing will play it again, so it ends, as a track stopped from Home Assistant does once stoppedFor
+// has gone by. A track playing, by any other name, or none, is left as it is, and nothing is told to
+// the sender.
+func (p *Player) ReceiverGone(name string) {
+	if p.stream.stopPaused(name) {
+		slog.Info("a received track left paused by a sender that has gone is ended", "from", name)
+	}
+}
+
+// ReceiverPaused is the sender of the received track named name pausing, or playing again, on its own
+// (from the phone): the track here follows it, without telling the sender back. Playing again is a play
+// as much as one from here, so a stop from Home Assistant before it no longer ends the track once
+// stoppedFor has gone by. A track by any other name, or none, is left as it is.
+func (p *Player) ReceiverPaused(name string, paused bool) {
+	if p.Receiving() != name {
+		return
+	}
+	if paused {
+		p.stream.senderPause()
+		return
+	}
+	p.stoppedAt.Add(1)
+	p.stream.Unpause()
+}
+
+// SenderPaused is whether the received track loaded was paused by its sender, not from here.
+func (p *Player) SenderPaused() bool { return p.stream.SenderPaused() }
+
+// senderPlaysAgain is the sender of the received track named name heard playing again (sendingAgain
+// of music, playingAgain), with no word that it plays (ReceiverPaused): a phone that paused on its
+// own and played again without its Status saying so. The track plays again with it, rather than
+// waiting paused for the phone's half hour, and OnReceiverPlays says so. A pause from here (the
+// listener's) is left as it is: the phone was asked to pause, and only a play says it means to play
+// here again. A track by any other name, or not paused, is left as it is.
+func (p *Player) senderPlaysAgain(name string) {
+	if p.stream.unpauseIf(func(t *track, bySender bool) bool { return t.received && t.item == name && bySender }) {
+		p.stoppedAt.Add(1)
+		slog.Info("a sender that paused on its own is playing again; its track plays", "from", name)
+		p.OnReceiverPlays.Emit(name)
+	}
+}
+
+// Resume picks a paused track up again, and a received track's sender with it (ReceiverControl).
+// (Stream.Resume is something else: it gives the speaker back after a turn, and leaves a track the
+// listener paused where it is.)
+func (p *Player) Resume() {
+	if from := p.Receiving(); from != "" {
+		if _, paused := p.stream.Playing(); paused {
+			p.tellSender(from, TransportPlay)
+		}
+	}
+	p.stream.Unpause()
+}
+
+// Stop ends the track, as Home Assistant's stop does. A received track's sender that a pause reaches
+// (ReceiverControl) is paused as well: stopped only here, the phone would go on playing to a speaker
+// that drops what it sends.
+func (p *Player) Stop() {
+	if from := p.Receiving(); from != "" {
+		if playing, _ := p.stream.Playing(); playing {
+			p.tellSender(from, TransportPause)
+		}
+	}
+	p.stream.Stop()
+	p.OnStop.Emit(struct{}{})
+}
 
 // Sleep is the sleep timer: what is playing stops after a while.
 func (p *Player) Sleep() *sleeper { return p.sleep }
@@ -1185,6 +1627,13 @@ func (p *Player) PlayURLChecked(url string, within time.Duration) error {
 	return err
 }
 
+// PlayTitledChecked is PlayURLChecked for something that is not a station, like a news update: it plays
+// once and ends, named title on the screen, and is never handed to the music library.
+func (p *Player) PlayTitledChecked(url string, title Title, within time.Duration) error {
+	p.ours()
+	return p.stream.PlayTitledChecked(url, &title, within)
+}
+
 // ours marks what is about to play as this player's own, so a play or a pause goes to its own stream
 // rather than to a remote that has let go. Every path that starts local audio has to say so: remoteLast
 // is what decides where a transport command goes, and one left set sends the pause to a session that is
@@ -1195,6 +1644,8 @@ func (p *Player) PlayURLChecked(url string, within time.Duration) error {
 // with the house has to leave the group before anything of its own starts, or the house goes with it.
 func (p *Player) ours() {
 	p.remoteLast.Store(false)
+	// A title is for the next play_media; anything else starting first was not it (title.go).
+	p.nextTitle.Store(nil)
 	if p.remote.playing() {
 		p.OnTakeOver.Emit(struct{}{})
 	}
@@ -1238,6 +1689,11 @@ func (p *Player) ReceivedTrack() (from, title, artist, album string) {
 // refresh tells Home Assistant what the player is doing. Anything that displaces the noise — a track,
 // a stop, the action button — clears both entities, rather than leaving them naming a sound nobody can
 // hear.
+//
+// What the room plays changes through here - the stream's tracks starting, pausing and ending, a
+// receiver's or a remote's song, a remote taking or giving back the speaker - which is why OnNowPlaying
+// fires from it rather than from each of them. Two things do not: a remote going (RemoteGone fires it
+// itself), and a held track running out of time, which nothing marks.
 func (p *Player) refresh() {
 	p.mp.SetState(p.state())
 
@@ -1246,6 +1702,7 @@ func (p *Player) refresh() {
 			sel.Set(noiseOff)
 		}
 	}
+	p.OnNowPlaying.Emit(struct{}{})
 }
 
 func (p *Player) state() esphome.MediaPlayerState {
@@ -1290,6 +1747,7 @@ func (p *Player) apply(step int, tell bool) int {
 	if !p.muted.Load() {
 		speaker.Get().SetVolume(step)
 	}
+	p.OnLevel.Emit(step)
 	if !tell {
 		return step
 	}
@@ -1306,10 +1764,18 @@ func (p *Player) Mute(muted bool) {
 	p.mp.SetMuted(muted)
 	if muted {
 		speaker.Get().SetVolume(0)
-		return
+	} else {
+		speaker.Get().SetVolume(p.Volume())
 	}
-	speaker.Get().SetVolume(p.Volume())
+	p.OnMute.Emit(muted)
 }
+
+// Muted reports whether the speaker is muted (Mute): the level is kept, and nothing is heard.
+func (p *Player) Muted() bool { return p.muted.Load() }
+
+// NoisePlaying reports whether what this player plays is noise it generates (Noise), a bed to sleep or
+// work to rather than music somebody would turn down.
+func (p *Player) NoisePlaying() bool { return len(p.stream.Noise()) > 0 }
 
 // Adjust moves the level by a step and says so, which is what the buttons and Home Assistant's own
 // up and down both do.
@@ -1320,7 +1786,7 @@ func (p *Player) Adjust(delta int) {
 		p.Mute(false)
 	}
 	p.Set(p.Volume() + delta)
-	speaker.Sound().Chime(speaker.ToneVolume)
+	speaker.Sound().Chime(speaker.VolumeSound())
 }
 
 // show lights the level as a clockwise arc, the leading segment dimmed by the fraction of a segment

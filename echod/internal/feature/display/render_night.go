@@ -14,25 +14,13 @@ import (
 	"golang.org/x/image/font"
 	"golang.org/x/image/math/fixed"
 	"golang.org/x/image/vector"
+
+	"github.com/HuskerMinion/techo5/echod/internal/feature/phone"
 )
 
 // The night clock: the time alone on black, in one of three looks - the ordinary clock face in dim
-// red, an LED clock's seven red segments, or a flip clock's charcoal cards and off-white digits.
-
-var (
-	// nightRed is the lit red: dim, so with the backlight at the night light's level it reads across
-	// a dark room without lighting it.
-	nightRed = color.RGBA{150, 14, 0, 255}
-	// nightGhost is an LED segment that is not lit, faint, as on a real LED clock.
-	nightGhost = color.RGBA{26, 3, 0, 255}
-	// The flip clock is not red: charcoal cards, a shade lighter above the split than below it, the
-	// hinges at their sides, and dim off-white digits.
-	flipTop   = color.RGBA{36, 36, 35, 255}
-	flipLower = color.RGBA{27, 27, 26, 255}
-	flipHinge = color.RGBA{52, 52, 50, 255}
-	flipInk   = color.RGBA{158, 152, 140, 255}
-	flipSplit = color.RGBA{0, 0, 0, 255}
-)
+// red, an LED clock's seven red segments, or a flip clock's charcoal cards and off-white digits. The
+// colors are the Spot's too (night_light.go).
 
 // clockInk is what the LED and flip clocks are drawn in: the night's colors, or a day clock style's
 // taken from the theme (render_styles.go).
@@ -45,21 +33,47 @@ type clockInk struct {
 // nightInk is the night clock's.
 var nightInk = clockInk{nightRed, nightGhost, flipTop, flipLower, flipHinge, flipInk, flipSplit}
 
-// redClockPage is the night as a clock alone.
-func (r *renderer) redClockPage(s scene) {
-	draw.Draw(r.dst, r.dst.Rect, image.NewUniform(color.Black), image.Point{}, draw.Src)
-	r.ink = nightInk
-	switch s.redStyle {
-	case nightStyleLED:
-		r.ledClock(s.now, r.dst.Rect, r.ampm)
-	case nightStyleFlip:
-		r.flipClock(s.now, r.dst.Rect)
-	default:
-		r.plainRedClock(s.now)
-	}
+// redClockFace is whether the frame is the red night clock (redClockPage): the night's glow with
+// nothing over it that has to be seen. Its red is the point, so a skin's filter is off for it
+// (unskinned).
+func (s scene) redClockFace() bool {
+	return s.redClock && s.phase == "idle" && s.call.Phase == phone.Idle && !s.setupAsking && !s.showVideoAsk &&
+		!s.showWifi && !s.bt.Pairing && !s.showCamera && !s.showAnnouncement && !s.showReminder &&
+		!(s.showDash && s.dashAsked)
 }
 
-func (r *renderer) plainRedClock(now time.Time) {
+// redClockPage is the night as a clock alone.
+func (r *renderer) redClockPage(s scene) {
+	fillCanvas(r.dst, color.Black)
+	r.ink = nightInk
+	// With Night clock shows Next up and notifications, the clock keeps clear of the foot when there is
+	// something along it (render_night_info.go); with nothing, or the setting off, it is as it was.
+	area := r.dst.Rect
+	if reserve := r.nightInfoReserve(s); reserve > 0 {
+		area.Max.Y -= reserve
+	}
+	shrunk := area != r.dst.Rect
+	switch s.redStyle {
+	case nightStyleLED:
+		box := r.dst.Rect
+		if shrunk {
+			box = nightInfoBox(area, r.w, min(r.h*52/100, area.Dy()*92/100))
+		}
+		r.ledClock(s.now, box, r.ampm)
+	case nightStyleFlip:
+		box := r.dst.Rect
+		if shrunk {
+			box = nightInfoBox(area, r.w, min(r.h*90/100, area.Dy()*95/100))
+		}
+		r.flipClock(s.now, box)
+	default:
+		r.plainRedClock(s.now, (area.Min.Y+area.Max.Y)/2)
+	}
+	r.nightInfoOver(s)
+}
+
+// plainRedClock is the time in dim red, centered top to bottom on cy.
+func (r *renderer) plainRedClock(now time.Time, cy int) {
 	hour, ampm := clockHM(now), clockSuffix(now)
 	hw, aw := r.width(r.clock, hour), r.width(r.ampm, ampm)
 	gap := r.s(18)
@@ -67,7 +81,7 @@ func (r *renderer) plainRedClock(now time.Time) {
 		gap = 0
 	}
 	x := (r.w - hw - gap - aw) / 2
-	base := r.h/2 + r.digitHeight()/2 // the digits centered top to bottom
+	base := cy + r.digitHeight()/2 // the digits centered top to bottom
 	r.text(r.clock, hour, x, base, nightRed)
 	r.text(r.ampm, ampm, x+hw+gap, base, nightRed)
 }
@@ -355,7 +369,7 @@ func (r *renderer) flipTurning(card image.Rectangle, from, to string, inset int,
 // shade darkens b by a fraction up to three quarters: a leaf turned away from the light.
 func (r *renderer) shade(b image.Rectangle, by float64) {
 	a := uint8(math.Round(min(max(by, 0), 1) * 190))
-	draw.Draw(r.dst, b, image.NewUniform(color.RGBA{0, 0, 0, a}), image.Point{}, draw.Over)
+	washOver(r.dst, b, color.RGBA{0, 0, 0, a})
 }
 
 // offscreen is what paint draws, over what the screen already has there, into a picture of just b,
@@ -416,7 +430,7 @@ func (r *renderer) digitHeight() int {
 }
 
 func (r *renderer) fillRect(b image.Rectangle, c color.Color) {
-	draw.Draw(r.dst, b, image.NewUniform(c), image.Point{}, draw.Over)
+	washOver(r.dst, b, c)
 }
 
 // roundRect fills b with its corners rounded to radius k.

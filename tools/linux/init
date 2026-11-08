@@ -40,10 +40,6 @@ crumb "init started, kernel $($BB uname -r) $($BB uname -m)"
 $BB mount -t proc proc /proc
 $BB mount -t sysfs sysfs /sys
 
-# Recovery bootloader message: clear it first, so a crash later still leaves
-# the unit booting normally next time.
-$BB dd if=/dev/zero of=$MISC bs=32 count=1 conv=notrunc 2>/dev/null
-
 $BB mount -t tmpfs -o mode=0755 tmpfs /dev
 $BB mkdir -p /dev/pts /dev/graphics /run /tmp /store /data /android /newroot
 $BB mount -t devpts devpts /dev/pts
@@ -51,6 +47,10 @@ $BB mount -t tmpfs tmpfs /run
 $BB mount -t tmpfs tmpfs /tmp
 $BB mdev -s
 $BB mknod -m 600 /dev/mmcblk0p8 b 179 8 2>/dev/null
+# Recovery bootloader message: clear it first, so a crash later still leaves
+# the unit booting normally next time (and a one-shot boot of the recovery
+# partition stays one-shot). /dev/zero exists only from here on.
+$BB dd if=/dev/zero of=$MISC bs=32 count=1 conv=notrunc 2>/dev/null
 [ -e /dev/fb0 ] && $BB ln -sf /dev/fb0 /dev/graphics/fb0
 echo 7 4 1 7 > /proc/sys/kernel/printk
 crumb "dev populated: $($BB ls /dev | $BB wc -l) nodes, fb0=$([ -e /dev/fb0 ] && echo yes || echo no)"
@@ -100,6 +100,11 @@ snapshot() {
 boot_slot() {
 	slot=$1
 	root=/store/slots/$slot
+	if [ -f /etc/techo5/kernel-release ] &&
+	   [ ! -f "$root/lib/modules/$(uname -r)/extra/mt76x8_wlan.ko" ]; then
+		crumb "slot $slot has no matching kernel modules; staying in rescue"
+		return 1
+	fi
 	[ -x $root/sbin/init ] || [ -L $root/sbin/init ] || { crumb "slot $slot has no /sbin/init"; return 1; }
 	mount --bind $root /newroot || { crumb "bind mount of slot $slot failed"; return 1; }
 	mkdir -p /run/techo5
@@ -110,6 +115,7 @@ boot_slot() {
 	crumb "switching root to slot $slot ($(cat $root/etc/techo5-release 2>/dev/null))"
 	# Nothing from the initramfs may keep running: its files are about to go.
 	kill -9 -1 2>/dev/null
+	[ -n "$AB_SLOT" ] && t5_watchdog && WATCHDOG=1
 	for m in store data run tmp dev sys proc; do
 		mkdir -p /newroot/$m
 		mount --move /$m /newroot/$m || crumb "moving /$m failed"
@@ -119,10 +125,28 @@ boot_slot() {
 	return 1
 }
 
+# The boot layer (techo5-lib.sh, t5_ab_slot), where it is installed, has picked the slot, started
+# that slot's own kernel with this initramfs, and counted the try. That slot is booted without
+# slotctl next, which would take a second try and might pick the other slot, whose root does not
+# go with this kernel. If it cannot start, slotctl decides as before. Without ab.slot= on the
+# command line (no boot layer) none of this runs.
+AB_SLOT=$(t5_ab_slot)
+WATCHDOG=
+ab_boot() {
+	crumb "the boot layer booted slot $AB_SLOT: no slotctl next"
+	boot_slot "$AB_SLOT"
+	crumb "slot $AB_SLOT from the boot layer did not start; slotctl decides"
+	mount -o remount,rw /store 2>/dev/null
+	umount /newroot 2>/dev/null
+	return 1
+}
+
 if [ $MODE = store ]; then
 	if [ -e /store/rescue ]; then
 		rm -f /store/rescue; sync
 		crumb "rescue marker found: staying in the initramfs this boot"
+	elif [ -n "$AB_SLOT" ] && ab_boot; then
+		: # not reached: ab_boot only returns when the slot did not start
 	elif slot=$(STORE=/store slotctl next 2>/tmp/slotctl.err); then
 		crumb "slotctl: $(tr '\n' ' ' < /tmp/slotctl.err)"
 		boot_slot "$slot"
@@ -136,6 +160,9 @@ fi
 
 # --- Rescue environment.
 crumb "rescue mode ($MODE)"
+# A slot's command line from the boot layer asks for the watchdog to be fed (t5_watchdog): here
+# too, so the rescue environment is not reset under the person using it.
+[ -n "$AB_SLOT" ] && [ -z "$WATCHDOG" ] && t5_watchdog
 snapshot
 
 # Panel: say what has happened and what to do about it.

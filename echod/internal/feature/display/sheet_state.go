@@ -3,6 +3,7 @@
 package display
 
 import (
+	"fmt"
 	"image"
 	"time"
 
@@ -61,7 +62,10 @@ type settings struct {
 	wifi        string
 	wifiName    string // the network joined, or what the Wi-Fi is doing
 	wifiOK      bool   // Wi-Fi is managed here, so it can be changed
+	addressSet  string // how the address is set, for its row; empty where the screen cannot change it
 	btProxy     bool
+	btSCOff     bool       // the controller's Secure Connections turned off (btaudio secureconn.go)
+	btSCFixed   bool       // and not this device's to change: athena on mainline has them off for good
 	checking    bool       // an update check from the screen is out
 	colors      bool       // the custom colors editor is open
 	demo        bool       // placeholders for the owner's details, for published screenshots
@@ -153,4 +157,13 @@ func cmpOr(a, b string) string {
 		return a
 	}
 	return b
+}
+
+// offsetText is a voice or call volume as the row reads it: how far from the volume, or that it is the
+// volume itself.
+func offsetText(n int) string {
+	if n == 0 {
+		return tr("ui_same_as_volume")
+	}
+	return fmt.Sprintf("%+d", n)
 }

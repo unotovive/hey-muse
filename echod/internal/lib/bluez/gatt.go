@@ -1,632 +1,784 @@
 //go:build linux
 
-// This file is a modified port of linux/src/musegadget/ble_server.py from Meta's Muse Gadget SDK,
-// Copyright (c) Meta Platforms, Inc. and affiliates, licensed under the Apache License, Version 2.0.
-// The GLib loop became one goroutine fed by the bus connection, and the service and advertisement are
-// the caller's to name.
-
 package bluez
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/godbus/dbus/v5"
+	"golang.org/x/sys/unix"
 )
 
 const (
-	gattMgrIfc  = "org.bluez.GattManager1"
-	gattSvcIfc  = "org.bluez.GattService1"
-	gattChrcIfc = "org.bluez.GattCharacteristic1"
-	advMgrIfc   = "org.bluez.LEAdvertisingManager1"
-	advIfc      = "org.bluez.LEAdvertisement1"
+	gattServiceIfc = "org.bluez.GattService1"
+	gattCharIfc    = "org.bluez.GattCharacteristic1"
+	gattDescIfc    = "org.bluez.GattDescriptor1"
 
-	gattAppPath = dbus.ObjectPath("/org/techo5/gatt")
-	gattSvcPath = gattAppPath + "/service0"
-	gattRXPath  = gattSvcPath + "/char0"
-	gattTXPath  = gattSvcPath + "/char1"
-	advPath     = dbus.ObjectPath("/org/techo5/advertisement0")
+	// cccd is the Client Characteristic Configuration descriptor. bluetoothd owns it and refuses
+	// writes to it; notifications are turned on and off through the characteristic instead.
+	cccd = "00002902-0000-1000-8000-00805f9b34fb"
 
-	// minMTU is the smallest ATT MTU there is; anything below it in a write's options is not one.
-	minMTU = 23
-
-	// callTimeout bounds each call to bluetoothd, so a stuck daemon cannot hold up teardown.
-	callTimeout = 5 * time.Second
-
-	// maxLinkEvents is how many writes may wait for the handler. A phone sends a few packets and
-	// waits for the answer, so only something misbehaving gets near it.
-	maxLinkEvents = 256
+	// defaultMTU is what ATT starts at before an exchange, and what is reported when bluetoothd
+	// does not say (MTU is a property only since BlueZ 5.62).
+	defaultMTU = 23
 )
 
-// ErrPeripheralClosed is what Send returns once the peripheral is closed.
-var ErrPeripheralClosed = errors.New("bluez: the peripheral is closed")
-
-// PeripheralConfig names what a Peripheral serves and advertises: one primary service with a
-// characteristic the central writes (RX) and one the peripheral notifies (TX).
-type PeripheralConfig struct {
-	// LocalName is advertised, and is the adapter's Alias while the peripheral is up, because a
-	// phone reads the GAP name as well as the advertised one.
-	LocalName string
-
-	ServiceUUID string
-	RXUUID      string
-	TXUUID      string
-	RXFlags     []string // as BlueZ names them: "write", "write-without-response"
-	TXFlags     []string // "read", "notify"
-
-	// ManufacturerData is advertised as it is, by company id.
-	ManufacturerData map[uint16][]byte
-
-	// AssumedMTU is what MTU answers until a write says what was negotiated.
-	AssumedMTU int
-
-	// Stagger is the pause between the packets of one Send.
-	Stagger time.Duration
+// Service is one GATT service of a connected LE device. Handles are ATT handles, as an ESP32 proxy
+// reports them: the service's first handle, a characteristic's value, a descriptor's own. Home
+// Assistant keeps them between connections and whichever proxy made them, so they must match.
+type Service struct {
+	Handle          uint16
+	UUID            string
+	Characteristics []Characteristic
 }
 
-func (c PeripheralConfig) validate() error {
-	for name, v := range map[string]string{"local name": c.LocalName, "service UUID": c.ServiceUUID, "RX UUID": c.RXUUID, "TX UUID": c.TXUUID} {
-		if v == "" {
-			return fmt.Errorf("bluez: peripheral has no %s", name)
-		}
-	}
-	if c.AssumedMTU < minMTU {
-		return fmt.Errorf("bluez: assumed MTU %d is below the ATT minimum of %d", c.AssumedMTU, minMTU)
-	}
-	return nil
+// Characteristic is one characteristic of a Service. Flags are bluetoothd's names for its
+// properties ("read", "write-without-response", "notify", ...).
+type Characteristic struct {
+	Handle      uint16
+	UUID        string
+	Flags       []string
+	Descriptors []Descriptor
 }
 
-// objects is the tree bluetoothd reads through ObjectManager when the application registers.
-func (c PeripheralConfig) objects() map[dbus.ObjectPath]map[string]map[string]dbus.Variant {
-	chrc := func(uuid string, flags []string) map[string]map[string]dbus.Variant {
-		return map[string]map[string]dbus.Variant{gattChrcIfc: {
-			"Service":     dbus.MakeVariant(gattSvcPath),
-			"UUID":        dbus.MakeVariant(uuid),
-			"Flags":       dbus.MakeVariant(append([]string{}, flags...)),
-			"Descriptors": dbus.MakeVariant([]dbus.ObjectPath{}),
-		}}
-	}
-	return map[dbus.ObjectPath]map[string]map[string]dbus.Variant{
-		gattSvcPath: {gattSvcIfc: {
-			"UUID":            dbus.MakeVariant(c.ServiceUUID),
-			"Primary":         dbus.MakeVariant(true),
-			"Characteristics": dbus.MakeVariant([]dbus.ObjectPath{gattRXPath, gattTXPath}),
-		}},
-		gattRXPath: chrc(c.RXUUID, c.RXFlags),
-		gattTXPath: chrc(c.TXUUID, c.TXFlags),
-	}
+// Descriptor is one descriptor of a Characteristic.
+type Descriptor struct {
+	Handle uint16
+	UUID   string
 }
 
-// advertisement is the LEAdvertisement1 object's properties.
-func (c PeripheralConfig) advertisement() map[string]dbus.Variant {
-	data := map[uint16]dbus.Variant{}
-	for id, b := range c.ManufacturerData {
-		data[id] = dbus.MakeVariant(append([]byte{}, b...))
-	}
-	return map[string]dbus.Variant{
-		"Type":             dbus.MakeVariant("peripheral"),
-		"LocalName":        dbus.MakeVariant(c.LocalName),
-		"ServiceUUIDs":     dbus.MakeVariant([]string{c.ServiceUUID}),
-		"ManufacturerData": dbus.MakeVariant(data),
-		"Includes":         dbus.MakeVariant([]string{}),
-	}
+// Central is the LE client side of bluetoothd: connections to other devices' GATT servers, for the
+// Bluetooth proxy to carry Home Assistant's reads, writes and notifications. It has its own bus
+// connection, so its signals and Adapter's don't mix.
+type Central struct {
+	conn    *dbus.Conn
+	adapter dbus.ObjectPath
+	value   func(address string, handle uint16, data []byte)
+	lost    func(address string)
+	stop    func()
+
+	mu    sync.Mutex
+	links map[string]*link // by upper-case address
 }
 
-// LinkHandler hears what the central does. Both are called from one goroutine, in the order things
-// happened on the link, and never from inside Send or Disconnect.
-type LinkHandler interface {
-	OnWrite(data []byte)
-	OnDisconnect()
+// link is one connected device: where bluetoothd has it, its attributes by handle once read, and
+// the notifications running on it.
+type link struct {
+	path      dbus.ObjectPath
+	attrs     map[uint16]attribute
+	notifying map[uint16]func()
+	closing   bool
 }
 
-// writeOptions is what bluetoothd says about a write: the link's ATT MTU and which device wrote.
-type writeOptions struct {
-	mtu    int // 0 when not given
-	device dbus.ObjectPath
+type attribute struct {
+	path dbus.ObjectPath
+	ifc  string
+	uuid string
+	char uint16 // a descriptor's characteristic
 }
 
-func parseWriteOptions(opts map[string]dbus.Variant) writeOptions {
-	var o writeOptions
-	if mtu, ok := opts["mtu"].Value().(uint16); ok && mtu >= minMTU {
-		o.mtu = int(mtu)
-	}
-	o.device, _ = opts["device"].Value().(dbus.ObjectPath)
-	return o
-}
-
-type linkEventKind int
-
-const (
-	linkWrite linkEventKind = iota
-	linkSubscribed
-	linkUnsubscribed
-	linkConnected
-	linkDisconnected
-)
-
-// linkEvent is one thing that happened on the link, as bluetoothd reported it.
-type linkEvent struct {
-	kind   linkEventKind
-	data   []byte          // linkWrite
-	opts   writeOptions    // linkWrite
-	device dbus.ObjectPath // linkConnected, linkDisconnected
-}
-
-// linkEventFrom picks the link's events out of everything the bus delivers.
-func linkEventFrom(msg *dbus.Message) (linkEvent, bool) {
-	path, _ := msg.Headers[dbus.FieldPath].Value().(dbus.ObjectPath)
-	ifc, _ := msg.Headers[dbus.FieldInterface].Value().(string)
-	member, _ := msg.Headers[dbus.FieldMember].Value().(string)
-	switch {
-	case msg.Type == dbus.TypeMethodCall && ifc == gattChrcIfc && path == gattRXPath && member == "WriteValue":
-		if len(msg.Body) != 2 {
-			return linkEvent{}, false
-		}
-		data, ok := msg.Body[0].([]byte)
-		opts, _ := msg.Body[1].(map[string]dbus.Variant)
-		if !ok {
-			return linkEvent{}, false
-		}
-		return linkEvent{kind: linkWrite, data: data, opts: parseWriteOptions(opts)}, true
-	case msg.Type == dbus.TypeMethodCall && ifc == gattChrcIfc && path == gattTXPath && member == "StartNotify":
-		return linkEvent{kind: linkSubscribed}, true
-	case msg.Type == dbus.TypeMethodCall && ifc == gattChrcIfc && path == gattTXPath && member == "StopNotify":
-		return linkEvent{kind: linkUnsubscribed}, true
-	case msg.Type == dbus.TypeSignal && ifc == propsIfc && member == "PropertiesChanged":
-		if len(msg.Body) < 2 {
-			return linkEvent{}, false
-		}
-		if of, _ := msg.Body[0].(string); of != deviceIfc {
-			return linkEvent{}, false
-		}
-		changed, _ := msg.Body[1].(map[string]dbus.Variant)
-		connected, ok := changed["Connected"].Value().(bool)
-		if !ok {
-			return linkEvent{}, false
-		}
-		if connected {
-			return linkEvent{kind: linkConnected, device: path}, true
-		}
-		return linkEvent{kind: linkDisconnected, device: path}, true
-	case msg.Type == dbus.TypeSignal && ifc == objMgrIfc && member == "InterfacesAdded":
-		// A central bluetoothd has not met before arrives as a new object that is already connected.
-		if len(msg.Body) != 2 {
-			return linkEvent{}, false
-		}
-		device, _ := msg.Body[0].(dbus.ObjectPath)
-		ifcs, _ := msg.Body[1].(map[string]map[string]dbus.Variant)
-		if connected, _ := ifcs[deviceIfc]["Connected"].Value().(bool); connected {
-			return linkEvent{kind: linkConnected, device: device}, true
-		}
-	}
-	return linkEvent{}, false
-}
-
-// adapterChange is one adapter property the peripheral set, and what it was before.
-type adapterChange struct {
-	prop     string
-	was, set dbus.Variant
-}
-
-// Peripheral is a GATT server and its advertisement, up from Start until Close. It satisfies the Muse
-// pairing Transport.
-//
-// godbus runs every incoming method call on a goroutine of its own, so two writes that arrive
-// together could reach the handler swapped, and a chunked message would not reassemble. The
-// peripheral therefore reads the link's events where the connection still has them in order, before
-// dispatch, and hands them to the handler from one goroutine. The exported methods only acknowledge.
-type Peripheral struct {
-	cfg PeripheralConfig
-
-	events  chan linkEvent
-	done    chan struct{}
-	closing sync.Once
-
-	mu       sync.Mutex
-	conn     *dbus.Conn
-	adapter  dbus.BusObject
-	started  bool
-	changes  []adapterChange
-	mtu      int
-	device   dbus.ObjectPath // who wrote last; "" until a central writes
-	notify   bool
-	value    []byte // what TX last carried, for a read
-	overflow bool
-}
-
-// NewPeripheral describes a peripheral. Nothing is on the air until Start.
-func NewPeripheral(cfg PeripheralConfig) *Peripheral {
-	return &Peripheral{
-		cfg:    cfg,
-		events: make(chan linkEvent, maxLinkEvents),
-		done:   make(chan struct{}),
-		mtu:    cfg.AssumedMTU,
-	}
-}
-
-// Start registers the service and begins advertising. The adapter is powered on, takes the local
-// name as its Alias, and stops being pairable, since setup bonds nothing; Close puts all three back.
-// When Start fails nothing is left registered. A Peripheral starts once.
-func (p *Peripheral) Start(ctx context.Context, h LinkHandler) error {
-	if err := p.cfg.validate(); err != nil {
-		return err
-	}
-	p.mu.Lock()
-	if p.started {
-		p.mu.Unlock()
-		return errors.New("bluez: a Peripheral starts once")
-	}
-	p.started = true
-	p.mu.Unlock()
-
-	if err := p.start(ctx, h); err != nil {
-		return errors.Join(err, p.Close())
-	}
-	return nil
-}
-
-func (p *Peripheral) start(ctx context.Context, h LinkHandler) error {
-	conn, err := SystemBus(dbus.WithIncomingInterceptor(p.intercept))
+// OpenCentral connects to bluetoothd. value hears every notification and indication, and lost every
+// device that disconnects without Disconnect being asked. Both are called on the bus's goroutines
+// and must not block.
+func OpenCentral(value func(address string, handle uint16, data []byte), lost func(address string)) (*Central, error) {
+	conn, err := SystemBus()
 	if err != nil {
-		return fmt.Errorf("system bus: %w", err)
+		return nil, fmt.Errorf("system bus: %w", err)
 	}
-	p.mu.Lock()
-	p.conn = conn
-	p.mu.Unlock()
-
-	path, err := gattAdapter(ctx, conn)
+	c := &Central{conn: conn, value: value, lost: lost, links: map[string]*link{}}
+	objs, err := c.objects()
 	if err != nil {
-		return err
+		conn.Close()
+		return nil, err
 	}
-	adapter := conn.Object(service, path)
-	p.mu.Lock()
-	p.adapter = adapter
-	p.mu.Unlock()
+	for path, ifcs := range objs {
+		if _, ok := ifcs[adapterIfc]; ok && (c.adapter == "" || path < c.adapter) {
+			c.adapter = path
+		}
+	}
+	if c.adapter == "" {
+		conn.Close()
+		return nil, errors.New("bluez: no adapter")
+	}
+	if err := c.watch(); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return c, nil
+}
 
-	for _, match := range [][]dbus.MatchOption{
-		{dbus.WithMatchInterface(propsIfc), dbus.WithMatchMember("PropertiesChanged"), dbus.WithMatchArg(0, deviceIfc)},
-		{dbus.WithMatchInterface(objMgrIfc), dbus.WithMatchMember("InterfacesAdded")},
-	} {
-		if err := conn.AddMatchSignalContext(ctx, append(match, dbus.WithMatchSender(service))...); err != nil {
+// Close disconnects every device and lets the bus go.
+func (c *Central) Close() error {
+	c.mu.Lock()
+	addrs := make([]string, 0, len(c.links))
+	for a := range c.links {
+		addrs = append(addrs, a)
+	}
+	c.mu.Unlock()
+	for _, a := range addrs {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = c.Disconnect(ctx, a)
+		cancel()
+	}
+	if c.stop != nil {
+		c.stop()
+	}
+	return c.conn.Close()
+}
+
+func (c *Central) objects() (map[dbus.ObjectPath]map[string]map[string]dbus.Variant, error) {
+	var objs map[dbus.ObjectPath]map[string]map[string]dbus.Variant
+	if err := c.conn.Object(service, "/").Call(objMgrIfc+".GetManagedObjects", 0).Store(&objs); err != nil {
+		return nil, fmt.Errorf("bluez: managed objects: %w", err)
+	}
+	return objs, nil
+}
+
+func (c *Central) watch() error {
+	opts := [][]dbus.MatchOption{
+		{dbus.WithMatchInterface(propsIfc), dbus.WithMatchMember("PropertiesChanged"), dbus.WithMatchArg(0, deviceIfc),
+			dbus.WithMatchSender(service), dbus.WithMatchPathNamespace(c.adapter)},
+		{dbus.WithMatchInterface(propsIfc), dbus.WithMatchMember("PropertiesChanged"), dbus.WithMatchArg(0, gattCharIfc),
+			dbus.WithMatchSender(service), dbus.WithMatchPathNamespace(c.adapter)},
+		// A device can go without Connected ever turning false: hci0 set up again (the Secure
+		// Connections switch does that) takes the adapter and its devices away, and bluetoothd
+		// restarting takes everything.
+		{dbus.WithMatchInterface(objMgrIfc), dbus.WithMatchMember("InterfacesRemoved"), dbus.WithMatchSender(service)},
+		{dbus.WithMatchInterface("org.freedesktop.DBus"), dbus.WithMatchMember("NameOwnerChanged"),
+			dbus.WithMatchSender("org.freedesktop.DBus"), dbus.WithMatchArg(0, service)},
+	}
+	for _, o := range opts {
+		if err := c.conn.AddMatchSignal(o...); err != nil {
 			return fmt.Errorf("bluez: match: %w", err)
 		}
 	}
-	if err := p.export(conn); err != nil {
-		return err
-	}
-	go p.pump(h)
-
-	for _, want := range []struct {
-		prop string
-		v    any
-	}{{"Powered", true}, {"Alias", p.cfg.LocalName}, {"Pairable", false}} {
-		if err := p.setAdapter(ctx, want.prop, want.v); err != nil {
-			return err
-		}
-	}
-	// bluetoothd reads the tree back through GetManagedObjects before it answers.
-	if err := adapter.CallWithContext(ctx, gattMgrIfc+".RegisterApplication", 0, gattAppPath, map[string]dbus.Variant{}).Err; err != nil {
-		return fmt.Errorf("bluez: register gatt application: %w", err)
-	}
-	if err := adapter.CallWithContext(ctx, advMgrIfc+".RegisterAdvertisement", 0, advPath, map[string]dbus.Variant{}).Err; err != nil {
-		return fmt.Errorf("bluez: register advertisement: %w", err)
-	}
-	slog.Info("bluetooth: advertising", "name", p.cfg.LocalName, "service", p.cfg.ServiceUUID, "adapter", string(path))
-	return nil
-}
-
-// gattAdapter is the first adapter that can serve GATT and advertise.
-func gattAdapter(ctx context.Context, conn *dbus.Conn) (dbus.ObjectPath, error) {
-	var objs map[dbus.ObjectPath]map[string]map[string]dbus.Variant
-	if err := conn.Object(service, "/").CallWithContext(ctx, objMgrIfc+".GetManagedObjects", 0).Store(&objs); err != nil {
-		return "", fmt.Errorf("bluez: managed objects: %w", err)
-	}
-	var found dbus.ObjectPath
-	for path, ifcs := range objs {
-		_, gatt := ifcs[gattMgrIfc]
-		_, adv := ifcs[advMgrIfc]
-		if gatt && adv && (found == "" || path < found) {
-			found = path
-		}
-	}
-	if found == "" {
-		return "", errors.New("bluez: no adapter that can advertise")
-	}
-	return found, nil
-}
-
-// setAdapter sets one adapter property and remembers what it was, unless it already has the value.
-func (p *Peripheral) setAdapter(ctx context.Context, prop string, v any) error {
-	var was dbus.Variant
-	if err := p.adapter.CallWithContext(ctx, propsIfc+".Get", 0, adapterIfc, prop).Store(&was); err != nil {
-		return fmt.Errorf("bluez: read adapter %s: %w", prop, err)
-	}
-	if was.Value() == v {
-		return nil
-	}
-	set := dbus.MakeVariant(v)
-	if err := p.adapter.CallWithContext(ctx, propsIfc+".Set", 0, adapterIfc, prop, set).Err; err != nil {
-		return fmt.Errorf("bluez: set adapter %s: %w", prop, err)
-	}
-	p.mu.Lock()
-	p.changes = append(p.changes, adapterChange{prop: prop, was: was, set: set})
-	p.mu.Unlock()
-	return nil
-}
-
-func (p *Peripheral) export(conn *dbus.Conn) error {
-	tree := p.cfg.objects()
-	exports := []struct {
-		v    any
-		path dbus.ObjectPath
-		ifc  string
-	}{
-		{gattApp{tree}, gattAppPath, objMgrIfc},
-		{properties(tree[gattSvcPath]), gattSvcPath, propsIfc},
-		{properties(tree[gattRXPath]), gattRXPath, propsIfc},
-		{properties(tree[gattTXPath]), gattTXPath, propsIfc},
-		{rxChrc{}, gattRXPath, gattChrcIfc},
-		{txChrc{p}, gattTXPath, gattChrcIfc},
-		{properties{advIfc: p.cfg.advertisement()}, advPath, propsIfc},
-		{advert{}, advPath, advIfc},
-	}
-	for _, e := range exports {
-		if err := conn.Export(e.v, e.path, e.ifc); err != nil {
-			return fmt.Errorf("bluez: export %s: %w", e.path, err)
-		}
-	}
-	return nil
-}
-
-// intercept runs on the connection's reader, so it must not block: a full queue drops the event.
-func (p *Peripheral) intercept(msg *dbus.Message) {
-	ev, ok := linkEventFrom(msg)
-	if !ok {
-		return
-	}
-	select {
-	case p.events <- ev:
-	default:
-		p.mu.Lock()
-		first := !p.overflow
-		p.overflow = true
-		p.mu.Unlock()
-		if first {
-			slog.Warn("bluetooth: the central is writing faster than setup reads; dropping")
-		}
-	}
-}
-
-func (p *Peripheral) pump(h LinkHandler) {
-	for {
-		select {
-		case <-p.done:
-			return
-		case ev := <-p.events:
-			p.handle(ev, h)
-		}
-	}
-}
-
-func (p *Peripheral) handle(ev linkEvent, h LinkHandler) {
-	switch ev.kind {
-	case linkWrite:
-		p.mu.Lock()
-		newCentral := ev.opts.device != "" && ev.opts.device != p.device
-		if newCentral {
-			p.device = ev.opts.device
-		}
-		newMTU := ev.opts.mtu != 0 && ev.opts.mtu != p.mtu
-		if ev.opts.mtu != 0 {
-			p.mtu = ev.opts.mtu
-		}
-		mtu := p.mtu
-		p.mu.Unlock()
-		if newCentral || newMTU {
-			slog.Info("bluetooth: central is writing", "device", string(ev.opts.device), "mtu", mtu, "mtu_negotiated", ev.opts.mtu != 0)
-		}
-		slog.Debug("bluetooth: write", "bytes", len(ev.data), "mtu", mtu)
-		h.OnWrite(ev.data)
-	case linkSubscribed, linkUnsubscribed:
-		p.mu.Lock()
-		p.notify = ev.kind == linkSubscribed
-		p.mu.Unlock()
-		slog.Info("bluetooth: central changed its subscription", "subscribed", ev.kind == linkSubscribed)
-	case linkConnected:
-		slog.Info("bluetooth: device connected", "device", string(ev.device))
-	case linkDisconnected:
-		// Before the first write nobody has said which device is the central, so any device
-		// leaving counts, as it does in the SDK: a reset the handler did not need is harmless, a
-		// missed one leaves a dead session open.
-		p.mu.Lock()
-		ours := p.device == "" || p.device == ev.device
-		if ours {
-			p.device = ""
-			p.mtu = p.cfg.AssumedMTU
-			p.notify = false
-		}
-		p.mu.Unlock()
-		slog.Info("bluetooth: device disconnected", "device", string(ev.device), "central", ours)
-		if ours {
-			h.OnDisconnect()
-		}
-	}
-}
-
-// Send notifies each packet on TX, in order, Stagger apart.
-func (p *Peripheral) Send(packets [][]byte) error {
-	for i, packet := range packets {
-		if i > 0 && p.cfg.Stagger > 0 {
+	ch := make(chan *dbus.Signal, 64)
+	c.conn.Signal(ch)
+	ctx, cancel := context.WithCancel(context.Background())
+	c.stop = cancel
+	go func() {
+		for {
 			select {
-			case <-p.done:
-				return ErrPeripheralClosed
-			case <-time.After(p.cfg.Stagger):
+			case <-ctx.Done():
+				c.conn.RemoveSignal(ch)
+				return
+			case s := <-ch:
+				if s == nil {
+					return
+				}
+				c.signal(s)
 			}
 		}
-		p.mu.Lock()
-		conn, subscribed := p.conn, p.notify
-		p.value = bytes.Clone(packet)
-		p.mu.Unlock()
-		select {
-		case <-p.done:
-			return ErrPeripheralClosed
-		default:
-		}
-		if conn == nil {
-			return errors.New("bluez: the peripheral is not started")
-		}
-		if !subscribed {
-			return errors.New("bluez: the central is not subscribed to notifications")
-		}
-		changed := map[string]dbus.Variant{"Value": dbus.MakeVariant(packet)}
-		if err := conn.Emit(gattTXPath, propsIfc+".PropertiesChanged", gattChrcIfc, changed, []string{}); err != nil {
-			return fmt.Errorf("bluez: notify: %w", err)
-		}
-	}
+	}()
 	return nil
 }
 
-// MTU is the ATT MTU of the current link, or the assumed one until a write has reported it.
-func (p *Peripheral) MTU() int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.mtu
+func (c *Central) signal(s *dbus.Signal) {
+	switch s.Name {
+	case objMgrIfc + ".InterfacesRemoved":
+		if len(s.Body) < 2 {
+			return
+		}
+		path, _ := s.Body[0].(dbus.ObjectPath)
+		ifcs, _ := s.Body[1].([]string)
+		for _, i := range ifcs {
+			if i == deviceIfc || i == adapterIfc {
+				c.gone(func(l *link) bool {
+					return l.path == path || strings.HasPrefix(string(l.path), string(path)+"/")
+				})
+			}
+		}
+		return
+	case "org.freedesktop.DBus.NameOwnerChanged":
+		// bluetoothd went (or came back with nothing connected): every link went with it.
+		c.gone(func(*link) bool { return true })
+		return
+	case propsIfc + ".PropertiesChanged":
+	default:
+		return
+	}
+	if len(s.Body) < 2 {
+		return
+	}
+	ifc, _ := s.Body[0].(string)
+	props, _ := s.Body[1].(map[string]dbus.Variant)
+	switch ifc {
+	case deviceIfc:
+		v, ok := props["Connected"]
+		if on, _ := v.Value().(bool); !ok || on {
+			return
+		}
+		c.gone(func(l *link) bool { return l.path == s.Path })
+	case gattCharIfc:
+		// Only for a characteristic notifying through StartNotify: bluetoothd also changes Value
+		// after a read, and a read is answered on its own.
+		v, ok := props["Value"]
+		if !ok {
+			return
+		}
+		data, _ := v.Value().([]byte)
+		addr, handle, ok := c.notifier(s.Path)
+		if ok && c.value != nil {
+			c.value(addr, handle, data)
+		}
+	}
 }
 
-// Disconnect drops the central that last wrote. With none it does nothing.
-func (p *Peripheral) Disconnect() error {
-	p.mu.Lock()
-	conn, device := p.conn, p.device
-	p.mu.Unlock()
-	if conn == nil || device == "" {
+// notifier finds which device's notifying characteristic path is.
+func (c *Central) notifier(path dbus.ObjectPath) (string, uint16, bool) {
+	h, ok := handleOf(path)
+	if !ok {
+		return "", 0, false
+	}
+	h = valueHandle(h)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for a, l := range c.links {
+		if _, on := l.notifying[h]; on && strings.HasPrefix(string(path), string(l.path)+"/") {
+			return a, h, true
+		}
+	}
+	return "", 0, false
+}
+
+// gone forgets the links that match, which went without being asked to, and tells lost of each.
+func (c *Central) gone(match func(*link) bool) {
+	var addrs []string
+	var stops []func()
+	c.mu.Lock()
+	for a, l := range c.links {
+		if !l.closing && match(l) {
+			addrs = append(addrs, a)
+			stops = append(stops, c.drop(a, l)...)
+		}
+	}
+	c.mu.Unlock()
+	stopAll(stops)
+	if c.lost != nil {
+		for _, a := range addrs {
+			c.lost(a)
+		}
+	}
+}
+
+// drop forgets a link and returns what stops its notifications. Called with mu held; the caller runs
+// them after letting go of it, since each can be a call to bluetoothd.
+func (c *Central) drop(address string, l *link) []func() {
+	stops := make([]func(), 0, len(l.notifying))
+	for _, stop := range l.notifying {
+		stops = append(stops, stop)
+	}
+	delete(c.links, address)
+	return stops
+}
+
+func stopAll(stops []func()) {
+	for _, stop := range stops {
+		stop()
+	}
+}
+
+// Connected reports whether there is a link to the device.
+func (c *Central) Connected(address string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, ok := c.links[strings.ToUpper(address)]
+	return ok
+}
+
+// Connect opens a GATT connection to an LE device and waits for bluetoothd to have read its
+// services, then reports the ATT MTU. random says the address is a random one, which only matters
+// for a device bluetoothd has not heard yet.
+func (c *Central) Connect(ctx context.Context, address string, random bool) (int, error) {
+	address = strings.ToUpper(address)
+	path, err := c.devicePath(address)
+	if err != nil {
+		return 0, err
+	}
+	if path == "" {
+		// Not heard yet: ConnectDevice makes the device and connects it in one call. It is
+		// experimental in bluetoothd (-E) and fails without it, the same as an unknown device.
+		kind := "public"
+		if random {
+			kind = "random"
+		}
+		args := map[string]dbus.Variant{"Address": dbus.MakeVariant(address), "AddressType": dbus.MakeVariant(kind)}
+		if err := c.conn.Object(service, c.adapter).CallWithContext(ctx, adapterIfc+".ConnectDevice", 0, args).Store(&path); err != nil {
+			return 0, fmt.Errorf("bluez: %s not found: %w", address, err)
+		}
+	} else {
+		err := c.conn.Object(service, path).CallWithContext(ctx, deviceIfc+".Connect", 0).Err
+		if err != nil && !strings.Contains(err.Error(), "AlreadyConnected") {
+			return 0, fmt.Errorf("bluez: connecting %s: %w", address, err)
+		}
+	}
+	if err := c.resolved(ctx, path); err != nil {
+		_ = c.conn.Object(service, path).Call(deviceIfc+".Disconnect", 0).Err
+		return 0, err
+	}
+
+	l := &link{path: path, notifying: map[uint16]func(){}}
+	var stops []func()
+	c.mu.Lock()
+	if old, ok := c.links[address]; ok {
+		stops = c.drop(address, old)
+	}
+	c.links[address] = l
+	c.mu.Unlock()
+	stopAll(stops)
+
+	mtu := defaultMTU
+	if _, err := c.Services(address); err == nil {
+		// Any characteristic says the link's MTU.
+		var char dbus.ObjectPath
+		c.mu.Lock()
+		for _, a := range l.attrs {
+			if a.ifc == gattCharIfc {
+				char = a.path
+				break
+			}
+		}
+		c.mu.Unlock()
+		if char != "" {
+			if v, err := c.conn.Object(service, char).GetProperty(gattCharIfc + ".MTU"); err == nil {
+				if m, ok := v.Value().(uint16); ok && int(m) > mtu {
+					mtu = int(m)
+				}
+			}
+		}
+	}
+	return mtu, nil
+}
+
+// resolved waits for a connected device's services to be discovered.
+func (c *Central) resolved(ctx context.Context, path dbus.ObjectPath) error {
+	o := c.conn.Object(service, path)
+	t := time.NewTicker(100 * time.Millisecond)
+	defer t.Stop()
+	for {
+		connected, _ := o.GetProperty(deviceIfc + ".Connected")
+		if on, _ := connected.Value().(bool); !on {
+			// Connect returns once the link is up; a device that drops it straight away is gone.
+			return fmt.Errorf("bluez: %s disconnected", path)
+		}
+		done, _ := o.GetProperty(deviceIfc + ".ServicesResolved")
+		if ok, _ := done.Value().(bool); ok {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("bluez: waiting for services: %w", ctx.Err())
+		case <-t.C:
+		}
+	}
+}
+
+// devicePath is where bluetoothd has the device, or "" when it doesn't know it. bluetoothd names a
+// device's object after its address, so this asks about that one object rather than reading every
+// device it knows, which near a busy street is hundreds.
+func (c *Central) devicePath(address string) (dbus.ObjectPath, error) {
+	path := dbus.ObjectPath(string(c.adapter) + "/dev_" + strings.ReplaceAll(strings.ToUpper(address), ":", "_"))
+	v, err := c.conn.Object(service, path).GetProperty(deviceIfc + ".Address")
+	if err != nil {
+		var de dbus.Error
+		if errors.As(err, &de) && strings.HasPrefix(de.Name, "org.freedesktop.DBus.Error.") {
+			return "", nil // no such object, or no Device1 on it
+		}
+		return "", fmt.Errorf("bluez: %s: %w", address, err)
+	}
+	if a, _ := v.Value().(string); !strings.EqualFold(a, address) {
+		return "", nil
+	}
+	return path, nil
+}
+
+// Known waits for bluetoothd to know the device, which it forgets a while after a connection ends
+// and learns again from its next advertisement. Scanning must be on for that.
+func (c *Central) Known(ctx context.Context, address string) error {
+	t := time.NewTicker(200 * time.Millisecond)
+	defer t.Stop()
+	for {
+		path, err := c.devicePath(strings.ToUpper(address))
+		if err != nil || path != "" {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("bluez: %s not heard: %w", address, ctx.Err())
+		case <-t.C:
+		}
+	}
+}
+
+// Disconnect drops the link to a device.
+func (c *Central) Disconnect(ctx context.Context, address string) error {
+	address = strings.ToUpper(address)
+	c.mu.Lock()
+	l, ok := c.links[address]
+	var stops []func()
+	if ok {
+		l.closing = true
+		stops = c.drop(address, l)
+	}
+	c.mu.Unlock()
+	if !ok {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
-	defer cancel()
-	if err := conn.Object(service, device).CallWithContext(ctx, deviceIfc+".Disconnect", 0).Err; err != nil && !gone(err) {
-		return fmt.Errorf("bluez: disconnect %s: %w", device, err)
+	stopAll(stops)
+	err := c.conn.Object(service, l.path).CallWithContext(ctx, deviceIfc+".Disconnect", 0).Err
+	if err != nil && strings.Contains(err.Error(), "NotConnected") {
+		return nil
 	}
-	return nil
+	return err
 }
 
-// gone is bluetoothd saying the thing to undo is not there, which is what undoing wanted.
-func gone(err error) bool {
-	for _, name := range []string{"DoesNotExist", "UnknownObject", "NotConnected"} {
-		if strings.Contains(err.Error(), name) {
+// Pair bonds with a device the way a light bulb is bonded: no code on either side (Just Works), and
+// the bond kept and the device trusted so it can reconnect. A device already paired is a success.
+// Only this device is touched; the pairings of phones and speakers are not.
+func (c *Central) Pair(ctx context.Context, address string) error {
+	path, err := c.devicePath(strings.ToUpper(address))
+	if err != nil {
+		return err
+	}
+	if path == "" {
+		return fmt.Errorf("bluez: %s not known", address)
+	}
+	proxyPairingSet(path, true)
+	defer proxyPairingSet(path, false)
+	obj := c.conn.Object(service, path)
+	err = obj.CallWithContext(ctx, deviceIfc+".Pair", 0).Err
+	if err != nil && ctx.Err() != nil {
+		// Out of time: tell bluetoothd to stop, or it keeps trying to bond.
+		_ = obj.Call(deviceIfc+".CancelPairing", dbus.FlagNoReplyExpected).Err
+	}
+	if err != nil && !strings.Contains(err.Error(), "AlreadyExists") {
+		return err
+	}
+	return obj.SetProperty(deviceIfc+".Trusted", dbus.MakeVariant(true))
+}
+
+// Unpair drops a device's bond and forgets the device, which removes its keys and cached services.
+// Other devices are not touched. A device bluetoothd does not know is a success.
+func (c *Central) Unpair(ctx context.Context, address string) error {
+	// The device's own pairings are refused before anything is done to them: a phone or a speaker
+	// playing through the device keeps its link.
+	path, err := c.devicePath(strings.ToUpper(address))
+	if err != nil || path == "" {
+		return err
+	}
+	props := map[string]dbus.Variant{}
+	if err := c.conn.Object(service, path).CallWithContext(ctx, propsIfc+".GetAll", 0, deviceIfc).Store(&props); err != nil {
+		return fmt.Errorf("bluez: %s: %w", address, err)
+	}
+	if ownPairing(props) {
+		return fmt.Errorf("bluez: %s is paired for audio or calls on this device, not unpaired", address)
+	}
+	if err := c.Disconnect(ctx, address); err != nil {
+		return err
+	}
+	return c.conn.Object(service, c.adapter).CallWithContext(ctx, adapterIfc+".RemoveDevice", 0, path).Err
+}
+
+// ownPairing is whether a device's properties say it is one of the device's own pairings: bonded
+// and an audio or hands-free peer (a phone or a speaker), by profile, icon or class of device.
+func ownPairing(props map[string]dbus.Variant) bool {
+	if paired, _ := props["Paired"].Value().(bool); !paired {
+		return false
+	}
+	uuids, _ := props["UUIDs"].Value().([]string)
+	for _, u := range uuids {
+		u = strings.ToLower(u)
+		if strings.HasPrefix(u, "0000") && strings.HasSuffix(u, "-0000-1000-8000-00805f9b34fb") {
+			switch u[4:8] {
+			case "110a", "110b", "110c", "110e", "111e", "111f", "1108", "1112":
+				return true
+			}
+		}
+	}
+	switch icon, _ := props["Icon"].Value().(string); icon {
+	case "phone", "audio-headset", "audio-headphones", "audio-card":
+		return true
+	}
+	if class, ok := props["Class"].Value().(uint32); ok {
+		if major := class >> 8 & 0x1f; major == 0x02 || major == 0x04 {
 			return true
 		}
 	}
 	return false
 }
 
-// Close stops advertising, drops the central, unregisters the service, and gives the adapter back the
-// properties Start changed. It may be called more than once and after a failed Start. A step that
-// fails does not stop the ones after it, and closing the connection makes bluetoothd drop whatever
-// was still registered.
-func (p *Peripheral) Close() error {
-	var errs []error
-	p.closing.Do(func() {
-		close(p.done)
-		p.mu.Lock()
-		conn, adapter, changes := p.conn, p.adapter, p.changes
-		p.mu.Unlock()
-		if conn == nil {
-			return
-		}
-		defer conn.Close()
-		if adapter == nil {
-			return
-		}
-		call := func(what, method string, args ...any) {
-			ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
-			defer cancel()
-			if err := adapter.CallWithContext(ctx, method, 0, args...).Err; err != nil && !gone(err) {
-				errs = append(errs, fmt.Errorf("bluez: %s: %w", what, err))
+// Services reads a connected device's attributes, in handle order.
+func (c *Central) Services(address string) ([]Service, error) {
+	address = strings.ToUpper(address)
+	c.mu.Lock()
+	l, ok := c.links[address]
+	c.mu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("bluez: %s not connected", address)
+	}
+	objs, err := c.objects()
+	if err != nil {
+		return nil, err
+	}
+	services, attrs := tree(l.path, objs)
+	c.mu.Lock()
+	l.attrs = attrs
+	c.mu.Unlock()
+	return services, nil
+}
+
+// tree builds the attribute table of the device at path from what bluetoothd exports.
+func tree(path dbus.ObjectPath, objs map[dbus.ObjectPath]map[string]map[string]dbus.Variant) ([]Service, map[uint16]attribute) {
+	attrs := map[uint16]attribute{}
+	byService := map[dbus.ObjectPath]*Service{}
+	byChar := map[dbus.ObjectPath]*Characteristic{}
+	prefix := string(path) + "/"
+
+	str := func(props map[string]dbus.Variant, k string) string {
+		s, _ := props[k].Value().(string)
+		return strings.ToLower(s)
+	}
+	// Services, then characteristics, then descriptors, so each has its parent to go under.
+	for _, ifc := range []string{gattServiceIfc, gattCharIfc, gattDescIfc} {
+		for p, ifcs := range objs {
+			props, ok := ifcs[ifc]
+			if !ok || !strings.HasPrefix(string(p), prefix) {
+				continue
 			}
-		}
-		call("unregister advertisement", advMgrIfc+".UnregisterAdvertisement", advPath)
-		if err := p.Disconnect(); err != nil {
-			errs = append(errs, err)
-		}
-		call("unregister gatt application", gattMgrIfc+".UnregisterApplication", gattAppPath)
-		for i := len(changes) - 1; i >= 0; i-- {
-			c := changes[i]
-			ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
-			var now dbus.Variant
-			err := adapter.CallWithContext(ctx, propsIfc+".Get", 0, adapterIfc, c.prop).Store(&now)
-			switch {
-			case err != nil:
-				errs = append(errs, fmt.Errorf("bluez: read adapter %s: %w", c.prop, err))
-			case now.Value() != c.set.Value():
-				// Someone else has set it since, the earbuds feature opening its own pairing
-				// mode for one. Theirs is the newer intent.
-				slog.Info("bluetooth: adapter property changed during setup; leaving it", "property", c.prop)
-			default:
-				if err := adapter.CallWithContext(ctx, propsIfc+".Set", 0, adapterIfc, c.prop, c.was).Err; err != nil {
-					errs = append(errs, fmt.Errorf("bluez: restore adapter %s: %w", c.prop, err))
+			h, ok := handleOf(p)
+			if !ok {
+				continue
+			}
+			parent := dbus.ObjectPath(string(p)[:strings.LastIndex(string(p), "/")])
+			uuid := str(props, "UUID")
+			switch ifc {
+			case gattServiceIfc:
+				byService[p] = &Service{Handle: h, UUID: uuid}
+				attrs[h] = attribute{path: p, ifc: ifc, uuid: uuid}
+			case gattCharIfc:
+				if _, ok := byService[parent]; !ok {
+					continue
 				}
+				h = valueHandle(h)
+				flags, _ := props["Flags"].Value().([]string)
+				byChar[p] = &Characteristic{Handle: h, UUID: uuid, Flags: flags}
+				attrs[h] = attribute{path: p, ifc: ifc, uuid: uuid}
+			case gattDescIfc:
+				ch, ok := byChar[parent]
+				if !ok {
+					continue
+				}
+				ch.Descriptors = append(ch.Descriptors, Descriptor{Handle: h, UUID: uuid})
+				attrs[h] = attribute{path: p, ifc: ifc, uuid: uuid, char: ch.Handle}
 			}
-			cancel()
 		}
-		slog.Info("bluetooth: peripheral closed", "name", p.cfg.LocalName)
+	}
+	for p, ch := range byChar {
+		sort.Slice(ch.Descriptors, func(i, j int) bool { return ch.Descriptors[i].Handle < ch.Descriptors[j].Handle })
+		s := byService[dbus.ObjectPath(string(p)[:strings.LastIndex(string(p), "/")])]
+		s.Characteristics = append(s.Characteristics, *ch)
+	}
+	out := make([]Service, 0, len(byService))
+	for _, s := range byService {
+		sort.Slice(s.Characteristics, func(i, j int) bool { return s.Characteristics[i].Handle < s.Characteristics[j].Handle })
+		out = append(out, *s)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Handle < out[j].Handle })
+	return out, attrs
+}
+
+// valueHandle is a characteristic's value handle from its declaration's, which bluetoothd names
+// it by: the value comes straight after the declaration (Core Specification, Vol 3, Part G, 3.3).
+func valueHandle(declaration uint16) uint16 { return declaration + 1 }
+
+// handleOf reads the ATT handle out of an attribute's object path: the hex after service, char or
+// desc in its last element, as bluetoothd names them (.../service000c/char000d/desc000f).
+func handleOf(path dbus.ObjectPath) (uint16, bool) {
+	last := string(path)[strings.LastIndex(string(path), "/")+1:]
+	for _, p := range []string{"service", "char", "desc"} {
+		if hex, ok := strings.CutPrefix(last, p); ok && len(hex) == 4 {
+			v, err := strconv.ParseUint(hex, 16, 16)
+			return uint16(v), err == nil
+		}
+	}
+	return 0, false
+}
+
+func (c *Central) attribute(address string, handle uint16) (attribute, error) {
+	address = strings.ToUpper(address)
+	c.mu.Lock()
+	l, ok := c.links[address]
+	var a attribute
+	found, loaded := false, false
+	if ok {
+		a, found = l.attrs[handle]
+		loaded = l.attrs != nil
+	}
+	c.mu.Unlock()
+	if !ok {
+		return attribute{}, fmt.Errorf("bluez: %s not connected", address)
+	}
+	if !found && !loaded {
+		// A client with services it read on an earlier connection asks without reading them again;
+		// they are read once for the connection. An unknown handle after that is the client's.
+		if _, err := c.Services(address); err != nil {
+			return attribute{}, err
+		}
+		c.mu.Lock()
+		a, found = l.attrs[handle]
+		c.mu.Unlock()
+	}
+	if !found {
+		return attribute{}, fmt.Errorf("bluez: %s has no handle 0x%04x", address, handle)
+	}
+	return a, nil
+}
+
+// Read reads a characteristic's or a descriptor's value.
+func (c *Central) Read(ctx context.Context, address string, handle uint16) ([]byte, error) {
+	a, err := c.attribute(address, handle)
+	if err != nil {
+		return nil, err
+	}
+	if a.ifc == gattServiceIfc {
+		return nil, fmt.Errorf("bluez: handle 0x%04x is a service", handle)
+	}
+	var data []byte
+	err = c.conn.Object(service, a.path).CallWithContext(ctx, a.ifc+".ReadValue", 0, map[string]dbus.Variant{}).Store(&data)
+	return data, err
+}
+
+// Write writes a characteristic's or a descriptor's value, waiting for the device to acknowledge it
+// when response is set (a characteristic's write request rather than a command). A write to a
+// characteristic's configuration descriptor turns its notifications on or off instead, since
+// bluetoothd keeps that descriptor for itself.
+func (c *Central) Write(ctx context.Context, address string, handle uint16, data []byte, response bool) error {
+	a, err := c.attribute(address, handle)
+	if err != nil {
+		return err
+	}
+	switch a.ifc {
+	case gattDescIfc:
+		if a.uuid == cccd {
+			return c.Notify(ctx, address, a.char, len(data) > 0 && data[0]&0x03 != 0)
+		}
+		return c.conn.Object(service, a.path).CallWithContext(ctx, gattDescIfc+".WriteValue", 0, data, map[string]dbus.Variant{}).Err
+	case gattCharIfc:
+		kind := "command"
+		if response {
+			kind = "request"
+		}
+		opts := map[string]dbus.Variant{"type": dbus.MakeVariant(kind)}
+		return c.conn.Object(service, a.path).CallWithContext(ctx, gattCharIfc+".WriteValue", 0, data, opts).Err
+	}
+	return fmt.Errorf("bluez: handle 0x%04x is a service", handle)
+}
+
+// Notify turns a characteristic's notifications or indications on or off. What it sends arrives at
+// the value callback.
+//
+// AcquireNotify is tried first: it hands over a socket that carries only notifications, where
+// StartNotify reports them as changes to Value, which a read changes too. It is offered only for a
+// characteristic that notifies rather than indicates, and only while no one else has notifications
+// on it; StartNotify covers the rest.
+func (c *Central) Notify(ctx context.Context, address string, handle uint16, on bool) error {
+	address = strings.ToUpper(address)
+	a, err := c.attribute(address, handle)
+	if err != nil {
+		return err
+	}
+	if a.ifc != gattCharIfc {
+		return fmt.Errorf("bluez: handle 0x%04x is not a characteristic", handle)
+	}
+	c.mu.Lock()
+	l, ok := c.links[address]
+	if !ok {
+		c.mu.Unlock()
+		return fmt.Errorf("bluez: %s not connected", address)
+	}
+	stop, running := l.notifying[handle]
+	if !on && running {
+		delete(l.notifying, handle)
+	}
+	c.mu.Unlock()
+	if !on {
+		if running {
+			stop()
+		}
+		return nil
+	}
+	if running {
+		return nil
+	}
+
+	o := c.conn.Object(service, a.path)
+	var fd dbus.UnixFD
+	var mtu uint16
+	if err := o.CallWithContext(ctx, gattCharIfc+".AcquireNotify", 0, map[string]dbus.Variant{}).Store(&fd, &mtu); err == nil {
+		// Non-blocking, so the runtime polls it and Close wakes the reader.
+		if err := unix.SetNonblock(int(fd), true); err != nil {
+			_ = unix.Close(int(fd))
+			return fmt.Errorf("bluez: notify socket: %w", err)
+		}
+		f := os.NewFile(uintptr(fd), "notify")
+		c.notifying(address, l, handle, func() { _ = f.Close() })
+		go c.relay(address, handle, f, int(mtu))
+		return nil
+	} else {
+		slog.Debug("bluez: AcquireNotify unavailable, using StartNotify", "handle", handle, "err", err)
+	}
+
+	// Registered before StartNotify, so a notification sent straight away is not missed.
+	c.notifying(address, l, handle, func() {
+		if err := o.Call(gattCharIfc+".StopNotify", 0).Err; err != nil {
+			slog.Debug("bluez: StopNotify", "handle", handle, "err", err)
+		}
 	})
-	return errors.Join(errs...)
-}
-
-// gattApp is the application root: org.freedesktop.DBus.ObjectManager over the tree.
-type gattApp struct {
-	tree map[dbus.ObjectPath]map[string]map[string]dbus.Variant
-}
-
-func (a gattApp) GetManagedObjects() (map[dbus.ObjectPath]map[string]map[string]dbus.Variant, *dbus.Error) {
-	return a.tree, nil
-}
-
-// properties is org.freedesktop.DBus.Properties over fixed values, by interface.
-type properties map[string]map[string]dbus.Variant
-
-func (p properties) GetAll(ifc string) (map[string]dbus.Variant, *dbus.Error) {
-	if props, ok := p[ifc]; ok {
-		return props, nil
+	err = o.CallWithContext(ctx, gattCharIfc+".StartNotify", 0).Err
+	if err != nil && !strings.Contains(err.Error(), "InProgress") {
+		c.mu.Lock()
+		delete(l.notifying, handle)
+		c.mu.Unlock()
+		return err
 	}
-	return map[string]dbus.Variant{}, nil
-}
-
-func (p properties) Get(ifc, name string) (dbus.Variant, *dbus.Error) {
-	if v, ok := p[ifc][name]; ok {
-		return v, nil
-	}
-	return dbus.Variant{}, dbus.NewError("org.freedesktop.DBus.Error.UnknownProperty", []any{ifc + "." + name})
-}
-
-// rxChrc acknowledges writes. Their content was taken by intercept.
-type rxChrc struct{}
-
-func (rxChrc) WriteValue([]byte, map[string]dbus.Variant) *dbus.Error { return nil }
-
-// txChrc acknowledges subscriptions, which intercept also took, and answers reads.
-type txChrc struct{ p *Peripheral }
-
-func (c txChrc) ReadValue(map[string]dbus.Variant) ([]byte, *dbus.Error) {
-	c.p.mu.Lock()
-	defer c.p.mu.Unlock()
-	return append([]byte{}, c.p.value...), nil
-}
-
-func (txChrc) StartNotify() *dbus.Error { return nil }
-func (txChrc) StopNotify() *dbus.Error  { return nil }
-
-// advert is org.bluez.LEAdvertisement1.
-type advert struct{}
-
-// Release is bluetoothd dropping the advertisement itself, when the adapter is powered off under it.
-func (advert) Release() *dbus.Error {
-	slog.Warn("bluetooth: bluetoothd released the advertisement")
 	return nil
+}
+
+func (c *Central) notifying(address string, l *link, handle uint16, stop func()) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.links[address] != l {
+		// Disconnected meanwhile: nothing to keep running.
+		go stop()
+		return
+	}
+	l.notifying[handle] = stop
+}
+
+// relay passes on what arrives on an AcquireNotify socket, one notification per read, until it is
+// closed.
+func (c *Central) relay(address string, handle uint16, f *os.File, mtu int) {
+	defer f.Close()
+	if mtu < defaultMTU {
+		mtu = 512
+	}
+	buf := make([]byte, mtu)
+	for {
+		n, err := f.Read(buf)
+		if err != nil {
+			return
+		}
+		if c.value != nil {
+			c.value(address, handle, append([]byte(nil), buf[:n]...))
+		}
+	}
 }

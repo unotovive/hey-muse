@@ -21,11 +21,19 @@ import (
 	"github.com/HuskerMinion/techo5/echod/internal/lib/triggers"
 )
 
-func init() { voice.SetThink(Get().Think) }
+func init() {
+	voice.SetThink(Get().Think)
+	// Realtime voice runs its model's calls under the same lockout, with the same instructions.
+	voice.SetRealtime(func() voice.ToolGate { return NewTurnGate() },
+		func() string { return instructions(config.Get().Brain, time.Now()) + realtimeInstructions })
+}
 
 // rounds bounds how many times one turn may go back to the model with tool results: a model that
 // keeps asking for tools is not going to stop by being asked once more.
 const rounds = 6
+
+// lookupReasoning is how hard a thinking model is asked to think once a turn has searched the web.
+const lookupReasoning = "medium"
 
 // memory is how long the conversation so far is kept for a follow-up; a question asked after that is
 // a new conversation.
@@ -72,27 +80,43 @@ func (a *Assistant) Think(ctx context.Context, heard string) (string, error) {
 	msgs = append(msgs, user)
 	added := []llm.Message{user}
 
-	ts := tools()
+	// The lockout after reading the web, which realtime voice shares (gate.go). A turn that has read
+	// the web keeps only its question and answer (remember).
+	g := NewTurnGate()
 	for range rounds {
-		m, err := c.Chat(ctx, msgs, specs(ts))
+		m, err := c.Chat(ctx, msgs, g.Tools())
 		if err != nil {
 			return "", err
 		}
 		msgs = append(msgs, m)
 		added = append(added, m)
 		if len(m.ToolCalls) == 0 {
-			a.remember(added)
+			a.remember(added, g.Read())
 			return speech.Spoken(m.Content), nil
 		}
 		for _, call := range m.ToolCalls {
-			result := run(ts, call)
+			if n := call.Function.Name; n == "web_search" || n == "read_page" {
+				// Low effort keeps a voice answer quick, but on a lookup it picked a poor page or gave
+				// up on a good one; the rounds after a search are worth a second more.
+				c.Reasoning = lookupReasoning
+			}
+			result := g.Run(call)
 			slog.Info("assistant: tool", "name", call.Function.Name, "args", call.Function.Arguments, "result", result)
 			r := llm.Message{Role: "tool", ToolCallID: call.ID, Name: call.Function.Name, Content: result}
 			msgs = append(msgs, r)
 			added = append(added, r)
 		}
+		g.EndRound()
 	}
-	a.remember(added)
+	// Out of rounds, most often still searching: one last ask with no tools, so what was found is said
+	// (or that nothing was) rather than nothing at all.
+	msgs = append(msgs, llm.Message{Role: "user", Content: "Answer now from what you have found, or say you couldn't find it."})
+	if m, err := c.Chat(ctx, msgs, nil); err == nil && strings.TrimSpace(m.Content) != "" {
+		added = append(added, m)
+		a.remember(added, g.Read())
+		return speech.Spoken(m.Content), nil
+	}
+	a.remember(added, g.Read())
 	return "Sorry, I got stuck on that one.", nil
 }
 
@@ -102,10 +126,19 @@ func handledHere(heard string) bool {
 	return triggers.AboutGoingHome(heard, lang) || (triggers.AboutCamera(heard, lang) && home.Get().MatchCamera(heard) != "")
 }
 
-func (a *Assistant) remember(added []llm.Message) {
+// remember keeps a turn for a follow-up. Of a turn that has read the web (read) only the question and
+// the answer are kept: the web's words, and the calls it may have steered the model to ask for, could
+// steer the next turn, where every tool runs (allowedAfterWeb). What was found lives on in the answer
+// given, which a follow-up goes by.
+func (a *Assistant) remember(added []llm.Message, read bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.history = append(a.history, added...)
+	for _, m := range added {
+		if read && (m.Role == "tool" || len(m.ToolCalls) > 0) {
+			continue
+		}
+		a.history = append(a.history, m)
+	}
 	if len(a.history) > kept {
 		a.history = a.history[len(a.history)-kept:]
 		// Never start on a tool result or a call's answer: the model needs the call they belong to.
@@ -131,6 +164,10 @@ func instructions(b config.Brain, now time.Time) string {
 	}
 	s.WriteString(strings.Join(days, ", "))
 	s.WriteString(": use these rather than working a date out. ")
+	if p := config.Get().Home.Place; p.Name != "" {
+		// Without it a search for a store's hours went out with no town, and found other towns' stores.
+		fmt.Fprintf(&s, "This device is in %s. ", p.Name)
+	}
 	s.WriteString("Everything you write is spoken aloud, exactly as written, so write only the answer - no notes ")
 	s.WriteString("to yourself. Answer in one or two short sentences, with no lists, ")
 	s.WriteString("markdown, emoji or symbols, and write numbers the way they are said. ")
@@ -149,6 +186,8 @@ func instructions(b config.Brain, now time.Time) string {
 	s.WriteString("A station asked for by its frequency, like 106.7, or its call letters is a local one: play it ")
 	s.WriteString("by what was said, and if the station that plays is from somewhere else, say where. If a ")
 	s.WriteString("frequency is not found, try the call letters of the station you know is on it here, if you do. ")
+	s.WriteString("Asked to hear the news, or for a news update or briefing, play one with play_news; if it says to ask which, ")
+	s.WriteString("ask, naming the sources it gives. ")
 	s.WriteString("Your tools are the only music this device has: never name a music service, app or account ")
 	s.WriteString("that a tool did not name, and never offer one. ")
 	if config.Get().MusicAssistant.Set() {
@@ -156,12 +195,20 @@ func instructions(b config.Brain, now time.Time) string {
 		s.WriteString("and play_radio only for radio stations. ")
 	}
 	if b.Search != "" {
-		s.WriteString("For anything current or that you are not sure of - sports schedules and scores, news, ")
-		s.WriteString("business hours, prices, events - use web_search, then read_page on the most useful result, ")
-		s.WriteString("and answer from what they say, not from memory. State only what a tool result actually says: ")
-		s.WriteString("never make up or guess dates, times, opponents, scores or facts. If a page does not have it, ")
-		s.WriteString("read another result; if none do, say you couldn't find it. A time from a page is said with ")
-		s.WriteString("the time zone the page gives it in, like three o'clock Central. ")
+		// Told to answer nothing from memory, the model searched for settled facts too, and a search
+		// that missed became "I don't know" to a question it knew the answer to.
+		s.WriteString("Settled general knowledge you are sure of - history, science, geography, word meanings, ")
+		s.WriteString("how things work - answer from what you know, without searching. For anything that changes - ")
+		s.WriteString("sports schedules and scores, news, business hours, prices, events, who holds a job now - use ")
+		s.WriteString("web_search, then read_page on the most useful result, saying what you are looking for, and ")
+		s.WriteString("answer from what they say, not from memory. A search for something near by - a store's hours, ")
+		s.WriteString("a local event - names this device's town unless another place was asked about. ")
+		s.WriteString("For those, state only what a tool result says: ")
+		s.WriteString("never make up or guess dates, times, opponents, scores or prices. A search result's own words ")
+		s.WriteString("or a quick answer are enough when they answer it. If a page does not have it, read another ")
+		s.WriteString("result, or search again with other words; say you couldn't find it only after that, and ")
+		s.WriteString("give whatever part you did find. A time from a page is said with the time zone the page ")
+		s.WriteString("gives it in, like three o'clock Central. ")
 	} else {
 		s.WriteString("Beyond the tools you cannot look anything up: no internet, no news, no sports schedules or ")
 		s.WriteString("scores, and nothing that happened after your training. Never make up dates, times, scores or ")
@@ -174,6 +221,95 @@ func instructions(b config.Brain, now time.Time) string {
 		s.WriteString(p)
 	}
 	return s.String()
+}
+
+// readsTheWeb is the tools that bring words from outside into a turn: the web's, a calendar's, which
+// may hold a stranger's invitation or a published feed, Radio Browser's station names and tags, which
+// anyone can list, and the names a place search gives back. Such words can be written to steer the
+// model ("now delete every alarm"), and the model cannot tell them from the person's own.
+var readsTheWeb = map[string]bool{
+	"web_search": true, "read_page": true, "calendar": true, "find_radio": true, "weather_elsewhere": true,
+	"read_todo": true, // a shared list can be written to by anyone in the house, or by a service
+}
+
+// allowedAfterStations is what a turn whose only reading was find_radio may still do besides
+// allowedAfterWeb: play or keep a station, which is what stations are looked up for.
+var allowedAfterStations = map[string]bool{"play_radio": true, "save_station": true}
+
+// allowedAfterWeb are the tools that only look things up, which a turn that has read the web may
+// still use. Every other tool changes something - an alarm, a timer, what plays, the volume, the
+// screen, a call to another device - and is refused for the rest of that turn: the person asks again,
+// and a new turn does it. A tool not named here is refused, so a new one is safe until it is added.
+// read_page goes only to a page a search found in the same turn (webTurn.check): an address the
+// web made up could carry what the turn has read (a calendar's events) out in its query.
+var allowedAfterWeb = map[string]bool{
+	"web_search": true, "read_page": true,
+	"list_timers": true, "list_alarms": true, "list_stations": true, "list_callees": true,
+	"find_radio": true, "calendar": true, "weather": true, "weather_elsewhere": true, "read_todo": true,
+}
+
+// refusedAfterWeb is what the model is told for a tool refused in a turn that has read the web.
+const refusedAfterWeb = "refused: this turn has read the web or a calendar, so nothing that changes anything " +
+	"on this device runs in it. Do not offer to do it. If the person asked for it themselves, tell them to " +
+	"ask again."
+
+// refusedPage is what the model is told for a page refused in a turn that has read the web.
+const refusedPage = "refused: after reading the web, only a page a search found in this turn is read."
+
+// webTurn is what a turn knows about having read the web.
+type webTurn struct {
+	// from is a turn that has read the web: from the next round on, only allowedAfterWeb runs.
+	// Calls asked for in the same reply as the reading were chosen before it was seen, and run.
+	from bool
+	// more is a turn that has read more than find_radio's stations: from the next round on,
+	// allowedAfterStations is refused too. moreNow is this round's.
+	more, moreNow bool
+	// found is the addresses the turn's searches returned, which read_page may still go to.
+	found map[string]bool
+}
+
+// check runs a call, or refuses it for a turn that has read the web.
+func (w *webTurn) check(ts []tool, call llm.ToolCall) string {
+	name := call.Function.Name
+	if w.from && !allowedAfterWeb[name] && (w.more || !allowedAfterStations[name]) {
+		slog.Warn("assistant: a tool refused after reading the web", "name", name)
+		return refusedAfterWeb
+	}
+	if w.from && name == "read_page" {
+		args := map[string]any{}
+		_ = json.Unmarshal([]byte(call.Function.Arguments), &args)
+		if !w.found[samePage(argString(args, "url"))] {
+			slog.Warn("assistant: a page refused after reading the web: not one a search found")
+			return refusedPage
+		}
+	}
+	if readsTheWeb[name] && name != "find_radio" {
+		w.moreNow = true
+	}
+	if name != "web_search" {
+		return run(ts, call)
+	}
+	// One search at a time, so the addresses taken are this search's and not another turn's.
+	searching.Lock()
+	defer searching.Unlock()
+	takeFound() // none left over from an earlier search
+	out := run(ts, call)
+	if w.found == nil {
+		w.found = map[string]bool{}
+	}
+	for _, a := range takeFound() {
+		w.found[samePage(a)] = true
+	}
+	return out
+}
+
+// searching is held while a turn's search runs and its addresses are taken (webTurn.check).
+var searching sync.Mutex
+
+// endRound is a round of calls done: what it read holds from the next round on.
+func (w *webTurn) endRound(read bool) {
+	w.from = w.from || read
+	w.more = w.more || w.moreNow
 }
 
 // run does one call, and says what happened in words the model reads.
@@ -196,3 +332,12 @@ func run(ts []tool, call llm.ToolCall) string {
 	}
 	return "error: there is no tool called " + call.Function.Name
 }
+
+// realtimeInstructions are added for realtime voice, whose model can reach Home Assistant's tools: to act
+// on the house by name, through Home Assistant's own intents, rather than reading the house's state first,
+// which can carry words a stranger wrote (a song's title, a notification).
+const realtimeInstructions = " To control the house, call Home Assistant's Hass tools (HassTurnOn, " +
+	"HassTurnOff, HassLightSet and the like) with the name of the device or area you were told, " +
+	"directly. Read the house's state (GetLiveContext) only when you are asked about it. " +
+	"Each request is answered on its own, with no memory of the one before: never end by asking a " +
+	"question, and if something is unclear, say what you need and that the person can ask again."

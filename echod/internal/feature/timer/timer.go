@@ -56,6 +56,12 @@ const lostAfter = 10 * time.Second
 // ResumeWithin, and for the same reasons. Not imported: alarm imports this package.
 const resumeWithin = 2 * time.Minute
 
+// ForgetGrace is how long Home Assistant's timers are kept after it stops listening, in case the
+// link is only reconnecting: they are still Home Assistant's, and dropping them at once takes the
+// countdown off the screen and off the wall clock for a blink. A link that is back within it carries
+// on as if nothing happened; one that is not leaves a countdown this device can no longer follow.
+const ForgetGrace = time.Minute
+
 // Timers is every timer Home Assistant has told this device about.
 type Timers struct {
 	countdown *led.Claim
@@ -67,6 +73,10 @@ type Timers struct {
 
 	// woke is how a new timer restarts the redraw, which stops while there is nothing counting down.
 	woke chan struct{}
+
+	// forgetWait is a ForgetAfter waiting out its grace, closed to call it off if Home Assistant
+	// listens again before the grace runs out.
+	forgetWait chan struct{}
 
 	mu   sync.Mutex
 	held map[string]*timer
@@ -160,7 +170,7 @@ func Get() *Timers {
 }
 
 func build() *Timers {
-	return &Timers{
+	t := &Timers{
 		countdown: led.Get().Claim(led.PriorityTimer),
 		names: &esphome.TextSensor{
 			Base: esphome.Base{
@@ -173,6 +183,10 @@ func build() *Timers {
 		woke: make(chan struct{}, 1),
 		held: map[string]*timer{},
 	}
+	// No timers yet, the state the sensor returns to when the last one ends; until something was set,
+	// Home Assistant showed it as unknown.
+	t.names.Set("")
+	return t
 }
 
 func (t *Timers) Name() string { return "timers" }
@@ -182,7 +196,7 @@ func (t *Timers) Entities() []esphome.Entity { return []esphome.Entity{t.names} 
 // Actions let Home Assistant set and cancel the device's own timers, which run and ring here with Home
 // Assistant away. Its own timers, set by voice through Assist, are canceled the same way they were set.
 func (t *Timers) Actions() []*esphome.Action {
-	return []*esphome.Action{
+	return append([]*esphome.Action{
 		{
 			Name:    "timer_start",
 			Args:    []esphome.Arg{{Name: "duration", Type: esphome.ArgString}, {Name: "label", Type: esphome.ArgString}},
@@ -202,7 +216,7 @@ func (t *Timers) Actions() []*esphome.Action {
 				return nil, t.cancelFromHA(strings.TrimSpace(c.String("id")))
 			},
 		},
-	}
+	}, t.controlActions()...)
 }
 
 // cancelFromHA cancels one of the device's own timers by id, or every one of them for "all".
@@ -526,22 +540,36 @@ func (t *Timers) publish() { t.names.Set(t.describe(time.Now())) }
 // timer Home Assistant has forgotten — a restart takes its own, and it never re-sends them — can still be
 // watched from there by its remaining time.
 //
+// A paused timer, of the device's own or one Assist paused, has no time it ends at, so it is said with
+// what it has left, after the running ones, and without a comma, which is what separates the timers.
+//
+// The timers are copied under the lock: a pause or a change from Home Assistant writes to them under it
+// while this runs.
+//
 // It takes the moment rather than reading the clock, so what it says can be tested without waiting.
 func (t *Timers) describe(now time.Time) string {
 	t.mu.Lock()
-	running := make([]*timer, 0, len(t.held))
+	running := make([]timer, 0, len(t.held))
+	var paused []timer
 	for _, c := range t.held {
 		if c.active {
-			running = append(running, c)
+			running = append(running, *c)
+		} else {
+			paused = append(paused, *c)
 		}
 	}
 	t.mu.Unlock()
 
-	slices.SortFunc(running, func(a, b *timer) int { return cmp.Compare(a.remaining(now), b.remaining(now)) })
+	soonest := func(a, b timer) int { return cmp.Compare(a.remaining(now), b.remaining(now)) }
+	slices.SortFunc(running, soonest)
+	slices.SortFunc(paused, soonest)
 
-	said := make([]string, 0, len(running))
+	said := make([]string, 0, len(running)+len(paused))
 	for _, c := range running {
 		said = append(said, cmp.Or(c.name, "Timer")+" at "+clockText(c.due()))
+	}
+	for _, c := range paused {
+		said = append(said, cmp.Or(c.name, "Timer")+" paused ("+LeftText(c.left)+" left)")
 	}
 	return strings.Join(said, ", ")
 }
@@ -568,6 +596,49 @@ func (t *Timers) Forget() {
 	}
 	t.mu.Unlock()
 	t.end(gone, time.Now())
+}
+
+// ForgetAfter drops Home Assistant's timers once the grace has passed, unless Keep comes first: a
+// link that is only reconnecting is back in a moment, and the countdown it still holds must not go
+// with it. One that stays away leaves timers this device can no longer follow, which are dropped
+// when the grace runs out.
+func (t *Timers) ForgetAfter(grace time.Duration) {
+	t.mu.Lock()
+	if t.forgetWait != nil {
+		close(t.forgetWait)
+	}
+	wait := make(chan struct{})
+	t.forgetWait = wait
+	t.mu.Unlock()
+
+	safe.Go("timers waiting for home assistant", func() {
+		timer := time.NewTimer(grace)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			t.mu.Lock()
+			still := t.forgetWait == wait
+			if still {
+				t.forgetWait = nil
+			}
+			t.mu.Unlock()
+			if still {
+				t.Forget()
+			}
+		case <-wait:
+		}
+	})
+}
+
+// Keep calls off a pending ForgetAfter: Home Assistant is listening again, so its timers are still
+// its own.
+func (t *Timers) Keep() {
+	t.mu.Lock()
+	if t.forgetWait != nil {
+		close(t.forgetWait)
+		t.forgetWait = nil
+	}
+	t.mu.Unlock()
 }
 
 // Ringing reports whether a finished timer is sounding, which is one of the things that makes the
@@ -657,7 +728,7 @@ func (t *Timers) startRinging(name string) {
 		return
 	}
 	t.rang = name
-	t.stop = ring.Start("timer", speaker.TimerSound(), t.rungOut)
+	t.stop = ring.Start("timer", name, speaker.TimerSound(), t.rungOut)
 }
 
 // rungOut is the bell telling the timers their ring is over, however that came about.

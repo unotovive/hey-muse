@@ -12,6 +12,7 @@ import (
 	"github.com/HuskerMinion/techo5/echod/internal/config"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/deck"
 	"github.com/HuskerMinion/techo5/echod/internal/hardware/touch"
+	"github.com/HuskerMinion/techo5/echod/internal/lib/fonts"
 )
 
 // TECHO5 Deck's page (render_deck.go): opened by a swipe up from the bottom edge of the clock, once a
@@ -71,7 +72,7 @@ func (d *Display) closeDeck() {
 func (d *Display) deckShowing() bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return d.deckUp && d.deckOnScreen && d.view.Phase == "idle"
+	return d.deckUp && d.deckOnScreen && pageIdle(d.view.Phase)
 }
 
 // onClock is whether the clock itself is the page: not now playing, not the weather.
@@ -84,13 +85,19 @@ func (d *Display) onClock() bool {
 // deckFrameKey is what a frame of the deck shows, or "" when the frame isn't just the deck: two frames
 // with the same key look the same.
 func deckFrameKey(s scene, ringing, calling bool) string {
+	// The update dialog is drawn over the deck, and its progress changes every frame, so a frame with
+	// it up is not the unchanged deck: otherwise the dialog is skipped while the deck is still there
+	// to take the taps that dismiss it, and the screen looks normal while ignoring every touch.
 	if !s.showDeck || s.showVideo || s.showVideoAsk || s.showVolume || ringing || calling || s.setupAsking || s.showAnnouncement ||
-		s.showReminder || s.popup != nil || s.bt.Pairing || s.pin.open || s.redClock || s.announceRecording {
+		s.showReminder || s.showNotification || s.popup != nil || s.bt.Pairing || s.pin.open || s.redClock || s.announceRecording || s.updateActive ||
+		s.cue != "" {
 		return ""
 	}
 	// The colors too: the deck is drawn in the theme's, and a change from the setup page (a custom
-	// palette's included) should show.
-	return fmt.Sprintf("%+v|%v|%v", s.deck, s.muted, [5]color.RGBA{walnut, amber, cream, dim, ember})
+	// palette's included) should show. So should a change of font, of the owner's own fonts, or of
+	// the text size.
+	return fmt.Sprintf("%+v|%v|%v|%s|%d|%d", s.deck, s.muted, [5]color.RGBA{walnut, amber, cream, dim, ember},
+		drawnFont(), fonts.Generation(), textSize())
 }
 
 // deckScene fills in what the deck page shows, when it is up.

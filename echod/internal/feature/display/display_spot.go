@@ -11,16 +11,18 @@
 // a question about the weather.
 //
 // Touch: a tap starts or ends a turn (on a dark screen it only lights it); a swipe up or down is the
-// volume, a step per 60 pixels; a held finger opens the ring menu (menu_spot.go). While the menu is open
-// the touch screen follows every moving finger, so dragging round the ring turns the dial (or, for a
-// value, is a jog wheel), and a tap in the middle does the item at the top.
+// volume, a step per 60 pixels, while Swipe for volume is on; a held finger opens the ring menu
+// (menu_spot.go). While the menu is open the touch screen follows every moving finger, so dragging
+// round the ring turns the dial (or, for a value, is a jog wheel), and a tap in the middle does the
+// item at the top.
 //
 // The backlight: the panel shows almost nothing below about 120 of 255 and glares at 255, so a
-// brightness in percent spans backlightMin to the top. From 22:00 to 07:00 (config Screen.Night) it is
-// held to nightCeiling.
+// brightness in percent spans backlightMin to the top. Through the night hours, 22:00 to 07:00 unless
+// others are set (config Screen.Night), it is held to nightCeiling, or the face is left to the red night
+// clock at the night light's level, or put out (night_spot.go).
 //
-// To Home Assistant the screen is a light with brightness, and a switch for auto-brightness, the
-// same entities the Show has.
+// To Home Assistant the screen is a light with brightness, and a switch for auto-brightness, with the
+// night's settings and Night mode beside them: the same entities the Show has.
 package display
 
 import (
@@ -42,15 +44,20 @@ import (
 	"github.com/HuskerMinion/techo5/echod/internal/feature/alarm"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/announce"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/assistant"
+	"github.com/HuskerMinion/techo5/echod/internal/feature/babymon"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/btaudio"
+	"github.com/HuskerMinion/techo5/echod/internal/feature/camstream"
+	"github.com/HuskerMinion/techo5/echod/internal/feature/doorbell"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/hastate"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/home"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/media"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/mute"
+	"github.com/HuskerMinion/techo5/echod/internal/feature/notify"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/phone"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/presence"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/remind"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/setup"
+	"github.com/HuskerMinion/techo5/echod/internal/feature/takes"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/talkback"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/timer"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/video"
@@ -60,6 +67,8 @@ import (
 	"github.com/HuskerMinion/techo5/echod/internal/hardware/camera"
 	"github.com/HuskerMinion/techo5/echod/internal/hardware/screen"
 	"github.com/HuskerMinion/techo5/echod/internal/hardware/touch"
+	"github.com/HuskerMinion/techo5/echod/internal/lib/bootreason"
+	"github.com/HuskerMinion/techo5/echod/internal/lib/fonts"
 	"github.com/HuskerMinion/techo5/echod/internal/service"
 )
 
@@ -76,6 +85,19 @@ var homeTurnStyles []turnStyle
 // hasNightSwitch is whether Home Assistant can turn the night on and off here: not on the Spot, whose
 // night hours are its own.
 const hasNightSwitch = false
+
+// hasRainbow is whether this screen offers the Rainbow turn screen: not the Spot's, which is round.
+const hasRainbow = false
+
+// hasTimerStyles: the Spot's timers stay around its rim, whatever the Show's are set to.
+const hasTimerStyles = false
+
+// hasSkins: the Spot has the skins too, in their colors, fonts and filters (skin_spot.go); what the
+// Show draws around its own clock is the Show's.
+const hasSkins = true
+
+// hasMicrophone: the Spot always has its microphones (the Show's is render_welcome.go).
+var hasMicrophone = func() bool { return true }
 
 const (
 	// volumeShow is how long the level stays up after it last moved.
@@ -114,11 +136,27 @@ const (
 )
 
 type Display struct {
+	// camButtons is the camera page's action buttons between taps: the one armed (camera_buttons.go).
+	camButtons cameraButtons
+
+	// firstRun is what the first-run faces keep between frames (firstrun.go, firstrun_spot.go).
+	firstRun firstRunState
+
 	light *esphome.Light
 	auto  *esphome.Switch
-	clock *esphome.Select
+	// power is Screen power, the screen's on and off as a switch, and roomSw Screen ignores room light
+	// commands (screen_room.go).
+	power  *esphome.Switch
+	roomSw *esphome.Switch
+	clock  *esphome.Select
 	// clockStyleSel is Clock style, how the clock looks all day (clock_style.go).
 	clockStyleSel *esphome.Select
+	// clockPos is Clock position, the clock across the middle or at the foot (clock_layout_spot.go).
+	clockPos *esphome.Select
+	// fontSel is Screen font, the font of every word the screen draws (font.go).
+	fontSel *esphome.Select
+	// textSizeSel is Screen text size, how large those words are drawn (text_size.go).
+	textSizeSel *esphome.Select
 	// styleNamed is the clock style a swipe turned to, said on the clock until styleNamedUntil.
 	styleNamed      string
 	styleNamedUntil time.Time
@@ -131,14 +169,20 @@ type Display struct {
 	camTime    *esphome.Select
 	answerTime *esphome.Select
 	turnStyle  *esphome.Select // Turn screen: Classic, Wave or Bars
+	skinSl     *esphome.Select // Screen skin
 	// callBtn is the home screen's Call button, on or off (callbutton.go).
 	callBtn *esphome.Switch
 	// styleSwipeSw is Swipe between clock styles (style_swipe.go).
 	styleSwipeSw *esphome.Switch
+	// volumeSwipeSw is Swipe for volume (volume_swipe.go).
+	volumeSwipeSw *esphome.Switch
 	// weatherFx is the weather page's sky moving, on or off (weatherfx.go).
 	weatherFx *esphome.Switch
 	// muteRing is the muted ring drawn thin and dim, on or off (mutering_spot.go).
 	muteRing *esphome.Switch
+	// camDot and idleRing are the quieter rims of #431 (rimdot_spot.go).
+	camDot   *esphome.Select
+	idleRing *esphome.Switch
 	lang     *esphome.Select
 
 	mu      sync.Mutex
@@ -210,6 +254,50 @@ type Display struct {
 
 	// wasNight is whether the last backlight was set for the night, so the change of hour relights.
 	wasNight bool
+
+	// touchedAt is the last finger on the face. nightGlow is the night having left the red clock alone
+	// on the face at the night light's level, until a touch or the end of the night takes it down
+	// (night_spot.go); redShown is the frame drawn last being that clock. nightDark is the face put out
+	// by the night (Screen off) rather than by anyone.
+	touchedAt time.Time
+	// idleDimmed is always false: Dim after idle is the Show's (idle_dim_show.go), named here for
+	// the settle ticker both share (autobright.go).
+	idleDimmed bool
+	nightGlow  bool
+	redShown   bool
+	nightDark  bool
+	// soonAt is when the red clock was last asked for at once (nightSoon): the night starting, Night
+	// clock chosen, or the settings or the menu closing. A touch or a turn after it waits nightIdle as
+	// before. nightIn and nightUsing are what the last frame found, to see the night begin and the
+	// settings close.
+	soonAt     time.Time
+	nightIn    bool
+	nightUsing bool
+	// glowUntil is the end of a step of the night clock's brightness showing on the backlight, from
+	// the settings sheet at night (stepGlow).
+	glowUntil time.Time
+	// glowTimer relights the face once a step's glowPreview is over: one timer, put off by each step,
+	// so a run of steps ends in one relight rather than one for each, and something that holds the
+	// face (a test, here) can stop it. Under mu.
+	glowTimer *time.Timer
+
+	// The night's settings in Home Assistant, as on the Show (night_select.go): its hours, their two
+	// ends to the quarter hour, what it does to the face, the red clock's look and brightness.
+	nightHours, atNight  *esphome.Select
+	nightStart, nightEnd *esphome.Select
+	// weekendStart and weekendEnd are the weekend's nights, when they differ (#305).
+	weekendStart, weekendEnd *esphome.Select
+	nightStyle               *esphome.Select
+	glowLevel                *esphome.Number
+	// nightInfoSw is Night clock shows Next up and notifications (night_info.go): on the Spot, the
+	// notification alone.
+	nightInfoSw *esphome.Switch
+	// nightMode is Night mode: Home Assistant turning the night on and off; nightShown what it last said.
+	nightMode  *esphome.Switch
+	nightShown bool
+	nightSeen  bool // nightShown has been sent at least once
+	// nightPubMu keeps publishing the Night mode switch to one caller at a time (showNightMode).
+	nightPubMu sync.Mutex
 	// lightMu makes each relight one step, from working out the level to writing it.
 	lightMu sync.Mutex
 	// sunriseLit is the light before an alarm having been on at the last settle tick (autobright.go).
@@ -232,6 +320,11 @@ type Display struct {
 	radioCue time.Time
 	radar    bool
 	radioSel int
+	// musicQuiet is how long the music on the face has been paused or stopped, and musicAway whether
+	// that has gone on past pausedAway: the clock comes back, and the face's taps go back to it, while
+	// the track stays held for play to pick up again.
+	musicQuiet quietTimer
+	musicAway  bool
 	// cameraSel is the camera list's middle row.
 	cameraSel int
 	// contactTop is the first contact the Call list shows.
@@ -262,7 +355,14 @@ type Display struct {
 	videoOver     image.Rectangle
 	vp            videoPainter
 	vask          askLatch
+	pask          askLatch // the setup page's asking, drawn (pageAsk)
 	videoLit      uint64
+
+	// notifyLit is the last notification that lit the face, once per notification like videoLit.
+	// notifySeen is the one the face may show at night: the one that came up by day, or that a touch
+	// released (notice_spot.go). Both under mu.
+	notifyLit  string
+	notifySeen string
 }
 
 var (
@@ -295,17 +395,35 @@ func build() *Display {
 	}
 	d.light.OnCommand = d.command
 	d.auto.OnCommand = func(on bool) { d.setAuto(on, true) }
+	d.buildRoomLights()
 	d.clock = clockSelect(d.wake)
 	d.clockStyleSel = clockStyleSelect(d)
+	d.clockPos = clockPositionSelect(d.wake)
+	d.fontSel = fontSelect(d)
+	d.textSizeSel = textSizeSelect(d)
 	setup.SetScreen(&setup.ScreenChoices{Styles: clockStyleOptions(), Current: clockStyleIndex, Choose: d.setClockStyle,
-		Places: spotWorld, Swipe: func(on bool) { setStyleSwipe(d.styleSwipeSw, on) }})
+		Fonts: fonts.Names(), FontNow: fontIndex, ChooseFont: d.setFont,
+		OwnFonts: ownFonts, AddFont: d.addOwnFont, RemoveFont: d.removeOwnFont, MaxFont: fonts.MaxOwnFile,
+		Places: spotWorld, Swipe: func(on bool) { setStyleSwipe(d.styleSwipeSw, on) }, VolumeSwipe: func(on bool) { setVolumeSwipe(d.volumeSwipeSw, on) },
+		IgnoreRoomLights: d.setRoomLightsIgnored})
 	d.camTime = cameraTimeSelect()
 	d.answerTime = answerTimeSelect()
 	d.turnStyle = turnStyleSelect(d.wake)
+	d.skinSl = skinSelect(d.wake)
 	d.callBtn = callButtonSwitch(d.wake)
 	d.styleSwipeSw = styleSwipeSwitch()
+	d.volumeSwipeSw = volumeSwipeSwitch()
 	d.weatherFx = weatherAnimationSwitch(d.wake)
 	d.muteRing = muteRingSwitch(d.wake)
+	d.camDot, d.idleRing = cameraDotSelect(d.wake), idleRingSwitch(d.wake)
+	d.nightHours = nightHoursSelect(d)
+	d.nightStart, d.nightEnd = nightEndSelect(d, true), nightEndSelect(d, false)
+	d.weekendStart, d.weekendEnd = weekendEndSelect(d, true), weekendEndSelect(d, false)
+	d.atNight = atNightSelect(d)
+	d.nightStyle = nightStyleSelect(d)
+	d.glowLevel = glowNumber(d)
+	d.nightInfoSw = nightInfoSwitch(d)
+	d.nightMode = nightModeSwitch(d)
 	d.lang = langSelect()
 	voice.Changed.Listen(d.changed)
 	media.Get().OnVolume.Listen(d.volumeMoved)
@@ -314,7 +432,20 @@ func build() *Display {
 	timer.Get().Changed.Listen(func(struct{}) { d.ringLights() })
 	alarm.Get().Changed.Listen(func(struct{}) { d.ringLights() })
 	remind.Get().Changed.Listen(func(struct{}) { d.reminderLights() })
+	notify.Get().Changed.Listen(func(struct{}) { d.notifyLights() })
+	notify.SetNight(nightNow)
 	home.Get().Changed.Listen(func(struct{}) { d.wake() })
+	// An announcement arriving lights a face the night put out (frame).
+	announce.Get().Changed.Listen(func(struct{}) { d.wake() })
+	doorbell.Get().Changed.Listen(func(struct{}) { d.wake() })
+	camstream.Get().Changed.Listen(func(struct{}) {
+		d.relight(true) // a dark face keeps a little light while the camera is watched (watchedLight)
+		d.wake()
+	})
+	babymon.Get().Changed.Listen(func(struct{}) {
+		d.relight(true) // and while the room is listened to: the mark that says so has to be seen
+		d.wake()
+	})
 	d.watchRoom()
 	talkback.Get().Changed.Listen(func(struct{}) { d.wake() })
 	onMissed(d.wake)
@@ -350,21 +481,42 @@ func (d *Display) Name() string { return "screen" }
 // turnStyleSel is the Turn screen setting in Home Assistant.
 func (d *Display) turnStyleSel() *esphome.Select { return d.turnStyle }
 
+// timerStyleSel: the Spot has no Timers setting.
+func (d *Display) timerStyleSel() *esphome.Select { return nil }
+
+// skinSel is the Screen skin setting in Home Assistant.
+func (d *Display) skinSel() *esphome.Select { return d.skinSl }
+
 func (d *Display) Entities() []esphome.Entity {
-	return []esphome.Entity{d.light, d.auto, d.clock, d.clockStyleSel, d.camTime, d.answerTime, d.turnStyle, d.callBtn, d.weatherFx, d.muteRing, d.lang, d.styleSwipeSw}
+	return []esphome.Entity{d.light, d.power, d.roomSw, d.auto, d.clock, d.clockStyleSel, d.clockPos, d.camTime, d.answerTime, d.turnStyle, d.skinSl, d.callBtn, d.weatherFx, d.muteRing, d.camDot, d.idleRing, d.lang, d.styleSwipeSw, d.volumeSwipeSw, d.fontSel, d.textSizeSel,
+		d.nightHours, d.nightStart, d.nightEnd, d.weekendStart, d.weekendEnd, d.nightMode, d.atNight, d.nightStyle, d.glowLevel, d.nightInfoSw}
 }
 
 // Restore lights the panel the way it was left.
 func (d *Display) Restore(c config.Config) {
 	setClock24(d.clock, c.Screen.Clock24)
+	d.roomSw.Set(c.Screen.IgnoreRoomLights)
+	d.describeScreen()
 	d.clockStyleSel.Set(clockStyles[clockStyleIndex()].label)
+	d.clockPos.Set(clockPositions[clockPositionIndex()].label)
+	d.fontSel.Set(fonts.Names()[fontIndex()])
+	d.textSizeSel.Set(textSizeOptions()[textSizeIndex()])
 	d.camTime.Set(cameraTimes[cameraTimeIndex()].label)
 	d.answerTime.Set(answerTimes[answerTimeIndex()].label)
 	d.turnStyle.Set(turnStyles[turnStyleIndex()].label)
+	d.skinSl.Set(skins[skinIndex()].label)
 	setCallButton(d.callBtn, c.Screen.CallButton)
 	d.styleSwipeSw.Set(!c.Screen.NoStyleSwipe)
+	d.volumeSwipeSw.Set(!c.Screen.NoVolumeSwipe)
 	setWeatherAnimation(d.weatherFx, !c.Screen.WeatherStill)
 	setMuteRingSubtle(d.muteRing, c.Screen.MuteRingSubtle)
+	setCameraDotWatchedOnly(d.camDot, c.Screen.CameraDotWatchedOnly)
+	setIdleRing(d.idleRing, !c.Screen.NoIdleRing)
+	d.nightHoursChanged()
+	d.atNight.Set(atNightOptions[atNightIndex()])
+	d.nightStyle.Set(nightStyleOptions[nightStyleIndex()])
+	d.glowLevel.Set(float32(d.glowSetting()))
+	d.nightInfoSw.Set(c.Screen.NightInfo)
 	d.setAuto(c.Screen.Auto, false)
 	d.apply(c.Screen.On, c.Screen.Brightness, false)
 }
@@ -380,15 +532,26 @@ func (d *Display) command(s esphome.LightState) {
 	d.apply(s.On, pct, true)
 }
 
+// wakeLight is the light before an alarm as this face shows it: all of it, here.
+func (d *Display) wakeLight(now time.Time) float64 { return sunriseProgress(now) }
+
 func (d *Display) apply(on bool, pct int, save bool) {
 	presence.Hush() // the screen's own light is about to change; the camera is not to take it for somebody
 	pct = min(max(pct, 0), 100)
 	d.mu.Lock()
 	d.on, d.ceiling = on, pct
+	// Somebody chose this, so the night no longer owns the face: a face put to sleep in the night stays
+	// asleep when it ends, as on the Show.
+	if save {
+		d.nightDark = false
+	}
 	d.mu.Unlock()
 	d.relight(true)
 
 	d.light.Set(esphome.LightState{On: on, Brightness: float32(pct) / 100, ColorMode: esphome.ColorModeBrightness})
+	if d.power != nil {
+		d.power.Set(on)
+	}
 	d.wake()
 
 	if save {
@@ -423,7 +586,7 @@ func (d *Display) relight(jump bool) {
 	// setting changed on the screen all relight, and a level worked out first must not land last.
 	d.lightMu.Lock()
 	defer d.lightMu.Unlock()
-	night := inNight(time.Now())
+	night := nightNow(time.Now())
 	d.mu.Lock()
 	// The hour turning is a change to show at once, whoever relights first: the settle ticker taking
 	// it would otherwise leave the frame nothing to jump for, and it would fade in.
@@ -443,6 +606,11 @@ func (d *Display) relight(jump bool) {
 			}
 		}
 		target = backlightMin + (screen.BacklightMax-backlightMin)*math.Min(math.Max(pct, 0), 100)/100
+		if d.nightGlow || (night && time.Now().Before(d.glowUntil)) {
+			// The red night clock: the night light's level, whatever the room and the brightness ask. A
+			// step of its brightness on the settings sheet shows it the same way for a moment.
+			target = float64(d.glowBacklight())
+		}
 	}
 	// The light before an alarm takes the backlight over while it runs: it starts under whatever the
 	// room would otherwise ask for and ends at the face's own brightness.
@@ -450,6 +618,7 @@ func (d *Display) relight(jump bool) {
 		full := backlightMin + (screen.BacklightMax-backlightMin)*float64(min(max(d.ceiling, 0), 100))/100
 		target = backlightMin + (full-backlightMin)*sunriseLevel(p)
 	}
+	target = watchedLight(target, d.on, watched(), backlightMin)
 	if jump || d.level == 0 {
 		d.level = target
 	} else {
@@ -468,15 +637,6 @@ func (d *Display) relight(jump bool) {
 	if err := screen.SetBacklight(level); err != nil {
 		slog.Warn("setting the backlight failed", "err", err)
 	}
-}
-
-// inNight says whether now is within the night hours, which may cross midnight.
-func inNight(now time.Time) bool {
-	v := config.Get().Screen.Night
-	if v == "" {
-		v = defaultNight
-	}
-	return config.InWindow(v, now)
 }
 
 func allowed(lux float64) float64 {
@@ -556,12 +716,30 @@ func (d *Display) volumeMoved(step int) {
 func (d *Display) gesture(g touch.Gesture) {
 	d.mu.Lock()
 	on, open := d.on, d.menuOpen
+	d.touchedAt = time.Now()
 	d.mu.Unlock()
+	// A notification that came up at night waits for a touch (releaseNotice), but not for one that stops
+	// a ring: that one is for the alarm. The touch that releases it only releases: whoever touched the
+	// face has not seen the card yet, so it is not a tap on anything.
+	held := d.noticeHeld()
+	ringTap := g.Kind == touch.Tap && ringingNow(time.Now()).any()
 
 	if !on {
-		// A dark panel only lights; nothing under the finger is acted on.
+		// A dark panel only lights; nothing under the finger is acted on. A long press on a face the
+		// night put out goes on to open the ring menu, as it does on the red night clock.
 		if g.Kind == touch.Tap || g.Kind == touch.Hold {
+			if !ringTap {
+				d.releaseHeld()
+			}
+			byNight := d.darkByNight()
 			d.apply(true, d.ceilingOrDefault(), true)
+			if byNight && g.Kind == touch.Hold && !held && !ringingNow(time.Now()).any() {
+				d.mu.Lock()
+				d.openMenu(modeMain, itemTalk)
+				d.spinning, d.spinAngle = true, fingerAngle(g.X, g.Y)
+				d.mu.Unlock()
+				d.wake()
+			}
 		}
 		// Unless something is ringing, where spending the press on the backlight is the wrong trade:
 		// the person is reaching for a noise, not for a screen they cannot see. A ring lights the
@@ -572,14 +750,62 @@ func (d *Display) gesture(g touch.Gesture) {
 		}
 	}
 
+	// The red night clock: a touch lights the face as it is by night, dimmed, and only lights it, as a
+	// touch on a dark face does: nobody can see what they are pressing on a clock alone at a glow. A ring
+	// under it is stopped or snoozed as on its own face, and a notification held for the night is only
+	// released. A long press goes on to open the ring menu, so the menu is one press away in the dark.
+	if d.redClockUp() {
+		if d.ringGesture(g) {
+			return
+		}
+		if held {
+			d.releaseHeld()
+			d.wake()
+			return
+		}
+		if n, up := notify.Get().Card(); up && g.Kind == touch.Tap && nightInfoOn() {
+			// Night clock shows Next up and notifications: the card on the night clock is tapped away,
+			// and the night light stays.
+			go notify.Get().DismissID(n.ID)
+			d.wake()
+			return
+		}
+		switch g.Kind {
+		case touch.Tap, touch.Hold, touch.SwipeUp, touch.SwipeDown, touch.SwipeLeft, touch.SwipeRight:
+			d.liftNight()
+		}
+		if g.Kind == touch.Hold {
+			d.mu.Lock()
+			d.openMenu(modeMain, itemTalk)
+			d.spinning, d.spinAngle = true, fingerAngle(g.X, g.Y)
+			d.mu.Unlock()
+			d.wake()
+		}
+		return
+	}
+
 	if d.callGesture(g) || d.ringGesture(g) || d.pinGesture(g) {
 		return
 	}
-	// A browser asking to be let in: its face takes every tap, and only the two answers decide.
-	if setup.Get().Waiting() {
+	// The setup page asking something of whoever is at the device: a browser to be let in, or takes of
+	// a word to start, and Stop, where Start was, while they record. Its face takes every tap, and only
+	// the answers on the face that was drawn decide, once it has been up long enough to have been read
+	// (pageAsk), since the yes is in the same place on each of them.
+	if asking, c := setup.Get().Asking(), takes.Get().Card(); asking != "" || c.Up() {
 		if g.Kind == touch.Tap {
-			if allow, answered := askTapSpot(g.Y); answered {
-				answerSetup(allow)
+			drawn, settled := d.pask.answerable(time.Now())
+			yes, answered := askTapSpot(g.Y)
+			switch {
+			case !settled || !answered:
+			case asking != "":
+				if drawn == letInKey(asking) {
+					answerSetup(yes, asking)
+				}
+			case drawn != takesKey(c):
+			case c.Phase == takes.Armed:
+				answerTakes(yes, c.ID)
+			case yes:
+				takes.Get().Stop()
 			}
 		}
 		d.wake()
@@ -597,6 +823,13 @@ func (d *Display) gesture(g touch.Gesture) {
 	}
 	if d.videoUpSpot() {
 		d.videoGestureSpot(g)
+		return
+	}
+	// First run still to do takes every finger, as the face it draws is all there is.
+	if d.firstRunActive() {
+		if g.Kind == touch.Tap {
+			d.firstRunTapSpot(g.X, g.Y)
+		}
 		return
 	}
 	// The microphone open for an announcement: its face takes every gesture, because a face nobody
@@ -627,6 +860,25 @@ func (d *Display) gesture(g touch.Gesture) {
 		d.wake()
 		return
 	}
+	// The touch that releases a held notification only releases it, rather than falling through to what
+	// is under the finger. The pages that take every tap have had their say above. A menu left open is
+	// put away now: the card is about to be drawn over it, and notifyLights left it alone for the night.
+	if held {
+		d.releaseHeld()
+		d.wake()
+		return
+	}
+	// A notification takes the face too: a tap puts it away and tells Home Assistant. A camera view is
+	// over it (the card stays up underneath and shows when the view ends), so the view takes the taps.
+	if _, camera := home.Get().Camera(); !camera {
+		if n, up := notify.Get().Card(); up {
+			if g.Kind == touch.Tap {
+				go notify.Get().DismissID(n.ID)
+			}
+			d.wake()
+			return
+		}
+	}
 	// The alert face takes every gesture while it is up.
 	if d.alertUpSpot() {
 		d.alertGestureSpot(g)
@@ -643,6 +895,11 @@ func (d *Display) gesture(g touch.Gesture) {
 		d.menuGesture(g)
 		return
 	}
+	// A cue turn's captions over the dashboard, the music or the clock: a tap on them puts them away,
+	// and anywhere else is the face's (turn_cue.go).
+	if d.captionsTap(g) {
+		return
+	}
 	d.mu.Lock()
 	dashUp := d.dashShowing
 	d.mu.Unlock()
@@ -656,7 +913,14 @@ func (d *Display) gesture(g touch.Gesture) {
 		case touch.Tap:
 			// The sound's control silences the sound and leaves the view up, which is the whole use of
 			// it at a doorbell; anywhere else on the face takes the view down as it always has. Talk
-			// starts or ends talking through the camera.
+			// starts or ends talking through the camera, and an action button arms or runs its action.
+			if d.r != nil {
+				if i := d.r.cameraButtonTapped(g.X, g.Y); i >= 0 {
+					d.camButtons.tap(v.Entity, i, cameraButtonsFor(v), time.Now())
+					d.wake()
+					return
+				}
+			}
 			if d.r != nil && d.r.cameraSoundTapped(g.X, g.Y) {
 				// Silence it, or ask for it again: the control is a toggle, and the view stays either way.
 				go home.Get().ToggleCameraSound()
@@ -666,13 +930,19 @@ func (d *Display) gesture(g touch.Gesture) {
 				go talkback.Get().Toggle(v.Entity)
 				return
 			}
-			go home.Get().HideCamera()
+			go closeCamera(v)
 			return
 		case touch.SwipeLeft:
-			go stepCamera(v.Entity, +1)
+			// A captioned view is a notification's, and stepping to the next camera would replace it
+			// without a word to Home Assistant; it stays, and a tap still dismisses it.
+			if v.Caption == nil {
+				go stepCamera(v.Entity, +1)
+			}
 			return
 		case touch.SwipeRight:
-			go stepCamera(v.Entity, -1)
+			if v.Caption == nil {
+				go stepCamera(v.Entity, -1)
+			}
 			return
 		case touch.Hold:
 			d.mu.Lock()
@@ -682,7 +952,7 @@ func (d *Display) gesture(g touch.Gesture) {
 			return
 		}
 	}
-	if d.showsNowPlaying() {
+	if d.musicFaceUp() {
 		switch g.Kind {
 		case touch.Tap:
 			if onDone(g.X, g.Y) {
@@ -709,6 +979,12 @@ func (d *Display) gesture(g touch.Gesture) {
 			d.clearAnswer()
 			return
 		}
+		// The wake light's face, held at full after an alarm with nothing ringing: a tap lets it go, as
+		// stop does (#161). While it is only coming up before an alarm, the tap is the clock's as ever.
+		if tapLetsGoOfLight(time.Now()) {
+			d.wake()
+			return
+		}
 		d.mu.Lock()
 		call := d.callShown && onCallButton(g.X, g.Y)
 		if call {
@@ -730,14 +1006,14 @@ func (d *Display) gesture(g touch.Gesture) {
 		}
 		voice.Get().Action()
 	case touch.SwipeUp:
-		media.Get().Adjust(+1)
+		swipeVolume(+1)
 	case touch.SwipeDown:
-		media.Get().Adjust(-1)
+		swipeVolume(-1)
 	case touch.SwipeLeft, touch.SwipeRight:
 		// Across the clock face, the next clock style or the one before: only on the face itself, not
 		// while a turn is on or its words are up, nor over the screensaver or the light before an alarm.
 		d.mu.Lock()
-		idle, up := d.view.Phase == "idle", d.clockUp
+		idle, up := pageIdle(d.view.Phase), d.clockUp
 		d.mu.Unlock()
 		if !idle || !up || d.answerUp(time.Now()) || !styleSwipeOn() {
 			return
@@ -1050,8 +1326,10 @@ func (d *Display) locked(f func()) {
 
 // restartDevice reboots; the slot store and the daemon's state are on disk already.
 func restartDevice() {
+	bootreason.Mark(bootreason.Restart)
 	syscall.Sync()
 	if err := syscall.Reboot(syscall.LINUX_REBOOT_CMD_RESTART); err != nil {
+		bootreason.Unmark()
 		slog.Error("restart failed", "err", err)
 	}
 }
@@ -1153,11 +1431,16 @@ func (d *Display) Run(ctx context.Context) error {
 	}
 }
 
-func (d *Display) frame() time.Duration {
+func (d *Display) frame() (next time.Duration) {
 	d.videoPainting, d.vp.dark = false, false
 	now := time.Now()
+	if d.dev != nil {
+		applySkin(d.dev, side, side)
+	} else {
+		applySkin(nil, side, side)
+	}
 	d.mu.Lock()
-	nightChanged := d.wasNight != inNight(now)
+	nightChanged := d.wasNight != nightNow(now)
 	d.mu.Unlock()
 	if nightChanged {
 		d.relight(true)
@@ -1187,6 +1470,11 @@ func (d *Display) frame() time.Duration {
 		case !d.menuMode.jogging() && now.Sub(d.menuAt) > menuIdle:
 			d.closeMenu()
 		}
+	}
+	if d.sheetOpen && pinIsOpen() {
+		// The PIN pad over the settings takes the taps, and someone typing is someone there: the
+		// settings wait behind it rather than closing on them, which would lose what the PIN was for.
+		d.sheetAt = now
 	}
 	if d.sheetOpen && !d.dragging && d.draft == nil && now.Sub(d.sheetAt) > sheetIdle {
 		d.sheetOpen, d.picker = false, ""
@@ -1227,13 +1515,13 @@ func (d *Display) frame() time.Duration {
 	_, reminding := remind.Get().Showing()
 	vs := video.Get().State()
 	busy := view.Phase != "idle" || sheetOpen || ringingNow(now).any() || phone.Get().Busy() || pinIsOpen() ||
-		sunriseProgress(now) > 0 || setup.Get().Waiting() || reminding || vs.Active()
-	if d.awayTick(now, on, busy, inNight(now)) {
+		sunriseProgress(now) > 0 || asksAtDevice() || reminding || vs.Active()
+	if d.awayTick(now, on, busy, nightNow(now)) {
 		d.mu.Lock()
 		on = d.on
 		d.mu.Unlock()
 	}
-	if vs.Active() && vs.ID != d.videoLit && (vs.Phase != video.Asking || !inNight(now)) {
+	if vs.Active() && vs.ID != d.videoLit && (vs.Phase != video.Asking || !nightNow(now)) {
 		// A video starting lights a dark face, once per video; a DLNA video's question only by day.
 		d.videoLit = vs.ID
 		if !on {
@@ -1241,16 +1529,50 @@ func (d *Display) frame() time.Duration {
 			on = true
 		}
 	}
+	if !on && d.darkByNight() && (sunriseProgress(now) > 0 || announcing()) {
+		// A face the night put out comes on for the light before an alarm and for an announcement, which
+		// are shown on the red night clock too; a ring, a call, a reminder and a video light it themselves.
+		d.apply(true, d.ceilingOrDefault(), false)
+		on = true
+	}
+	// The red night clock up or down, or the face put out or back; relit at once, and drawn from this
+	// frame.
+	d.night(now, on, view)
+	d.mu.Lock()
+	on = d.on
+	s.redClock, s.redStyle = d.nightGlow && nightClockOn(), config.Get().Screen.NightClockStyle
+	s.nightInfo = s.redClock && config.Get().Screen.NightInfo
+	d.mu.Unlock()
 	if !on && !video.Get().State().Active() {
 		d.vp.drop() // a video that ended while the panel was dark: its frame goes with it
 	}
-	if !on && vs.Frames {
+	playing := !on && vs.Frames
+	if playing {
 		// Dark with a video playing: its frames are taken as they fall due so its sound goes on.
 		video.Get().Covered(false)
 		d.videoPainting, d.vp.dark, d.videoOver = true, true, image.Rectangle{}
+	}
+	if !on && watched() {
+		// Dark, with the camera watched over the network: its mark, alone on black (not a video's last
+		// frame), at the dimmest light (relight), so the room can tell. Looked at again until the
+		// watching ends.
+		d.r.watchedDark()
+		unskinned(d.dev, true)
+		if err := d.dev.Present(); err != nil {
+			slog.Warn("presenting the frame failed", "err", err)
+		}
+		if playing {
+			return videoRecheck
+		}
+		return 5 * time.Second
+	}
+	if playing {
 		return videoRecheck
 	}
 	if !on {
+		if d.darkByNight() {
+			return time.Minute // until the night ends, or something lights the face
+		}
 		return time.Hour
 	}
 	if view.Phase == "idle" && (view.Heard != "" || view.Reply != "") && now.Sub(at) < linger() {
@@ -1260,12 +1582,18 @@ func (d *Display) frame() time.Duration {
 		// A screen command: the screen it asked for is the answer, not the words.
 		s.phase, s.heard, s.reply = "idle", "", ""
 	}
+	if cueOn() {
+		s.cue, s.phase, s.heard, s.reply = cueTurn(s.phase, s.heard, s.reply, captionsOn())
+	}
+	s.said = voice.Spoken(s.reply, now)
 	if equalizerOn() && (s.phase == "listening" || s.phase == "thinking" || s.phase == "replying" || s.phase == "lingering") {
-		s.eq = eqFor(s.phase, inNight(now), now)
+		s.eq = eqFor(s.phase, nightNow(now), now)
 		s.eq.wave = waveOn()
 	}
 	s.muted, _ = mute.Get().Muted()
 	s.mutedSubtle = muteRingSubtle.Load()
+	s.noIdleRing = idleRingHidden.Load()
+	s.listening = babymon.Shown()
 	// A stream this player is carrying is the room's when it is what is being heard: the face names it,
 	// and says what it is doing, though the audio never passes through this player's own stream. Both,
 	// not just playing: the face tests paused first, so a station left paused underneath would label
@@ -1305,15 +1633,18 @@ func (d *Display) frame() time.Duration {
 		}
 	}
 	s.call = phone.Get().State()
+	s.atDoor = s.call.Phase != phone.Idle && doorbell.Get().AtDoor(now)
 	s.weather = home.Get().Weather()
 	s.style = styleFactsFor(clockStyle(), now)
 	s.style.named = d.styleName(now)
 	s.camera, s.showCamera = home.Get().Camera()
+	s.camera, s.showCamera = d.gateCamera(s.camera, s.showCamera, nightNow(now))
 	s.cameraSound, s.cameraSoundLive = home.Get().CameraSoundOn(), home.Get().CameraSoundLive()
 	if s.showCamera {
 		s.talkOffered, s.talk = talkback.Offered(s.camera.Entity), talkback.Get().State()
+		s.camButtons = d.camButtons.faces(s.camera.Entity, cameraButtonsFor(s.camera), now)
 	}
-	s.cameraLive = camera.Get().Running()
+	s.cameraLive = camera.Get().Running() && (!cameraDotWatchedOnly.Load() || camstream.Watching() || camstream.ToHomeAssistant())
 	bt := btaudio.Get().State()
 	s.btPairing = bt.Pairing
 	if s.menuOpen {
@@ -1332,12 +1663,25 @@ func (d *Display) frame() time.Duration {
 			s.sky = skyNow(weatherNow(s.weather, s.forecast, s.now))
 		}
 	}
-	s.nowPlaying = s.phase == "idle" && d.showsNowPlaying()
+	music := d.showsNowPlaying()
+	s.nowPlaying = s.phase == "idle" && music
 	if s.nowPlaying || (s.menuOpen && s.menuMode == modeRadio) {
 		s.radio = home.Get().Radio()
 		if s.radio.Followed {
 			s.playing, s.paused = s.radio.Playing, s.radio.Paused
 		}
+	}
+	// Music quiet for pausedAway gives the face back to the clock; playing again brings it back. The
+	// time runs through a turn, so a question asked while the music is paused does not bring the face
+	// back for another half minute after its answer.
+	d.mu.Lock()
+	away := d.musicQuiet.over(now, music, s.playing)
+	d.musicAway = away
+	d.mu.Unlock()
+	if away {
+		s.nowPlaying = false
+	}
+	if s.nowPlaying || (s.menuOpen && s.menuMode == modeRadio) {
 		if rows := radioRows(s.radio, s.playing || s.paused); s.radioSel >= len(rows) || s.radioSel < 0 {
 			s.radioSel = min(max(s.radioSel, 0), max(len(rows)-1, 0))
 			d.mu.Lock()
@@ -1356,11 +1700,23 @@ func (d *Display) frame() time.Duration {
 	// still standing in it. It was set only on the idle page once, and the press could not be given
 	// without leaving settings first.
 	s.setupAsking = setup.Get().Waiting()
+	// Takes of a word asked for there are the same kind of face, and wait their turn behind a browser
+	// asking to be let in.
+	if !s.setupAsking {
+		s.takes = takes.Get().Card()
+		s.setupAsking = s.takes.Up()
+	}
+	// First run still to do takes the face (firstrun_spot.go), under all of the above.
+	if s.firstRunUp = d.firstRunActive(); s.firstRunUp {
+		s.firstRun = d.firstRunView(now)
+	}
 	s.announceReady = config.Get().Home.HouseWord != ""
 	s.announceRecording = announce.Get().Recording()
 	s.announcePeers = len(announce.Peers())
 	s.announcement, s.showAnnouncement = announce.Get().Showing()
 	s.reminder, s.showReminder = remind.Get().Showing()
+	s.notification, s.showNotification = notify.Get().Card()
+	d.gateNotice(&s, nightNow(now))
 	if s.reminder.From != config.Get().Device.Name {
 		s.reminderFrom = s.reminder.From
 	}
@@ -1374,7 +1730,7 @@ func (d *Display) frame() time.Duration {
 		s.sunrise, s.sunriseFace = sunriseProgress(now), config.Get().Alarms.SunriseFace
 		// The weather art only where it will be seen: not under the night clock or the light before an
 		// alarm, which take the whole screen, where composing it each second is work for nothing.
-		artSeen := s.sunrise == 0
+		artSeen := !s.redClock && s.sunrise == 0
 		s.slideshow = home.Get().SlideshowBackground()
 		if home.Get().SlideshowMode() == config.SlideshowBackground && artSeen {
 			if art, fx := sceneArt(now, side, side); art != nil {
@@ -1385,28 +1741,42 @@ func (d *Display) frame() time.Duration {
 			s.slideshowTrouble = home.Get().SlideshowTrouble()
 		}
 	}
+	wait := home.Get().SlideshowIdleTimeout()
 	d.mu.Lock()
-	d.clockUp = boring && s.sunrise == 0 && s.slideshowScreensaver == nil
+	d.clockUp = boring && s.sunrise == 0 && s.slideshowScreensaver == nil && !s.redClock
 	if !boring {
 		d.slideshowIdleSince = time.Time{}
-	} else if d.slideshowIdleSince.IsZero() {
+	} else if d.slideshowIdleSince.IsZero() || (s.cue != "" && now.Sub(d.slideshowIdleSince) < wait) {
+		// A turn under a cue is somebody at the screen, as any turn is: the screensaver's wait starts
+		// again from it. One already up stays up under the light, as any page under a cue does.
 		d.slideshowIdleSince = now
 	}
 	idleSince := d.slideshowIdleSince
 	d.mu.Unlock()
-	if boring && !idleSince.IsZero() && now.Sub(idleSince) >= home.Get().SlideshowIdleTimeout() {
+	if boring && !idleSince.IsZero() && now.Sub(idleSince) >= wait {
 		s.slideshowScreensaver = home.Get().SlideshowScreensaverPhoto()
-		if home.Get().SlideshowMode() == config.SlideshowScreensaver && s.sunrise == 0 {
+		if home.Get().SlideshowMode() == config.SlideshowScreensaver && !s.redClock && s.sunrise == 0 {
 			if art, fx := sceneArt(now, side, side); art != nil {
 				s.slideshowScreensaver, s.artFx = art, fx
 			}
 		}
 		s.slideshowOverlay = home.Get().SlideshowOverlay()
+		if s.slideshowScreensaver != nil && !home.Get().SlideshowArt() {
+			s.slideshowCaptions = home.Get().SlideshowCaptions()
+		}
 	}
 
 	d.dashSceneSpot(&s)
 	s.callButton = callButton.Load()
 	d.videoSceneSpot(&s, now)
+	d.mu.Lock()
+	if s.showDash && d.dashHeld {
+		// A dashboard Home Assistant put up is shown over the night, as on the Show: somebody set it up
+		// to be seen.
+		s.redClock = false
+	}
+	d.redShown = s.nightClockFace()
+	d.mu.Unlock()
 	if s.showVideo && s.videoLive {
 		// The picture's own frames go to the panel; the canvas holds only the controls.
 		d.r.draw(s)
@@ -1430,6 +1800,8 @@ func (d *Display) frame() time.Duration {
 	d.callShown = d.r.callDrawn
 	d.mu.Unlock()
 	painted := time.Now()
+	plain := s.nightClockFace() || s.muted || s.cameraLive
+	unskinned(d.dev, plain)
 	if err := d.dev.Present(); err != nil {
 		slog.Warn("presenting the frame failed", "err", err)
 	}
@@ -1441,18 +1813,22 @@ func (d *Display) frame() time.Duration {
 	for pending := true; pending; {
 		select {
 		case reply := <-d.shots:
-			src := d.dev.Canvas()
-			cp := image.NewRGBA(src.Rect)
-			copy(cp.Pix, src.Pix)
-			reply <- cp
+			reply <- skinnedCopy(d.dev.Canvas(), plain)
 		default:
 			pending = false
 		}
 	}
 
+	if cueFace(s) && cueLit(s.cue) {
+		// The cue's rim breathes and runs over whatever face is up; a face that moves faster keeps
+		// its own pace.
+		defer func() { next = min(next, cueFrame) }()
+	}
 	switch {
 	case turning || (s.menuOpen && d.isSpinning()):
 		return dialFrame
+	case s.showCamera && stillOnly(s.camera):
+		return time.Until(now.Truncate(idleFrame).Add(idleFrame)) // a still: its picture arriving wakes the loop
 	case s.showCamera:
 		// New frames wake the loop themselves; this only brings the view down when its time is up.
 		return activeFrame
@@ -1462,15 +1838,17 @@ func (d *Display) frame() time.Duration {
 		return fxFrame
 	case s.sheetOpen:
 		return dialFrame // a finger dragging the page is followed smoothly
+	case s.firstRunUp:
+		return time.Second // Home Assistant connecting moves it on by itself
 	case s.showDash && !s.menuOpen:
 		return time.Second // what arrives for it wakes the loop itself
 	case d.r.artDrawn:
 		return artFxFrame // rain or snow is falling over the weather art on the screen
 	case s.eq != nil && !s.showVolume && !s.menuOpen && !s.sheetOpen && !s.showCamera && s.call.Phase == phone.Idle &&
-		!s.ringing.any() && !s.setupAsking && !s.announceRecording && !s.showReminder && !s.showAnnouncement &&
-		!s.showAlert && !(s.phase == "lingering" && s.eq.quiet):
-		if s.eq.wave {
-			return waveFrame
+		!s.ringing.any() && !s.setupAsking && !s.announceRecording && !s.showReminder && !s.showAnnouncement && !s.showNotification &&
+		!s.showAlert && !(s.phase == "lingering" && s.eq.quiet && faceSettled(s.eq)):
+		if s.eq.wave || s.eq.style == "orb" || s.eq.style == "face" {
+			return waveFrame // ten a second: the orb and the face are soft and need no more
 		}
 		return eqFrame // the bars are moving
 	case s.phase == "listening" || s.phase == "thinking" || s.phase == "replying" || s.showVolume || s.menuOpen || s.btPairing || s.call.Phase != phone.Idle || s.ringing.any():
@@ -1500,21 +1878,6 @@ func (d *Display) Screenshot() *image.RGBA {
 		return nil
 	}
 }
-
-// setAtNight and nightHoursChanged are the Show's night light and its Home Assistant selects; the
-// Spot's night only dims, and its hours are not in Home Assistant.
-func (d *Display) setAtNight(int)     {}
-func (d *Display) nightHoursChanged() {}
-
-// The clock's position and the date's color are the Show's (clock_layout.go): the Spot's round face
-// has neither.
-func clockLayoutRows() []settingRow                        { return nil }
-func clockLayoutPicker(string) (pickerView, bool)          { return pickerView{}, false }
-func (d *Display) chooseClockLayout(id string, i int) bool { return false }
-
-// nightLeftToHA does nothing on the Spot, which has no Night mode switch (hasNightSwitch).
-func (d *Display) nightLeftToHA()    {}
-func (d *Display) setNightStyle(int) {}
 
 // popupSettingsChanged: the Spot has no event pop-ups yet.
 func (d *Display) popupSettingsChanged() {}

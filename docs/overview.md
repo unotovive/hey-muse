@@ -5,27 +5,41 @@ is the state.
 
 ## What a TECHO5 is
 
-An Amazon Echo Show 5 (MediaTek MT8163, "cronos") running our own Linux image instead of
-Android, with one Go daemon, `echod`, doing everything the device does:
+An Amazon Echo (the Show 5 and Show 8, both generations, the Spot, the Dot and the Echo 2nd gen), a
+Skylight Calendar 15 or an Android tablet (the Panel app) running our own Linux image instead of
+the vendor's system. One Go daemon, `echod`, does everything the device does; only the boot image and
+kernel differ per device. This page describes the Show 5 (MediaTek MT8163, "cronos"), the one the
+project started on:
 
 - **Voice satellite for Home Assistant** over the ESPHome API: local wake word (microWakeWord on
   the CPU), streaming to Home Assistant's pipeline, spoken replies, echo cancellation so the
   wake word works over music. It sounds like Home Assistant's own voice satellites: their recorded
   sounds for a wake word, muting and a finished timer are the defaults, and TECHO5's own notes are a
-  choice (the Wake sound setting, and Home Assistant sounds under Sound & Voice).
+  choice (the Wake sound setting, and Home Assistant sounds under Sound & Voice). With echo
+  cancellation on, the microphones stay open while the wake sound plays, so a request can follow the
+  wake word in one breath. The sounds a request makes can be your own recordings, **Voice volume** and
+  **Call volume** sit a few steps above or below the music volume, and spoken replies can play on any
+  Home Assistant media player.
 - **Screen**: clock and weather, the conversation as it happens, a now-playing page with song and
   artwork, a forecast page and a rain radar map, live views of Home Assistant cameras — the camera's own sound plays over the music, with a Mute
   control on the view — and of the Show's own camera, and
   a swipe-down settings screen with its categories down the left (Display, Sound, Alarms,
   Connections, Privacy, General) and each one's settings on a card beside them, a drawer in from the
-  right edge with Cameras and Radio, and Wi-Fi setup with an on-screen keyboard. A first-run card
+  right edge with Cameras and Radio (and, once lists are chosen, a To-do tab with Home Assistant's to-do and
+  shopping lists, on the Show, the Skylight and the Panel), and Wi-Fi setup with an on-screen keyboard. A first-run card
   shows once.
+
+  What each touch and swipe on a Show's clock does:
+
+  ![Touch map of the clock](images/touch-map.svg)
+
 - **Timers and alarms**: voice timers from Home Assistant count down under the clock; alarms are set
   on the settings screen (Alarms) or with the `alarm_set` action, or followed from Home Assistant `input_datetime`
   helpers (`alarms_follow`), and ring from the device's own clock even when Home Assistant is down.
   A ringing timer or alarm takes the whole screen, lights a dark one, and offers Stop and Snooze
-  (9 minutes unless changed); the alarm sound (Home Assistant, Beeps, Chimes, Bells, Gentle or Pulse) and the snooze
-  length are set on the Alarms card or in Home Assistant; the stop word, the action button and Home Assistant's Stop/Snooze buttons work too.
+  (9 minutes unless changed); the alarm sound (Home Assistant, Beeps, Chimes, Bells, Gentle, Pulse or a recording of your own), whether it
+  starts quiet and gets louder, and the snooze length are set on the Alarms card or in Home Assistant; the stop word, the action button and Home Assistant's Stop/Snooze buttons work too.
+  Home Assistant can see one ringing: `binary_sensor.sounding` is on while any ring is active (including one a button silenced and not yet answered), `alarm_sounding` and `timer_sounding` say which kind, and the `sounding_what` text sensor names them (`alarm "Wake up", timer "Pasta"`). They are on every device.
 - **Weather**: a new device shows Home Assistant's own forecast (`weather.forecast_home`), or, when
   Home Assistant has none, the first weather entity it lists; any other
   weather entity is chosen on the settings screen (General, Weather), with the "Weather source"
@@ -34,7 +48,8 @@ Android, with one Go daemon, `echod`, doing everything the device does:
   zone, the last hour as a loop, over NASA's Blue Marble with a GOES satellite's clouds and the towns
   named. The radar comes from the National Weather Service in the lower 48 and RainViewer anywhere
   else; the "Radar source" setting (settings screen, or the `radar_source` select) can pick either
-  always. "Show the radar" asks for it directly.
+  always. "Show the radar" asks for it directly. On a Show, Home Assistant's `weather_show` and
+  `radar_show` actions open the forecast and the rain map, for a dashboard button or an automation.
 - **Weather alerts** (U.S.): the National Weather Service's alerts in force at home put a badge on the
   clock (a pill on the Spot) and pills over the rain map, with the alerts' storm polygons and counties
   outlined on it; a tap opens the alert's whole text, swiped sideways to the next. On unless turned off
@@ -47,24 +62,37 @@ Android, with one Go daemon, `echod`, doing everything the device does:
   token, Local stations (within 100 km of home) and Popular worldwide come from Home Assistant's
   Radio Browser integration and play through `media_player.play_media` on the device's own player,
   with no setup. Stations play on the device's own speaker or on Bluetooth earbuds; song, artist and
-  cover come from iHeartRadio or TuneIn behind the page.
+  cover come from iHeartRadio or TuneIn behind the page, and for the BBC's own networks from the BBC.
 - **Camera**: the front camera as a Home Assistant camera entity (plus JPEG and MJPEG over HTTP
   when switched on). Auto-exposure meters a center-weighted zone grid, so a window behind somebody
   no longer sets it, and the tone curve finds black and lifts the middle of a backlit frame. Off
   unless something is looking, and off while the mute button is engaged.
+- **Baby monitor**: a private link plays the room's sound live in a phone's browser, on devices with
+  microphones. Off until you turn it on in Privacy & Security; the screen (or the Dot's light ring)
+  shows when someone is listening, and the mute switch stops it. See
+  [setup.md](setup.md#the-baby-monitor).
 - **Phone calls** through a SIP provider (TLS and SRTP): placed from Home Assistant (`phone_call`) or
   by voice through an automation, answered on the call page, device to device calls, an
   `esphome.techo5_phone` event per step. Off until `phone_account` signs the device in. See
   [phone.md](phone.md).
-- **Bluetooth audio** to earbuds or a speaker; a Bluetooth proxy for Home Assistant (scanning
-  through BlueZ on the Show), off by default.
+- **Bluetooth audio** to earbuds or a speaker, and from a phone on the Show, the Spot and the Dot; a
+  Bluetooth proxy for Home Assistant, off by default: scanning, and on the Show and the Spot active
+  connections too (through BlueZ) behind a switch of their own, also off by default, so integrations
+  that control a BLE device can reach it.
 - **Security**: nothing is open to the network by default except Home Assistant's encrypted link
   and the Sendspin player. SSH (keys only), the camera page and the screen page each have a switch
   on the settings screen (Privacy) and in Home Assistant, all off on a new device. SSH keys come only from Home
   Assistant (`ssh_keys` action) and live on userdata; the image carries none.
 - **Time zone**: taken from Home Assistant on each connection (the POSIX rule it sends ESPHome devices)
   and kept on userdata, so the images carry none and a unit keeps its zone while Home Assistant is
-  away; a new unit is on UTC until its first connection.
+  away; a new unit is on UTC until its first connection. A zone chosen on the device (Settings,
+  General, Time zone) holds over Home Assistant's until Follow Home Assistant is chosen again; the Common
+  zones work even on an early image with no zone database.
+- **Clock**: set from time servers on the internet (NTP). A time server on your own network, like a
+  router's, can be set on the setup page (General, Time server) and is asked first. A device that
+  reaches no time server at all takes Home Assistant's time when it connects; once NTP has set the
+  clock, Home Assistant's time doesn't change it. On a Dot, a new time server is asked from its next
+  restart.
 - **Updates**: two root filesystem slots with a trial and automatic fallback; a release that
   carries a rootfs tarball installs over the air from Home Assistant's update entity.
 
@@ -74,6 +102,7 @@ Android, with one Go daemon, `echod`, doing everything the device does:
 |---|---|---|
 | Bootloader | Amazon's LK, patched for our logo and unlocked with the amonet/kaeru chain | `tools/linux/patch-lk-logo.py`, `docs/hardware.md` |
 | Kernel | LineageOS cronos 4.9 rebuilt with Bluetooth and MODVERSIONS, vendor Wi-Fi/BT modules | `tools/linux/build-kernel.sh`, `patch-dtb.py`, `build-image.sh` |
+| Mainline kernel | The Show 8 2nd gen (athena) and the Skylight run TECHO5's own 64-bit mainline kernel instead of a vendor one | `tools/linux/athena/kernel`, `tools/linux/skylight/kernel` |
 | Root filesystem | Alpine armv7 plus our overlay, built in WSL, two slots on the userdata partition | `tools/linux/mkrootfs.sh`, `wsl-build.sh`, `deploy-rootfs.sh`, `rootfs/` overlay, `slotctl` |
 | Daemon | Go, one binary, features as components registered at init | `echod/` |
 | Audio | ALSA directly on the vendor PCM devices; MAX98396 amplifier controls; echo canceller in `hardware/mic` | `echod/internal/hardware/{speaker,mic}` |
@@ -82,6 +111,11 @@ Android, with one Go daemon, `echod`, doing everything the device does:
 | Bluetooth | Vendor `/dev/stpbt` bridged to `/dev/vhci` by `cmd/btbridge`; BlueZ and bluez-alsa | `cmd/btbridge`, `echod/internal/lib/{bluez,bluealsa}`, `feature/btaudio` |
 | Home Assistant | ESPHome device API (go-esphome-device), state subscription, device actions, REST with a long-lived token for weather and camera proxies | `feature/api`, `feature/hastate`, `feature/home`, `lib/hass` |
 | Updates | Manifest with binaries and a rootfs; slot devices install through `slotctl` | `echod/internal/update`, `tools/release.ps1`, `echod/cmd/mkmanifest` |
+
+The normal microphone path uses TECHO5's built-in processing. An optional
+[External microphone ASP interface](external-asp.md) allows a separately installed, compatible helper to
+process native capture PCM before the downstream mono stream is selected. The standard configuration
+needs no external helper.
 
 ## Working on it
 
@@ -102,17 +136,17 @@ Android, with one Go daemon, `echod`, doing everything the device does:
   kernel.
 - **Slots**: `slotctl status`, `slotctl install <tar.gz>`, `slotctl switch <a|b>`; a trial slot
   commits after five minutes of a healthy daemon.
-- **Release**: `tools/release.ps1 -Version vX.Y.Z -Notes "..." -Rootfs <tarball> [-Boot <image>] -Agents <dir>` builds the
-  daemon, writes the manifest, and publishes the release Home Assistant will offer. `-Boot` attaches a
-  boot image built with `build-image.sh --no-key` for new units, and refuses one that carries a key.
-  `-Agents` is the CI run's TECHO5 Deck agent files (`-NoAgents` to release without them).
+- **Release**: `tools/release.ps1` builds the daemon, writes the manifest and publishes the release
+  Home Assistant will offer. The switches it needs, and the order of the steps, are in the Releases
+  section of [building.md](building.md#releases-maintainer).
 
 ## Known gaps
 
-- The Bluetooth proxy on the Show only scans: BlueZ owns the controller, so there is no beacon
-  and no active connections for Home Assistant. It stays off by default until it has run a while.
-- The camera and screen pages have no login: they are for a trusted network, and off until
-  switched on. The rescue environment (boot image) still trusts the key built into that image.
+- The Bluetooth proxy on the Show and the Spot has no beacon: BlueZ owns the controller. Its active
+  connections have no pairing or cache clearing, and the Dot's proxy only scans. It stays off by
+  default until it has run a while.
+- The screen page has no login, and the camera pages take the stream's Digest login (or a browser
+  the setup page has let in). Both are for a trusted network, and off until switched on. The rescue environment (boot image) still trusts the key built into that image.
 - Song metadata rests on two undocumented service endpoints; when one changes shape the page
   falls back to the station logo.
 - Exposure knows the middle of the frame, not faces: somebody off to one side of a window is still

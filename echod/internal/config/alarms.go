@@ -18,6 +18,11 @@ type Alarms struct {
 	// SnoozeMinutes is how long Snooze puts an alarm off.
 	SnoozeMinutes int `json:"snooze_minutes,omitempty"`
 
+	// AllOff turns every alarm off at once and leaves each one's own switch as it is, for a trip
+	// (D#350): none of them rings, the ones followed in Home Assistant included, and turning them back
+	// on brings back the ones that were on. Reminders still go off.
+	AllOff bool `json:"all_off,omitempty"`
+
 	// Snoozed is the alarms put off and not yet rung, as absolute times. A snooze used to live only
 	// in memory, so a restart between pressing Snooze and the alarm coming back lost it silently —
 	// and somebody who pressed Snooze has been told the alarm is coming back.
@@ -26,8 +31,31 @@ type Alarms struct {
 	// as the process restarting, and means the same thing whatever the clock did in between.
 	Snoozed []Snooze `json:"snoozed,omitempty"`
 
+	// Skipped is the occurrences left out, by alarm and moment. One alarm's next time is then the one
+	// after it, while its On and Days stay as they are: a recurring alarm is left out once, not turned
+	// off or moved. Written when one is left out, never on a tick, and only trusted once on disk.
+	Skipped []Skip `json:"skipped,omitempty"`
+
+	// Held is the alarm the wake light is held at full for, after a ring with a wake light ended
+	// inside that alarm's window (#161), so a restart in between keeps the light up as a snooze keeps
+	// it. Nothing for none.
+	Held *Held `json:"held,omitempty"`
+
+	// HeldDark is the screen turned off by somebody while the wake light was held at full, kept so a
+	// restart does not light the panel again under the same light: the moment that light waits for.
+	// Zero for none; it goes when the light it was turned off under is over.
+	HeldDark time.Time `json:"held_dark,omitzero"`
+
 	// Sound is what an alarm rings with, by name; empty is the first of the speaker's alarm sounds.
 	Sound string `json:"sound,omitempty"`
+
+	// Say is what an alarm says as it starts ringing: its words (the default), the time and its words,
+	// or nothing.
+	Say AlarmSay `json:"say,omitempty"`
+
+	// Rise is how long an alarm takes to come up from quiet to its ring volume (#284); empty rings at
+	// full from the first chime, as alarms always have.
+	Rise AlarmRise `json:"rise,omitempty"`
 
 	// SunriseMinutes is how long before an alarm the screen starts to light, nothing for not at all:
 	// the default, for alarms that do not choose their own (Alarm.Sunrise) and for the Home Assistant
@@ -77,6 +105,11 @@ type Alarm struct {
 	// Silent makes no sound and shows no ring: it only tells Home Assistant (feature/alarm's Event),
 	// for an alarm that is an automation's wake-up call rather than the device's.
 	Silent bool `json:"silent,omitempty"`
+
+	// LightOnly makes it a wake light and no more (#164): the light comes up before it as for any
+	// alarm, and at its time there is no sound and nothing to stop; the night ends instead, so the
+	// screen is back as by day until the night's next start. It always has a light (SunriseFor).
+	LightOnly bool `json:"light_only,omitempty"`
 }
 
 // DateLayout is how an alarm's date is written.
@@ -115,14 +148,26 @@ const SunriseOff = -1
 // in the afternoon is the bug this replaced.
 func (a Alarms) SunriseFor(al Alarm) int {
 	switch {
-	case al.Remind || al.Silent || al.Sunrise < 0:
+	case al.Remind || al.Silent:
 		// A reminder is said, and a silent alarm is Home Assistant's: neither brings up the light.
 		return 0
 	case al.Sunrise > 0:
 		return al.Sunrise
+	case al.LightOnly:
+		// The light is all a light-only alarm is, so it has one even where the default is none or the
+		// alarm's own light was turned off.
+		if a.SunriseMinutes > 0 {
+			return a.SunriseMinutes
+		}
+		return LightOnlyMinutes
+	case al.Sunrise < 0:
+		return 0
 	}
 	return max(a.SunriseMinutes, 0)
 }
+
+// LightOnlyMinutes is a light-only alarm's light where nothing else says how long.
+const LightOnlyMinutes = 30
 
 // Snooze is one alarm put off until At. Key is the alarm it came from, so a snooze that fires can be
 // told apart from the alarm's own next time.
@@ -130,6 +175,22 @@ type Snooze struct {
 	Key   string    `json:"key"`
 	Label string    `json:"label,omitempty"`
 	At    time.Time `json:"at"`
+	// Lit is a snooze of an alarm that had a wake light, which stays on at full until it rings again.
+	Lit bool `json:"lit,omitempty"`
+}
+
+// Held is the alarm the wake light waits for at full: Key is the alarm, At the moment it rings.
+type Held struct {
+	Key string    `json:"key"`
+	At  time.Time `json:"at"`
+}
+
+// Skip is one occurrence left out: the ID of the alarm it belongs to, and the moment it would have
+// rung. The moment is exact, so it leaves out that occurrence alone and the alarm's next one is its
+// usual one.
+type Skip struct {
+	ID string    `json:"id"`
+	At time.Time `json:"at"`
 }
 
 const (
@@ -242,7 +303,18 @@ func (w AlarmsWriter) Put(a Alarm) error {
 func (w AlarmsWriter) Delete(id string) error {
 	return w.st.Update(func(c *Config) {
 		c.Alarms.List = slices.DeleteFunc(c.Alarms.List, func(x Alarm) bool { return x.ID == id })
+		// Its occurrence left out has no alarm to leave it out of now.
+		c.Alarms.Skipped = slices.DeleteFunc(c.Alarms.Skipped, func(x Skip) bool { return x.ID == id })
 	})
+}
+
+// ChangeStrict applies f to the alarms and writes the file only when f accepts the change and the
+// file takes it. A change that could not be saved, or that f refused, is taken back whole, even when
+// the file was never readable: unlike UpdateOrUndo there is no run-long exception, because what this
+// is for is a promise — an occurrence somebody was told is left out — that must not be reported from
+// memory alone.
+func (w AlarmsWriter) ChangeStrict(f func(*Alarms) error) error {
+	return w.st.UpdateChecked(func(c *Config) error { return f(&c.Alarms) })
 }
 
 // SnoozeMinutes sets the snooze length, held between MinSnoozeMinutes and MaxSnoozeMinutes.
@@ -257,6 +329,22 @@ func (w AlarmsWriter) Snoozed(list []Snooze) error {
 	return w.st.Update(func(c *Config) { c.Alarms.Snoozed = slices.Clone(list) })
 }
 
+// Held sets the alarm the wake light is held for, nil for none. Like Snoozed, it is written when the
+// hold begins or is let go, never on a tick.
+func (w AlarmsWriter) Held(h *Held) error {
+	if h != nil {
+		c := *h
+		h = &c
+	}
+	return w.st.Update(func(c *Config) { c.Alarms.Held = h })
+}
+
+// HeldDark sets the moment the screen stays off for the held wake light until, zero for none. Written
+// when the screen is turned off under the light and when that light is over, never on a tick.
+func (w AlarmsWriter) HeldDark(until time.Time) error {
+	return w.st.Update(func(c *Config) { c.Alarms.HeldDark = until })
+}
+
 // SunriseMinutes sets how long before an alarm the screen starts to light; nothing for not at all.
 func (w AlarmsWriter) SunriseMinutes(n int) error {
 	return w.st.Update(func(c *Config) { c.Alarms.SunriseMinutes = n })
@@ -264,6 +352,11 @@ func (w AlarmsWriter) SunriseMinutes(n int) error {
 
 func (w AlarmsWriter) SunriseFace(on bool) error {
 	return w.st.Update(func(c *Config) { c.Alarms.SunriseFace = on })
+}
+
+// AllOff turns every alarm off at once, or back on (Alarms.AllOff).
+func (w AlarmsWriter) AllOff(off bool) error {
+	return w.st.Update(func(c *Config) { c.Alarms.AllOff = off })
 }
 
 // Sound sets what alarms ring with, by name.
@@ -275,6 +368,87 @@ func (w AlarmsWriter) RingVolume(n int) error {
 
 func (w AlarmsWriter) Sound(name string) error {
 	return w.st.Update(func(c *Config) { c.Alarms.Sound = name })
+}
+
+// Say sets what an alarm says as it starts ringing.
+func (w AlarmsWriter) Say(v AlarmSay) error {
+	return w.st.Update(func(c *Config) { c.Alarms.Say = v })
+}
+
+// Rise sets how long an alarm takes to get up to its ring volume.
+func (w AlarmsWriter) Rise(v AlarmRise) error {
+	return w.st.Update(func(c *Config) { c.Alarms.Rise = v })
+}
+
+// AlarmRise is how long an alarm takes to come up from quiet to its ring volume.
+type AlarmRise string
+
+const (
+	RiseNone AlarmRise = ""
+	Rise30s  AlarmRise = "30s"
+	Rise1m   AlarmRise = "1m"
+	Rise2m   AlarmRise = "2m"
+	Rise5m   AlarmRise = "5m"
+)
+
+// AlarmRises is the choice, for a select.
+func AlarmRises() []AlarmRise { return []AlarmRise{RiseNone, Rise30s, Rise1m, Rise2m, Rise5m} }
+
+// Duration is how long the rise takes; 0 for none, and for a value this version does not know.
+func (v AlarmRise) Duration() time.Duration {
+	switch v {
+	case Rise30s:
+		return 30 * time.Second
+	case Rise1m:
+		return time.Minute
+	case Rise2m:
+		return 2 * time.Minute
+	case Rise5m:
+		return 5 * time.Minute
+	}
+	return 0
+}
+
+func (v AlarmRise) Label() string {
+	switch v {
+	case Rise30s:
+		return "Over 30 seconds"
+	case Rise1m:
+		return "Over 1 minute"
+	case Rise2m:
+		return "Over 2 minutes"
+	case Rise5m:
+		return "Over 5 minutes"
+	}
+	return "Full at once"
+}
+
+// AlarmSay is what an alarm says as it starts ringing.
+type AlarmSay string
+
+const (
+	// SayWords is an alarm's own words, when it has some: what alarms have always said, so it is the
+	// empty value and a device that never chose keeps it.
+	SayWords AlarmSay = ""
+
+	// SayTime is the time it rings at, then its words, so an alarm with none still says something.
+	SayTime AlarmSay = "time"
+
+	// SayNothing is the ring alone.
+	SayNothing AlarmSay = "off"
+)
+
+// AlarmSays is the choice, for a select.
+func AlarmSays() []AlarmSay { return []AlarmSay{SayWords, SayTime, SayNothing} }
+
+func (v AlarmSay) Label() string {
+	switch v {
+	case SayTime:
+		return "The time and its words"
+	case SayNothing:
+		return "Nothing"
+	}
+	return "Its words"
 }
 
 func (w AlarmsWriter) Follow(entities []string) error {

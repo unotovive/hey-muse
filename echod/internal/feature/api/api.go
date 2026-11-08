@@ -25,8 +25,9 @@ import (
 	"github.com/HuskerMinion/techo5/echod/internal/component"
 	"github.com/HuskerMinion/techo5/echod/internal/config"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/bluetooth"
-	"github.com/HuskerMinion/techo5/echod/internal/feature/voice"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/wakeword"
+	"github.com/HuskerMinion/techo5/echod/internal/feature/web"
+	"github.com/HuskerMinion/techo5/echod/internal/hardware/led"
 	"github.com/HuskerMinion/techo5/echod/internal/layout"
 	"github.com/HuskerMinion/techo5/echod/internal/lib/safe"
 )
@@ -60,6 +61,9 @@ type API struct {
 
 	reconnect chan struct{}
 	announced sync.Once
+
+	// clients is the connections open now (clients.go).
+	clients atomic.Int32
 
 	// mu guards nextPSK, a key for the server to take when it next listens, key, the key in force,
 	// and unkeyed, whether that is the zero key (adopt.go).
@@ -102,12 +106,16 @@ func (a *API) useKey(k *esphome.PSK) {
 
 // serverFor is a server for one spell of listening, serving with k.
 func (a *API) serverFor(k *esphome.PSK) *esphome.Server {
+	// The room first run chose, read afresh for each spell: choosing it reconnects (firstrun.go), so a
+	// Home Assistant adding the device after that finds the device in it.
+	info := a.info
+	info.SuggestedArea = config.Get().Home.Area
 	return &esphome.Server{
 		Addr:         a.addr,
 		WriteTimeout: writeTimeout,
-		Info:         a.info,
+		Info:         info,
 		PSK:          k,
-		Logger:       slog.Default(),
+		Logger:       slog.New(newFloodGuard(slog.Default().Handler())),
 		// Persist a key Home Assistant pushes, or the next connection reverts to the old one.
 		OnSetEncryptionKey: a.keySet,
 
@@ -148,7 +156,12 @@ func Get() *API {
 // happens before the server is up; Home Assistant also has to allow it for this device.
 func (a *API) call(c component.Call) {
 	srv := a.server()
-	if srv == nil {
+	if srv == nil || a.clients.Load() == 0 {
+		// Nobody to send it to: Broadcast would send it to no one and say nothing.
+		slog.Info("home assistant action not called: Home Assistant is not connected", "service", c.Service)
+		if c.Unheard != nil {
+			c.Unheard()
+		}
 		return
 	}
 	pairs := func(m map[string]string) []*api.HomeassistantServiceMap {
@@ -176,6 +189,7 @@ func (a *API) Start(ctx context.Context) error {
 		return err
 	}
 	psk = a.resumeAdoption(psk)
+	psk = a.firstStart(psk)
 	a.mu.Lock()
 	a.useKey(psk)
 	a.mu.Unlock()
@@ -186,28 +200,33 @@ func (a *API) Start(ctx context.Context) error {
 
 	device := config.Get().Device
 	ents := esphome.NewEntities()
-	if err := ents.Add(component.Default().Entities()...); err != nil {
+	if err := ents.Add(heard(component.Default().Entities())...); err != nil {
 		return err
 	}
-	if err := ents.AddActions(component.Default().Actions()...); err != nil {
+	if err := ents.AddActions(heardActions(component.Default().Actions())...); err != nil {
 		return err
 	}
 
-	a.name = layout.Slug(device.Name)
+	a.name = nodeName(device.Name, mac)
 	a.addr = device.Addr
 	a.info = esphome.Info{
 		Name:         a.name,
 		FriendlyName: device.Name,
 		MACAddress:   mac,
 		Manufacturer: layout.Manufacturer,
-		// The model carries the daemon's own release, since the version field is Home Assistant's
-		// ESPHome version: given this daemon's release number there, it reads an ancient ESPHome and
-		// raises a repair to update firmware the device does not run (compat.go).
-		Model:             layout.Model + " · TECHO5 " + layout.Version,
-		Version:           ESPHomeCompat,
+		Model:        layout.Model,
+		// The daemon's release goes as the project's version, beside the ESPHome release it speaks
+		// (compat.go): Home Assistant shows the firmware as "v1.6.21 (ESPHome 2026.5.1)", takes the
+		// manufacturer and model from the project name, and leaves the outdated-firmware check to a
+		// project it does not know. The model stays the same from one release to the next.
+		ProjectName:       layout.Manufacturer + "." + layout.Model,
+		Version:           layout.Version,
 		ESPHomeVersion:    ESPHomeCompat,
-		VoiceFeatures:     voice.Features,
+		VoiceFeatures:     voiceFeatures(),
 		BluetoothFeatures: bluetooth.Get().Features(),
+		// Home Assistant links the device's page to its web port (techo5-dot#24): the setup page and
+		// the rest, each served only while its switch is on.
+		WebserverPort: web.Port,
 
 		Devices: subDevices(device.Name),
 	}
@@ -219,16 +238,34 @@ func (a *API) Start(ctx context.Context) error {
 	return nil
 }
 
+// nodeName is the ESPHome node's own name (layout.NodeName).
+func nodeName(name, mac string) string { return layout.NodeName(name, mac) }
+
 // subDevices groups entities onto pages of their own, since Home Assistant puts every entity a device has
-// on one page and there are more here than anyone wants to read.
+// on one page and there are more here than anyone wants to read. A device that cannot hear has no
+// microphone or assistant pages: nothing is listed on them there (nomic.go).
 //
 // Each name carries the device's own, because Home Assistant shows what it is given verbatim: a bare "Ring"
 // or "Assistant 1" is unreadable in a house with several satellites.
 func subDevices(name string) []esphome.Device {
 	out := []esphome.Device{
-		{ID: component.DeviceRing, Name: name + " ring"},
 		{ID: component.DeviceMicrophone, Name: name + " microphone"},
 		{ID: component.DevicePlayback, Name: name + " playback"},
+	}
+	if led.HasRing {
+		// Only a device with a ring has anything to put on its page (led.HasRing).
+		out = append([]esphome.Device{{ID: component.DeviceRing, Name: name + " ring"}}, out...)
+	}
+	// Sub-devices a component asks for while a setting is on (component.Offer): the Tessera screen.
+	out = append(out, component.OfferedDevices(name)...)
+	if !layout.HasMicrophone() {
+		kept := out[:0]
+		for _, d := range out {
+			if !listeningDevice(d.ID) {
+				kept = append(kept, d)
+			}
+		}
+		return kept
 	}
 
 	for slot := range wakeword.Slots {
@@ -274,11 +311,7 @@ func (a *API) Run(ctx context.Context) error {
 		// A device with a key serves Noise: a plaintext hello is told so (plainhint.go). Not while it
 		// waits on the zero key for a Home Assistant to give it one (adopt.go): that hand-over is
 		// left exactly as Home Assistant has always found it.
-		served := ln
-		if keyKind(srv.PSK) == keyReal {
-			served = hintListener{ln}
-		}
-		err = srv.Serve(serving, served)
+		err = srv.Serve(serving, servedListener(ln, &a.clients, keyKind(srv.PSK) == keyReal))
 		stop()
 
 		if err != nil || ctx.Err() != nil {
@@ -288,6 +321,9 @@ func (a *API) Run(ctx context.Context) error {
 		// Between serving and listening again is the only moment what the device says it is can change:
 		// a client is told once, when it connects. The key likewise, on a server of its own.
 		a.info.BluetoothFeatures = bluetooth.Get().Features()
+		// Serve waits for its connections to end, so nothing is reading the entities now: what they say
+		// about themselves may change here (component.Between).
+		component.Between.Emit(struct{}{})
 		a.srv.Store(a.nextServer())
 		slog.Info("serving again", "bluetooth", a.info.BluetoothFeatures)
 	}

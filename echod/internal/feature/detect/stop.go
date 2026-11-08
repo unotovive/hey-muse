@@ -73,7 +73,7 @@ func newStopEntity(d *Detect) *esphome.Number {
 		Base: esphome.Base{
 			ObjectID: "stop_word_sensitivity",
 			DeviceID: component.DeviceMicrophone,
-			Name:     "Stop word sensitivity",
+			Name:     "Stop word threshold",
 			Icon:     "mdi:hand-back-left",
 			Category: esphome.CategoryConfig,
 		},
@@ -95,11 +95,106 @@ func newStopEntity(d *Detect) *esphome.Number {
 	return n
 }
 
-func (d *Detect) Entities() []esphome.Entity { return []esphome.Entity{d.stop} }
+func (d *Detect) Entities() []esphome.Entity {
+	out := []esphome.Entity{d.stop, d.hangup.word, d.hangup.threshold}
+	for _, c := range d.commands {
+		out = append(out, c.word, c.threshold)
+	}
+	out = append(out, d.frames.busy, d.frames.rate, d.frames.worst)
+	return append(out, d.score, d.onHA.stream, d.onHA.confirm, d.onHA.threshold, d.clipsTotal, d.clipsKinds,
+		d.keepClips)
+}
+
+// newScoreEntity is the highest score the last wake reached. Set beside what was heard, it is how a
+// threshold is set by evidence rather than by guessing: a wake by mistake that scored 0.91 is gone at
+// 0.93, and a real one that scored 0.99 says there is room to go higher still.
+func newScoreEntity() *esphome.Sensor {
+	return &esphome.Sensor{
+		Base: esphome.Base{
+			ObjectID: "last_wake_score",
+			Name:     "Last wake score",
+			Icon:     "mdi:gauge",
+			Category: esphome.CategoryDiagnostic,
+		},
+		Decimals: 2,
+	}
+}
 
 // Restore only publishes the value. Loading the model is Start's, through the engine's Load, so that a
 // restart and a first boot take the same path.
 func (d *Detect) Restore(c config.Config) {
 	d.stop.Set(float32(c.Wake.Stop.Threshold))
 	slog.Info("restored", "what", d.stop.ObjectID, "using", c.Wake.Stop.Threshold)
+	d.hangup.restore(c.Wake.Hangup)
+	d.restoreCommands(c.Wake)
+	d.onHA.restore(c.Wake.OnHA)
+	// An off that never reached the state wins over it (clipsoff.go).
+	keep := d.keepClipsAtStart(c.Wake.KeepClips)
+	d.keepClips.Set(keep)
+	slog.Info("restored", "what", d.keepClips.ObjectID, "using", keep)
+	// Off, anything an earlier run left behind goes too.
+	d.clips.enable(keep)
+}
+
+// newClipsEntities are how many wake clips the device keeps (clips.go): all of them, and each kind.
+func newClipsEntities() (*esphome.Sensor, *esphome.TextSensor) {
+	total := &esphome.Sensor{
+		Base: esphome.Base{
+			ObjectID: "wake_clips",
+			Name:     "Wake clips",
+			Icon:     "mdi:waveform",
+			Category: esphome.CategoryDiagnostic,
+		},
+	}
+	kinds := &esphome.TextSensor{
+		Base: esphome.Base{
+			ObjectID: "wake_clips_by_kind",
+			Name:     "Wake clips by kind",
+			Icon:     "mdi:waveform",
+			Category: esphome.CategoryDiagnostic,
+		},
+	}
+	return total, kinds
+}
+
+// newKeepClipsEntity is Keep wake clips: short clips of the wake word kept on the device, for training
+// a model on (clips.go). Off by default; turned off, every clip kept is deleted.
+func newKeepClipsEntity(d *Detect) *esphome.Switch {
+	sw := &esphome.Switch{
+		Base: esphome.Base{
+			ObjectID: "keep_wake_clips",
+			DeviceID: component.DeviceMicrophone,
+			Name:     "Keep wake clips",
+			Icon:     "mdi:waveform",
+			Category: esphome.CategoryConfig,
+		},
+	}
+	sw.OnCommand = func(on bool) {
+		d.clipsSave.Lock()
+		defer d.clipsSave.Unlock()
+		// Turned off, the recorder stops first: nothing is kept while a save that is slow to fail runs.
+		if !on && d.clips != nil {
+			d.clips.enable(false)
+		}
+		if err := saveKeepClips(on); err != nil {
+			slog.Error("saving keep wake clips failed", "err", err)
+			if on {
+				return
+			}
+			// The clips went all the same, and the off holds past a restart: it is recorded on its own
+			// and the save tried again until it holds (clipsoff.go).
+			if err := markClipsOff(); err != nil {
+				slog.Error("recording keep wake clips off failed too", "err", err)
+			}
+			d.retryClipsOffLater()
+		} else {
+			clearClipsOff()
+		}
+		sw.Set(on)
+		slog.Info("setting changed", "setting", sw.ObjectID, "using", on)
+		if on && d.clips != nil {
+			d.clips.enable(true)
+		}
+	}
+	return sw
 }

@@ -17,14 +17,14 @@ import (
 // demo shows a made-up address in place of this device's, for screenshots that will be published.
 func setupRow(demo bool) settingRow {
 	s := setup.Get()
-	row := settingRow{id: "setuppage", label: "Setup page", sub: "Off", kind: ctlToggle}
+	row := settingRow{id: "setuppage", label: tr("ui_setup_page"), sub: tr("ui_off"), kind: ctlToggle}
 	switch {
 	case s.Waiting():
-		row.sub, row.on = "A browser is asking: press the action button", true
+		row.sub, row.on = tr("ui_setup_browser_waiting"), true
 	case s.On():
-		row.sub, row.on = "Open "+setupURL(), true
+		row.sub, row.on = fmt.Sprintf(tr("ui_setup_open_url"), setupURL()), true
 		if demo {
-			row.sub = fmt.Sprintf("Open http://192.168.1.50:%d", web.Port)
+			row.sub = fmt.Sprintf(tr("ui_setup_open_url"), fmt.Sprintf("http://192.168.1.50:%d", web.Port))
 		}
 	}
 	return row
@@ -39,5 +39,5 @@ func setupURL() string {
 			return fmt.Sprintf("http://%s:%d", v4, web.Port)
 		}
 	}
-	return fmt.Sprintf("this device's address, port %d", web.Port)
+	return fmt.Sprintf(tr("ui_setup_address_fallback"), web.Port)
 }

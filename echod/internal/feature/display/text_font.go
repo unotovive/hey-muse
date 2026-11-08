@@ -12,6 +12,8 @@ import (
 	"golang.org/x/image/font"
 	"golang.org/x/image/font/opentype"
 	"golang.org/x/image/math/fixed"
+
+	"github.com/HuskerMinion/techo5/echod/internal/lib/fonts"
 )
 
 // Noto Sans CJK JP is distributed under the SIL Open Font License in fonts/LICENSE.
@@ -28,13 +30,7 @@ func newTextFace(primary *opentype.Font, options *opentype.FaceOptions) (font.Fa
 	if err != nil {
 		return nil, err
 	}
-	japaneseFontOnce.Do(func() {
-		var err error
-		japaneseFont, err = opentype.Parse(japaneseFontData)
-		if err != nil {
-			slog.Error("parsing Japanese fallback font failed", "err", err)
-		}
-	})
+	japaneseFontOnce.Do(parseJapaneseFont)
 	if japaneseFont == nil {
 		return face, nil
 	}
@@ -44,6 +40,22 @@ func newTextFace(primary *opentype.Font, options *opentype.FaceOptions) (font.Fa
 		return nil, err
 	}
 	return &fallbackTextFace{Face: face, fallback: fallback}, nil
+}
+
+// The embedded font is lib/fonts' last resort as well, under the screen font, Go and the owner's own
+// fonts, so every face the screen makes (fontFace) draws Japanese without a download; a downloaded
+// Japanese font (feature/cjkfont) still draws what it has first.
+func init() {
+	japaneseFontOnce.Do(parseJapaneseFont)
+	fonts.SetLastResort(japaneseFont)
+}
+
+func parseJapaneseFont() {
+	var err error
+	japaneseFont, err = opentype.Parse(japaneseFontData)
+	if err != nil {
+		slog.Error("parsing Japanese fallback font failed", "err", err)
+	}
 }
 
 type fallbackTextFace struct {

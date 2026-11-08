@@ -8,10 +8,17 @@
 // input device named m_alsps_input. The driver samples every alsdelay nanoseconds, but the input
 // layer drops a value equal to the last, so a reading arrives only when the light changes. (The
 // IIO device on this board is the auxadc, which is why metrics.LuxPath finds nothing.)
+//
+// The 2nd gen Show 8 on TECHO5's mainline kernel is different: its TCS3400 is an IIO device with raw
+// color counts and no lux, so it is polled and converted here (iio.go). So is the Skylight Calendar's
+// EM3071X, which has no driver at all and is read over I2C (em3071x.go). The Echo Show 5 on TECHO5's
+// mainline kernel has no misc node either: its JSA1214 is an IIO device that reports lux with its own
+// scale, so it is polled through metrics (metricsLux).
 package ambient
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -19,14 +26,18 @@ import (
 	"time"
 
 	"github.com/HuskerMinion/techo5/echod/internal/component"
+	"github.com/HuskerMinion/techo5/echod/internal/hardware/metrics"
+	"github.com/HuskerMinion/techo5/echod/internal/layout"
 	"github.com/HuskerMinion/techo5/echod/internal/lib/hook"
 	"github.com/HuskerMinion/techo5/echod/internal/lib/input"
 	"github.com/HuskerMinion/techo5/echod/internal/service"
 )
 
 func init() {
-	component.Register(component.Hardware, Get(), component.Order(20),
-		component.Supervise(service.Restart(time.Second, 30*time.Second)))
+	if Here {
+		component.Register(component.Hardware, Get(), component.Order(20),
+			component.Supervise(service.Restart(time.Second, 30*time.Second)))
+	}
 }
 
 const (
@@ -46,7 +57,19 @@ type Sensor struct {
 	last float64
 	at   time.Time
 
-	dev *input.Device
+	dev  *input.Device
+	poll poller // athena on mainline and the Skylight instead of dev
+
+	// pollStop ends the Run polling poll, and pollDone is closed once it has: Close waits for that
+	// before it closes the sensor, so a reading under way never meets a closed bus.
+	pollStop context.CancelFunc
+	pollDone chan struct{}
+}
+
+// poller is a sensor read every period rather than one that reports by itself.
+type poller interface {
+	sample() (lux float64, ok bool, err error)
+	close() error
 }
 
 var (
@@ -70,6 +93,25 @@ func (s *Sensor) Current() (lux float64, at time.Time, ok bool) {
 
 // Start switches the sensor on and opens its input node.
 func (s *Sensor) Start(context.Context) error {
+	if layout.Skylight() {
+		return s.startEM3071X()
+	}
+	if layout.AthenaMainline() {
+		return s.startIIO()
+	}
+	if _, err := os.Stat(misc); os.IsNotExist(err) {
+		path := metrics.Reader{}.LuxPath()
+		if path == "" {
+			return fmt.Errorf("ambient: no supported light sensor")
+		}
+		s.mu.Lock()
+		s.poll = metricsLux(path)
+		s.mu.Unlock()
+		slog.Info("light sensor on", "device", path, "period", period)
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("ambient: finding the sensor: %w", err)
+	}
 	if err := os.WriteFile(misc+"/alsdelay", []byte(fmt.Sprint(period.Nanoseconds())), 0o644); err != nil {
 		return fmt.Errorf("ambient: setting the report period: %w", err)
 	}
@@ -108,19 +150,52 @@ func (s *Sensor) seed(abs func(code uint16) (input.AbsInfo, error)) (float64, bo
 }
 
 func (s *Sensor) Close() error {
+	s.mu.Lock()
+	p, dev := s.poll, s.dev
+	stop, done := s.pollStop, s.pollDone
+	s.poll, s.dev, s.pollStop, s.pollDone = nil, nil, nil, nil
+	s.mu.Unlock()
+	if p != nil {
+		if stop != nil {
+			stop()
+			<-done
+		}
+		return p.close()
+	}
 	_ = os.WriteFile(misc+"/alsactive", []byte("0"), 0o644)
-	if s.dev == nil {
+	if dev == nil {
 		return nil
 	}
-	err := s.dev.Close()
-	s.dev = nil
-	return err
+	return dev.Close()
 }
 
+// errNotOpen is Run's answer when Close came first.
+var errNotOpen = errors.New("ambient: the sensor is not open")
+
 // Run reads until ctx is canceled. The read blocks in the kernel, so cancellation closes the node
-// from the side and lets the read fail.
+// from the side and lets the read fail. What it reads is taken once, at the start: a Close that comes
+// first, or while it runs, leaves it nothing to read rather than a nil sensor; a polled sensor is only
+// closed once the poll has stopped.
 func (s *Sensor) Run(ctx context.Context) error {
-	dev := s.dev
+	s.mu.Lock()
+	p, dev := s.poll, s.dev
+	var done chan struct{}
+	if p != nil {
+		// Under the same lock as p is taken: a Close from now on stops this poll before closing p.
+		var stop context.CancelFunc
+		ctx, stop = context.WithCancel(ctx)
+		defer stop()
+		done = make(chan struct{})
+		s.pollStop, s.pollDone = stop, done
+	}
+	s.mu.Unlock()
+	if p != nil {
+		defer close(done)
+		return s.runPoll(ctx, p)
+	}
+	if dev == nil {
+		return errNotOpen
+	}
 	stop := context.AfterFunc(ctx, func() { _ = dev.Close() })
 	defer stop()
 
@@ -135,10 +210,27 @@ func (s *Sensor) Run(ctx context.Context) error {
 		if e.Type != input.EvAbs || e.Code != 0 { // ABS_X carries the lux
 			continue
 		}
-		lux := float64(e.Value)
-		s.mu.Lock()
-		s.last, s.at = lux, time.Now()
-		s.mu.Unlock()
-		s.Lux.Emit(lux)
+		s.emit(float64(e.Value))
 	}
 }
+
+func (s *Sensor) emit(lux float64) {
+	s.mu.Lock()
+	s.last, s.at = lux, time.Now()
+	s.mu.Unlock()
+	s.Lux.Emit(lux)
+}
+
+// metricsLux is an IIO light sensor that reports lux itself, read through metrics: the 2nd gen Show 5's
+// JSA1214 on TECHO5's mainline kernel.
+type metricsLux string
+
+func (p metricsLux) sample() (float64, bool, error) {
+	r := (metrics.Reader{}).Lux(string(p))
+	if !r.Known {
+		return 0, false, fmt.Errorf("ambient: reading %s", string(p))
+	}
+	return r.Value, true, nil
+}
+
+func (metricsLux) close() error { return nil }

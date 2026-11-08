@@ -4,6 +4,7 @@ package microphone
 
 import (
 	"log/slog"
+	"math"
 	"sync"
 
 	esphome "github.com/ygelfand/go-esphome-device"
@@ -21,6 +22,8 @@ func init() {
 // sub-device as a device of its own, which would put a bare "Microphone" device in the list for
 // every satellite in the house.
 type Microphone struct {
+	aspSelected *esphome.Select
+	aspActive   *esphome.TextSensor
 	mixing      *esphome.Select
 	gain        *esphome.Number
 	leveling    *esphome.Switch
@@ -28,6 +31,7 @@ type Microphone struct {
 	engine      *esphome.Select
 	denoise     *esphome.Switch
 	ends        *esphome.Switch
+	pause       *esphome.Number // how long a pause ends a turn
 	sensitivity *esphome.Number
 }
 
@@ -43,6 +47,14 @@ func Get() *Microphone {
 
 func build() *Microphone {
 	m := &Microphone{
+		aspSelected: &esphome.Select{Base: esphome.Base{
+			ObjectID: "microphone_asp_selected", Name: "Microphone ASP selected",
+			Icon: "mdi:microphone-settings", Category: esphome.CategoryConfig,
+		}},
+		aspActive: &esphome.TextSensor{Base: esphome.Base{
+			ObjectID: "microphone_asp_active", Name: "Microphone ASP active",
+			Icon: "mdi:microphone", Category: esphome.CategoryDiagnostic,
+		}},
 		mixing: &esphome.Select{
 			Base: esphome.Base{
 				ObjectID: "microphone_mixing",
@@ -91,6 +103,16 @@ func build() *Microphone {
 				Category: esphome.CategoryConfig,
 			},
 		},
+		pause: &esphome.Number{
+			Base: esphome.Base{
+				ObjectID: "microphone_end_of_speech_pause",
+				Name:     "End of speech pause",
+				Icon:     "mdi:timer-sand",
+				Category: esphome.CategoryConfig,
+			},
+			Min: config.MinEndPause / 10.0, Max: config.MaxEndPause / 10.0, Step: 0.1, Unit: "s",
+			Mode: esphome.NumberBox,
+		},
 		sensitivity: &esphome.Number{
 			Base: esphome.Base{
 				ObjectID: "microphone_sensitivity",
@@ -114,15 +136,33 @@ func build() *Microphone {
 	}
 
 	for _, b := range []*esphome.Base{
+		&m.aspSelected.Base, &m.aspActive.Base,
 		&m.mixing.Base, &m.gain.Base, &m.leveling.Base, &m.cancel.Base, &m.engine.Base, &m.denoise.Base,
-		&m.ends.Base, &m.sensitivity.Base,
+		&m.ends.Base, &m.pause.Base, &m.sensitivity.Base,
 	} {
 		b.DeviceID = component.DeviceMicrophone
 	}
 
 	source := mic.Get()
+	m.aspSelected.Options = config.Labels(config.ASPModes())
+	m.aspSelected.OnCommand = func(label string) {
+		want, ok := config.ByLabel(config.ASPModes(), label)
+		if !ok {
+			return
+		}
+		// Persistence is immediate and independent of launch/READY/PCM outcome.
+		if err := config.Set().Microphone().ASP(want); err != nil {
+			slog.Error("saving ASP selection failed", "err", err)
+		}
+		m.aspSelected.Set(source.SetASP(want).Label())
+	}
+	source.SetASPActiveObserver(func(v config.ASPMode) { m.aspActive.Set(v.Label()) })
 	component.Bind(m.mixing, mic.Mixings(), source.SetMixing, config.Set().Microphone().Mixing)
-	component.Bind(m.engine, config.CancelEngines(), setEngine, config.Set().Microphone().CancelEngine)
+	engines := config.CancelEngines()
+	if !mic.HaveWebRTC() {
+		engines = []config.CancelEngine{config.CancelBuiltin}
+	}
+	component.Bind(m.engine, engines, setEngine, config.Set().Microphone().CancelEngine)
 
 	m.leveling.OnCommand = func(on bool) {
 		m.leveling.Set(on)
@@ -156,6 +196,15 @@ func build() *Microphone {
 		}
 	}
 
+	// Read by each turn as it opens too.
+	m.pause.OnCommand = func(v float32) {
+		tenths := config.Microphone{EndPause: int(math.Round(float64(v) * 10))}.EndPauseTenths()
+		m.pause.Set(float32(tenths) / 10)
+		if err := config.Set().Microphone().EndPause(tenths); err != nil {
+			slog.Error("saving the end of speech pause failed", "err", err)
+		}
+	}
+
 	m.sensitivity.OnCommand = func(v float32) {
 		m.sensitivity.Set(v)
 		source.SetSensitivity(int(v))
@@ -176,7 +225,9 @@ func build() *Microphone {
 func (m *Microphone) Name() string { return "microphone settings" }
 
 func (m *Microphone) Entities() []esphome.Entity {
-	return []esphome.Entity{m.mixing, m.gain, m.leveling, m.cancel, m.engine, m.denoise, m.ends, m.sensitivity}
+	return append([]esphome.Entity{m.aspSelected, m.aspActive, m.mixing, m.gain, m.leveling, m.cancel, m.engine, m.denoise, m.ends, m.pause,
+		m.sensitivity},
+		buildEntities()...)
 }
 
 // setEngine applies a canceller choice and reports what the source settled on, which is the
@@ -192,7 +243,7 @@ func setEngine(e config.CancelEngine) config.CancelEngine {
 // it when it opens the device, which is the only moment it can be set.
 func (m *Microphone) Restore(c config.Config) {
 	source := mic.Get()
-
+	m.aspSelected.Set(source.SetASP(c.Microphone.ASP).Label())
 	component.Restore(m.mixing, c.Microphone.Mixing, source.SetMixing)
 
 	m.leveling.Set(c.Microphone.Leveling)
@@ -211,6 +262,9 @@ func (m *Microphone) Restore(c config.Config) {
 
 	m.ends.Set(!c.Microphone.PipelineEnds)
 	slog.Info("restored", "what", m.ends.ObjectID, "using", !c.Microphone.PipelineEnds)
+
+	m.pause.Set(float32(c.Microphone.EndPauseTenths()) / 10)
+	slog.Info("restored", "what", m.pause.ObjectID, "using", c.Microphone.EndPauseTenths())
 
 	m.sensitivity.Set(float32(c.Microphone.Sensitivity))
 	source.SetSensitivity(c.Microphone.Sensitivity)

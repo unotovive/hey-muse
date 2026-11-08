@@ -14,6 +14,7 @@ type room struct {
 	attends []bool
 	chimes  int
 	byLen   map[int]int // chimes by how many notes they had, to tell rings apart
+	gains   []float64   // each chime's share of the full level, in order
 }
 
 func (r *room) heard(notes int) int {
@@ -40,9 +41,10 @@ func quietBell(t *testing.T, rings time.Duration) *room {
 	rm := &room{}
 	wasFor, wasEvery, wasChime, wasAttend := ringFor, ringEvery, chime, attend
 	ringFor, ringEvery = rings, 5*time.Millisecond
-	chime = func(n []speaker.Note) {
+	chime = func(n []speaker.Note, gain float64) {
 		rm.mu.Lock()
 		rm.chimes++
+		rm.gains = append(rm.gains, gain)
 		if rm.byLen == nil {
 			rm.byLen = map[int]int{}
 		}
@@ -93,7 +95,7 @@ func TestAStoppedRingEndsOnceAndGivesTheRoomBack(t *testing.T) {
 	rm := quietBell(t, time.Minute)
 	var e ends
 
-	stop := Start("alarm", nil, e.ended)
+	stop := Start("alarm", "", nil, e.ended)
 	// Sounding before Start returns, so nothing sees a ring started and silent.
 	if !IsSounding() {
 		t.Fatal("not sounding straight after Start")
@@ -124,8 +126,8 @@ func TestTwoRingsShareOneLightAndOneDuck(t *testing.T) {
 	rm := quietBell(t, time.Minute)
 	var alarm, timer ends
 
-	stopAlarm := Start("alarm", nil, alarm.ended)
-	stopTimer := Start("timer", nil, timer.ended)
+	stopAlarm := Start("alarm", "", nil, alarm.ended)
+	stopTimer := Start("timer", "", nil, timer.ended)
 
 	stopTimer()
 	waitFor(t, "the timer to end", func() bool { return timer.count() == 1 })
@@ -148,7 +150,7 @@ func TestARingNobodyStopsRingsOut(t *testing.T) {
 	quietBell(t, 30*time.Millisecond)
 	var e ends
 
-	Start("timer", nil, e.ended)
+	Start("timer", "", nil, e.ended)
 	waitFor(t, "the ring to run out", func() bool { return e.count() == 1 })
 	if IsSounding() {
 		t.Error("still sounding after ringing out")
@@ -165,8 +167,8 @@ func TestAnUnansweredSilenceEndsEveryRing(t *testing.T) {
 	t.Cleanup(func() { state.now = was })
 
 	var alarm, timer ends
-	Start("alarm", nil, alarm.ended)
-	Start("timer", nil, timer.ended)
+	Start("alarm", "", nil, alarm.ended)
+	Start("timer", "", nil, timer.ended)
 	waitFor(t, "a chime", func() bool { return rm.rounds() > 0 })
 
 	if !Silence() {
@@ -198,12 +200,12 @@ func TestARingStartedDuringTheOfferSounds(t *testing.T) {
 	alarmNotes := []speaker.Note{{Freq: 440, Ms: 1}}
 	timerNotes := []speaker.Note{{Freq: 880, Ms: 1}, {Freq: 880, Ms: 1}}
 	var alarm, timer ends
-	Start("alarm", alarmNotes, alarm.ended)
+	Start("alarm", "", alarmNotes, alarm.ended)
 	waitFor(t, "the alarm", func() bool { return rm.heard(1) > 0 })
 
 	Silence()
 	time.Sleep(4 * ringEvery)
-	stopTimer := Start("timer", timerNotes, timer.ended)
+	stopTimer := Start("timer", "", timerNotes, timer.ended)
 	defer stopTimer()
 	waitFor(t, "the timer to sound over the silence", func() bool { return rm.heard(2) > 1 })
 	quiet := rm.heard(1)
@@ -229,7 +231,7 @@ func TestARingStartedDuringTheOfferSounds(t *testing.T) {
 func TestAgainSoundsASilencedRing(t *testing.T) {
 	rm := quietBell(t, time.Minute)
 	var e ends
-	stop := Start("timer", []speaker.Note{{Freq: 880, Ms: 1}}, e.ended)
+	stop := Start("timer", "", []speaker.Note{{Freq: 880, Ms: 1}}, e.ended)
 	defer stop()
 	waitFor(t, "a chime", func() bool { return rm.rounds() > 0 })
 	Silence()

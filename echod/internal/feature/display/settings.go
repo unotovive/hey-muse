@@ -12,11 +12,13 @@ import (
 
 	"github.com/HuskerMinion/techo5/echod/internal/config"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/bluetooth"
+	"github.com/HuskerMinion/techo5/echod/internal/feature/btaudio"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/home"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/media"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/mute"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/sendspin"
 	"github.com/HuskerMinion/techo5/echod/internal/layout"
+	"github.com/HuskerMinion/techo5/echod/internal/lib/bootreason"
 	"github.com/HuskerMinion/techo5/echod/internal/lib/wake"
 	"github.com/HuskerMinion/techo5/echod/internal/lib/wifi"
 )
@@ -25,7 +27,7 @@ import (
 // interface listing.
 func (d *Display) gather(s scene, restartArm time.Time) settings {
 	d.mu.Lock()
-	st := settings{cat: d.cat, picker: d.picker, cardScroll: d.cardScroll, pickScroll: d.pickScroll, checking: d.checking, colors: d.colors, folder: d.folder, brightness: d.ceiling, auto: d.autoOn, now: s.now, restartArm: restartArm}
+	st := settings{cat: d.cat, picker: d.picker, cardScroll: d.cardScroll, pickScroll: d.pickScroll, checking: d.checking, colors: d.colors, folder: d.folder, brightness: d.ceiling, auto: d.autoOn, now: s.now, restartArm: restartArm, forgetArm: d.forgetArm}
 	d.mu.Unlock()
 	if st.brightness == 0 {
 		st.brightness = config.DefaultScreenBrightness
@@ -50,13 +52,19 @@ func (d *Display) gather(s scene, restartArm time.Time) settings {
 	st.night = config.Get().Screen.Night
 	d.mu.Lock()
 	st.wifi = wifiSummary(d.wifi.status)
-	st.wifiName = cmpOr(d.wifi.status.SSID, "Not connected")
+	st.wifiName = cmpOr(d.wifi.status.SSID, tr("not_connected"))
 	if ws := d.wifi.status; !ws.Connected && ws.SSID != "" && ws.State != "" {
 		st.wifiName = ws.SSID + " · " + ws.State
 	}
 	d.mu.Unlock()
 	st.wifiOK = wifi.Available()
+	if st.wifiOK {
+		if wifi.AddressSupported() {
+			st.addressSet = wifi.LoadAddress().String()
+		}
+	}
 	st.btProxy = bluetooth.Get().Enabled()
+	st.btSCOff, st.btSCFixed = c.Bluetooth.SecureConnectionsOff, !btaudio.Get().SecureConnectionsHere()
 	st.address = address()
 	if !wifi.Available() {
 		st.wifi = st.address
@@ -77,8 +85,12 @@ func slotName() string {
 	return strings.TrimSpace(string(b))
 }
 
-// address is the device's IPv4 address, which is how people find it on the network.
-func address() string {
+// address is the device's IPv4 address, which is how people find it on the network: the network
+// stack's, and on a panel the app's (address_panel.go). A variable, for tests.
+var address = stackAddress
+
+// stackAddress is the first IPv4 address of an interface that is up, as the network stack lists them.
+func stackAddress() string {
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return "-"
@@ -100,8 +112,10 @@ func address() string {
 // restart reboots the device the plain way; the slot store and the daemon's state are on disk
 // already, so nothing needs saying goodbye to.
 func restart() {
+	bootreason.Mark(bootreason.Restart)
 	syscall.Sync()
 	if err := syscall.Reboot(syscall.LINUX_REBOOT_CMD_RESTART); err != nil {
+		bootreason.Unmark()
 		slog.Error("restart failed", "err", err)
 	}
 }

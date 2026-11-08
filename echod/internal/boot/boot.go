@@ -16,9 +16,11 @@ import (
 	"github.com/HuskerMinion/techo5/echod/internal/component"
 	_ "github.com/HuskerMinion/techo5/echod/internal/component/all"
 	"github.com/HuskerMinion/techo5/echod/internal/config"
+	"github.com/HuskerMinion/techo5/echod/internal/feature/firstrun"
 	"github.com/HuskerMinion/techo5/echod/internal/feature/voice"
 	"github.com/HuskerMinion/techo5/echod/internal/hardware/led"
 	"github.com/HuskerMinion/techo5/echod/internal/hardware/metrics"
+	"github.com/HuskerMinion/techo5/echod/internal/hardware/mic"
 	"github.com/HuskerMinion/techo5/echod/internal/layout"
 	"github.com/HuskerMinion/techo5/echod/internal/service"
 	"github.com/HuskerMinion/techo5/echod/internal/update"
@@ -29,8 +31,11 @@ import (
 // Hardware that cannot be taken is logged and left out: a device with no speaker still answers, and
 // nothing here is worth refusing to start over.
 func Run(ctx context.Context) error {
-	slog.Info("echod starting", "version", layout.Version,
+	slog.Info("echod starting", "version", layout.Version, "board", layout.Board,
 		"pid", os.Getpid(), "uid", os.Getuid(), "context", selinuxContext())
+	if layout.BoardDoubt != "" {
+		slog.Error(layout.BoardDoubt)
+	}
 
 	_ = prop.Set(layout.StartedProp, fmt.Sprintf("%.2f", metrics.Uptime()))
 	_ = prop.Set(layout.StateProp, "starting")
@@ -38,6 +43,9 @@ func Run(ctx context.Context) error {
 	// What this process was told, put where everything else reads its settings from, so nothing has to
 	// be handed a struct to find out what the device is called or where it listens. Before anything
 	// else: the components were built during init and read this the moment they are asked to restore.
+	// A reset for someone else asked for at the last run wipes the name first, so the device comes
+	// back named from its MAC rather than announcing the old home's name until the next restart.
+	firstrun.BeforeConfig()
 	config.Started(config.Device{
 		Name: name(),
 		Addr: listenAddr(),
@@ -45,6 +53,9 @@ func Run(ctx context.Context) error {
 	if err := config.LoadError(); err != nil {
 		slog.Error("reading the saved config failed, continuing with defaults", "err", err)
 	}
+	// Whether this device was set up before first run existed, looked at once, before anything asks
+	// whether first run is pending.
+	firstrun.Settle()
 
 	// Before any hardware: an update that was installed and never settled either gets its turn here or
 	// sends the device round for another boot, where something outside this binary can put the old one
@@ -64,7 +75,7 @@ func Run(ctx context.Context) error {
 
 	// The boot animation runs until Home Assistant has a pipeline listening, which is the point the
 	// device can actually answer. It only takes a claim, so it can be asked for before the ring is up.
-	startSplash(ctx, led.Get(), voice.Get().Ready)
+	startSplash(ctx, led.Get(), voice.Get().Ready, firstrun.Pending)
 
 	// Everything the device remembers, put back in the order the components registered and before
 	// anything is listening: how the device behaves is not Home Assistant's business. Silent —
@@ -96,13 +107,24 @@ func Run(ctx context.Context) error {
 func run(ctx context.Context, group *service.Group, restarting *string) error {
 	inner, stop := context.WithCancel(ctx)
 	defer stop()
+	resident := mic.Get()
+	resident.BindASP(inner)
+	// Required-service early errors enter Group.stop without ctx cancellation;
+	// the hook cancels a blocked exchange BEFORE Group waits for Run.
+	group.SetBeforeWait(resident.StopASP)
+	defer resident.WaitASP() // only after Group's capture wait
 
 	done := make(chan error, 1)
 	go func() { done <- group.Run(inner) }()
 
 	select {
 	case err := <-done:
+		resident.StopASP()
 		return err
+	case <-ctx.Done():
+		stop()
+		resident.StopASP()
+		return <-done
 	case why := <-update.Wanted():
 		*restarting = why
 		slog.Info("restarting", "why", why)
@@ -111,6 +133,7 @@ func run(ctx context.Context, group *service.Group, restarting *string) error {
 		led.Get().HoldOnStop(led.UpdateColor)
 
 		stop()
+		resident.StopASP()
 		return <-done
 	}
 }

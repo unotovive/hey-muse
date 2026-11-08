@@ -2,13 +2,10 @@ package update
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
@@ -16,10 +13,6 @@ import (
 
 	"github.com/HuskerMinion/techo5/echod/internal/layout"
 )
-
-// downloadTimeout bounds the fetch. Sixteen megabytes over a satellite's wifi is not quick, and a stalled
-// download should give up rather than hold the device in an installing state forever.
-const downloadTimeout = 10 * time.Minute
 
 // installing is held for the whole of an install, so a second request while one is running is refused
 // rather than racing it onto the same file.
@@ -47,7 +40,10 @@ func Installing() bool {
 	return true
 }
 
-func Install(ctx context.Context, m Manifest, progress func(float32)) error {
+// phase, when not nil, is called with each named step once the download has finished — installing
+// what arrived, the three-second countdown, and then the restart or the reboot itself — so a display
+// can show them rather than a bar stuck at 100%.
+func Install(ctx context.Context, m Manifest, progress func(float32), phase func(string)) error {
 	if !installing.TryLock() {
 		return ErrInstalling
 	}
@@ -59,32 +55,122 @@ func Install(ctx context.Context, m Manifest, progress func(float32)) error {
 	if err := notOlder(m.Version, layout.Version); err != nil {
 		return err
 	}
-	if slotSystem() {
-		return installRootfs(ctx, m, progress)
-	}
-	b, err := m.For(arch)
-	if err != nil {
-		return err
+
+	// A slot install replaces the whole rootfs, so getting into it is the device's reboot. A binary
+	// swap only needs this process replaced, which the supervisor does without the device going down.
+	reboot := slotSystem()
+	if reboot {
+		if err := installRootfs(ctx, m, progress, phase); err != nil {
+			return err
+		}
+	} else {
+		b, err := m.For(arch)
+		if err != nil {
+			return err
+		}
+
+		staged := filepath.Join(layout.StateDir, "echod.incoming")
+		defer os.Remove(staged)
+		// What an earlier try fetched of another release only takes up room, and has to go before the
+		// room is measured, or a nearly full partition refuses every release after it.
+		dropParts(staged+".*.part", partPath(staged, b))
+
+		// Both partitions are asked for the room before anything is fetched. The download lands on the
+		// state partition and is then copied into /system beside the binary it replaces, so the space has
+		// to be there twice over — and finding that out after sixteen megabytes have been written is
+		// finding it out with the device's storage already full.
+		if err := room(layout.StateDir, b.Size-partial(staged, b)); err != nil {
+			return err
+		}
+		if err := room(mount, b.Size); err != nil {
+			return err
+		}
+
+		if err := download(ctx, b, staged, progress); err != nil {
+			return err
+		}
+		// The download reaching its end is not the end of the install: what arrived still has to be
+		// copied into /system, and a screen left on a bar at 100% through that looks finished while the
+		// install it is describing is still going.
+		report(phase, installStep)
+		if err := swap(staged, m.Version); err != nil {
+			return err
+		}
 	}
 
-	staged := filepath.Join(layout.StateDir, "echod.incoming")
-	defer os.Remove(staged)
+	// What follows the countdown is named for what actually happens: a slot device reboots into the
+	// new rootfs, while a binary swap only has this process replaced, and a screen that called both a
+	// reboot would be saying the wrong thing on one of them.
+	last := restartStep(reboot)
+	// The install lock is held through the countdown, so a second press in this window is refused
+	// rather than starting the download over. It also gives whoever is standing at the device a
+	// visible three seconds before it goes away.
+	for seconds := 3; seconds >= 1; seconds-- {
+		report(phase, fmt.Sprintf("%s-in-%d", last, seconds))
+		time.Sleep(time.Second)
+	}
+	report(phase, last)
 
-	// Both partitions are asked for the room before anything is fetched. The download lands on the
-	// state partition and is then copied into /system beside the binary it replaces, so the space has
-	// to be there twice over — and finding that out after sixteen megabytes have been written is
-	// finding it out with the device's storage already full.
-	if err := room(layout.StateDir, b.Size); err != nil {
-		return err
+	if reboot {
+		return rebootIntoSlot()
 	}
-	if err := room(mount, b.Size); err != nil {
-		return err
-	}
+	Restart("update to " + m.Version)
+	return nil
+}
 
-	if err := download(ctx, b, staged, progress); err != nil {
-		return err
+// report passes a named step to the display, if one is listening.
+func report(phase func(string), name string) {
+	if phase != nil {
+		phase(name)
 	}
-	return swap(staged, m.Version)
+}
+
+// installStep is the named step an install is in once the download has finished and it is writing
+// what arrived: slotctl unpacking the rootfs into the other slot, or the copy into /system.
+const installStep = "installing"
+
+// installingEvery is how often that step says it is still going. It has no progress of its own to
+// report — slotctl says nothing at all until it returns, which is seconds on a fast device and
+// minutes on a slow one — and the display drops a dialog it has heard nothing about for a few
+// minutes, so the word has to keep coming well inside that.
+var installingEvery = 30 * time.Second
+
+// restartStep is the last named step of an install, and so what its countdown counts to. A slot
+// device reboots into the rootfs it has just unpacked; a binary swap only has this process replaced,
+// which the supervisor does without the device going down. The display words the two differently.
+func restartStep(reboot bool) string {
+	if reboot {
+		return "rebooting"
+	}
+	return "restarting"
+}
+
+// stillInstalling tells the display that the step with nothing to report is still running, every
+// installingEvery, until the returned function is called. That step is the one the device must not
+// lose power in, so a dialog dropped for silence there would drop the warning with it. The returned
+// function is called once, when the step is over, and does not return until the reports have stopped.
+func stillInstalling(phase func(string)) func() {
+	if phase == nil {
+		return func() {}
+	}
+	done, stopped := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(stopped)
+		tick := time.NewTicker(installingEvery)
+		defer tick.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-tick.C:
+				report(phase, installStep)
+			}
+		}
+	}()
+	return func() {
+		close(done)
+		<-stopped
+	}
 }
 
 // notOlder refuses a manifest offering a version below the one this binary reports as running.
@@ -102,58 +188,6 @@ func Install(ctx context.Context, m Manifest, progress func(float32)) error {
 func notOlder(offered, running string) error {
 	if rank, ok := compareVersions(offered, running); ok && rank < 0 {
 		return fmt.Errorf("update: %s is older than the running %s, and an older release is not installed over a newer one", offered, running)
-	}
-	return nil
-}
-
-// download fetches the binary and proves it before it is allowed near /system. The hash is taken as the
-// bytes go past rather than by reading the file back, so nothing has to hold sixteen megabytes in memory
-// on a device with half a gigabyte.
-func download(ctx context.Context, b Binary, to string, progress func(float32)) error {
-	ctx, cancel := context.WithTimeout(ctx, downloadTimeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, b.URL, nil)
-	if err != nil {
-		return err
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("update: fetching %s: %w", b.URL, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("update: fetching %s: %s", b.URL, resp.Status)
-	}
-
-	f, err := os.OpenFile(to, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	// One byte past what was offered is all that is read. The size in the manifest is what the room
-	// check was made against, and a server that keeps sending after it — a mirror serving the wrong
-	// file, or something aiming a stream of zeros at a device with a couple of gigabytes of flash —
-	// would otherwise write until the partition was full. The extra byte is what makes the length
-	// check below say "more than offered" rather than silently accepting a truncation.
-	sum := sha256.New()
-	written, err := io.Copy(io.MultiWriter(f, sum), &counter{
-		from: io.LimitReader(resp.Body, b.Size+1), size: b.Size, report: progress,
-	})
-	if err != nil {
-		return fmt.Errorf("update: downloading %s: %w", b.URL, err)
-	}
-	if err := f.Sync(); err != nil {
-		return err
-	}
-
-	if written != b.Size {
-		return fmt.Errorf("update: %d bytes, offered as %d", written, b.Size)
-	}
-	if got := hex.EncodeToString(sum.Sum(nil)); got != b.SHA256 {
-		return fmt.Errorf("update: hash %s, offered as %s", got, b.SHA256)
 	}
 	return nil
 }
@@ -216,38 +250,19 @@ func copyTo(from, to string) error {
 	return dst.Sync()
 }
 
-// counter reports how far a download has got, as a fraction.
-type counter struct {
-	from   io.Reader
-	size   int64
-	report func(float32)
-
-	read int64
-	last float32
-}
-
-func (c *counter) Read(p []byte) (int, error) {
-	n, err := c.from.Read(p)
-	c.read += int64(n)
-
-	if c.report == nil || c.size <= 0 {
-		return n, err
-	}
-
-	// Only when it has moved a percent, since every update is a message to Home Assistant.
-	if at := float32(c.read) / float32(c.size); at-c.last >= 0.01 {
-		c.last = at
-		c.report(at)
-	}
-	return n, err
-}
-
 // Serves reports whether this device could install what the manifest offers: a rootfs for its
 // architecture when it boots from slots, a binary otherwise. A release made for another device (the
 // Show's, seen from a Dot) is then not offered at all, rather than offered and failing on install.
 func (m Manifest) Serves() bool {
-	if slotSystem() {
-		_, ok := m.Rootfs[arch]
+	return m.serves(slotSystem())
+}
+
+// serves is Serves with the question of whether this device boots from slots answered, so a test can
+// ask it for either. A slot device is served by a rootfs under its own key (rootfsArch: the 2nd gen
+// Show 8's is not the other Shows'), never by the binary alone.
+func (m Manifest) serves(slots bool) bool {
+	if slots {
+		_, ok := m.Rootfs[rootfsArch()]
 		return ok
 	}
 	_, err := m.For(arch)
