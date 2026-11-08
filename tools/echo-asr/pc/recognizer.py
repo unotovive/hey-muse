@@ -41,12 +41,14 @@ def send_event(stream, kind, data):
     stream.flush()
 
 class Recognizer:
-    def __init__(self, model_dir):
+    def __init__(self, model, device, compute_type):
         from faster_whisper import WhisperModel
 
         self.lock = threading.Lock()
-        self.model = WhisperModel(str(model_dir), device='cpu', compute_type='int8', cpu_threads=6,
-                                 local_files_only=True)
+        # A local directory is used offline; a model name is fetched from the hub on first use.
+        self.model = WhisperModel(str(model), device=device, compute_type=compute_type,
+                                 cpu_threads=6 if device == 'cpu' else 0,
+                                 local_files_only=Path(str(model)).is_dir())
 
     def transcribe(self, pcm, language):
         import numpy as np
@@ -122,17 +124,40 @@ class Server(socketserver.ThreadingTCPServer):
     def verify_request(self, request, client_address):
         return client_address[0] in self.allowed
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--bind', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=50024)
     parser.add_argument('--allow', action='append', default=['127.0.0.1'], help='allowed Echo IPv4 address')
-    parser.add_argument('--model-dir', type=Path, required=True, help='local faster-whisper-small model directory')
-    args = parser.parse_args()
+    parser.add_argument('--model', default='large-v3-turbo', help='faster-whisper model name')
+    parser.add_argument('--model-dir', type=Path, default=None, help='local model directory (overrides --model)')
+    parser.add_argument('--device', choices=('auto', 'cuda', 'cpu'), default='auto')
+    parser.add_argument('--compute-type', default=None, help='default: float16 on cuda, int8 on cpu')
+    return parser.parse_args(argv)
+
+def cuda_devices():
+    try:
+        import ctranslate2
+        return ctranslate2.get_cuda_device_count()
+    except Exception:
+        return 0
+
+def model_settings(ns):
+    device = ns.device
+    if device == 'auto':
+        device = 'cuda' if cuda_devices() > 0 else 'cpu'
+    model = str(ns.model_dir) if ns.model_dir else ns.model
+    compute_type = ns.compute_type or ('float16' if device == 'cuda' else 'int8')
+    return model, device, compute_type
+
+def main():
+    args = parse_args()
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
-    recognizer = Recognizer(args.model_dir)
+    model, device, compute_type = model_settings(args)
+    LOG.info('loading model=%s device=%s compute_type=%s', model, device, compute_type)
+    recognizer = Recognizer(model, device, compute_type)
     with Server((args.bind, args.port), recognizer, args.allow) as server:
-        LOG.info('ready bind=%s port=%s', args.bind, args.port)
+        LOG.info('ready bind=%s port=%s model=%s device=%s compute_type=%s', args.bind, args.port, model, device, compute_type)
         server.serve_forever()
 
 if __name__ == '__main__':

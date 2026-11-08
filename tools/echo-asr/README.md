@@ -48,12 +48,19 @@ Changing the model restarts the recognizer, so switch between conversations. The
 
 ## Run Whisper on a PC
 
-In a Python environment on the PC, install the runtime and download the CTranslate2 model once:
+In a Python environment on the PC, install the runtime. For an NVIDIA GPU also install the CUDA 12 libraries:
 
 ```sh
-python -m pip install faster-whisper==1.2.1
-hf download Systran/faster-whisper-small --revision 536b0662742c02347bc0e980a01041f333bce120 --local-dir whisper-small
-python tools/echo-asr/pc/recognizer.py --model-dir whisper-small --bind PC_LAN_IP --allow ECHO_LAN_IP
+python -m pip install faster-whisper==1.2.1 nvidia-cublas-cu12 nvidia-cudnn-cu12
+export LD_LIBRARY_PATH=$(python -c 'import nvidia.cublas.lib, nvidia.cudnn.lib; print(nvidia.cublas.lib.__path__[0]+":"+nvidia.cudnn.lib.__path__[0])')
+python tools/echo-asr/pc/recognizer.py --bind PC_LAN_IP --allow ECHO_LAN_IP --device cuda
 ```
 
-Replace the two IP placeholders with the addresses on your LAN. The server uses CPU int8 inference and defaults to port 50024. Allow the Echo to reach that port and select the PC endpoint in Setup. To return to on-device recognition, set the endpoint back to `127.0.0.1:50024`.
+The defaults are `--model large-v3-turbo`, `--device auto` (CUDA when `ctranslate2` sees a GPU, otherwise CPU) and `--compute-type` `float16` on CUDA or `int8` on CPU. The model downloads on first start (about 1.6 GB). To run offline or on a CPU-only PC, download a model once and pass its directory:
+
+```sh
+hf download Systran/faster-whisper-small --revision 536b0662742c02347bc0e980a01041f333bce120 --local-dir whisper-small
+python tools/echo-asr/pc/recognizer.py --model-dir whisper-small --device cpu --bind PC_LAN_IP --allow ECHO_LAN_IP
+```
+
+Replace the two IP placeholders with the addresses on your LAN. The server defaults to port 50024. Allow the Echo to reach that port and select the PC endpoint in Setup. To return to on-device recognition, set the endpoint back to `127.0.0.1:50024`.
