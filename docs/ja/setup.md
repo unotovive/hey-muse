@@ -183,3 +183,111 @@ Echo Show では、P2P 地震情報（https://www.p2pquake.net/）の WebSocket 
   ```
 
 > **免責**: 表示する内容は P2P 地震情報が中継する気象庁の情報で、気象庁の警報そのものではありません。受信の遅れや欠落があり得ます。身を守る判断には、テレビ・ラジオ・携帯電話の緊急速報など公式の手段を使ってください。
+
+## 第 7 部 端末設定の配置
+
+端末に置く設定は、母艦（または Windows）の `~/.config/hey-muse/` で用意し、USB 経由でまとめて送ります。ここでは Nature Remo と Google カレンダーを使う構成を前提にします。
+
+> 番号について: 計画では第 5・6 部としていましたが、その番号は在室検知と地震情報の節がすでに使っているため、この端末設定と次の Muse の節は第 7・8 部にしました。在室検知は第 5 部、地震情報は第 6 部です。
+
+### 1. 設定ファイルを用意する
+
+| ファイル（母艦） | 端末での名前 | 内容 |
+|---|---|---|
+| `home-local.json` | `home-local.json` | `backend`、`calendars`、`voice_devices` |
+| `natureremo.env` | `natureremo.env` | `NATURE_REMO_TOKEN=…`（機種が決まるまで空でも可） |
+| `google-token.json` | `google-token.json` | 第 4 部で作ったトークン |
+
+`home-local.json` は `tools/mothership/home-local.example.json` を元に作ります。Nature Remo を使うときの形は次のとおりです。`key` は SwitchBot 用なので空のままにします。`calendars` の `id` は第 4 部の手順 5 で表示されたものです（下はダミー値）。
+
+```json
+{
+  "backend": "nature_remo",
+  "key": "",
+  "calendars": [{"id": "xxxxxxxx@group.calendar.google.com", "name": "家族"}],
+  "voice_devices": {}
+}
+```
+
+Remo の機種が決まったら、`voice_devices` に Remo アプリの機器名と種類（照明は `LIGHT`、エアコンは `AC`）を書き、`natureremo.env` にトークンを入れて、もう一度手順 2 を実行します。書き方は `tools/standalone-home/README.md` の「Nature Remo を使う」にあります。
+
+### 2. 端末へ送る
+
+端末を USB でつなぎ、シリアル番号を指定して送ります。
+
+```
+python3 tools/standalone-home/deploy_usb.py config --serial SERIAL
+```
+
+`natureremo.env` と `google-token.json` は、母艦に存在するときだけ送られます。端末側の置き場所は `/data/misc/techo5/standalone-home/` です。
+
+### 3. 有効にして確認する
+
+端末の USB コンソールで次を実行します。
+
+```sh
+touch /data/misc/techo5/standalone-home/enabled
+techo5 tools home-check
+ls -l /data/misc/techo5/standalone-home/
+```
+
+期待する結果は次のとおりです。
+
+- `Backend: nature_remo` と出ます。
+- `Calendar refreshed: N events` と出ます（N は今後 7 日間の予定の数）。
+- Remo のトークンが空なら、家電の検査はエラーで止まります。これは想定どおりで、その行までが出れば足ります。
+- 一覧に `enabled`、`home-local.json`、`natureremo.env`、`google-token.json` が見えます。
+
+`natureremo.env`、`google-token.json`、`home-local.json` の `key` は秘密情報です。リポジトリにコミットしないでください。
+
+### 4. 在室検知・地震情報・手で覆う停止
+
+これらは端末の設定画面の「画面」カードで入り切りします。内容は第 5 部と第 6 部を見てください。施主向けの目安は次のとおりです。
+
+- 地震情報: 新しい端末では切れています。「地震情報を表示」を入れます。既定は震度 3 以上（`min_scale` 30）です。都道府県と音は `state.json` の `quake` で設定します。
+- 在室検知: 「人感検知」を入れ、消灯までの分数を選びます。就寝中に点かないよう、消灯を 5 分程度にするのが目安です。
+- 手で覆って停止: 「手で覆って停止」を入れると、アラームやタイマーをカメラへ手をかざして止められます。Home Assistant を使っている場合に限り、「Gestures」スイッチでも切り替えられます。使わなくても支障はありません。
+
+## 第 8 部 Muse の契約とペアリング
+
+端末を Muse（Meta の AI エージェント）に答えさせる手順です。契約、トークン発行、ペアリングは施主本人のアカウントで行います。詳しい背景と注意は英語の [docs/muse.md](../muse.md) にあります。
+
+> Meta や Amazon の製品ではありません。利用は Meta の [Gadget SDK Terms](https://gadgets.muse.ai/sdk-terms) に従います。SDK トークンを作るときに同意する内容なので、先に読んでください。
+
+### 1. 契約と SDK トークン
+
+1. Muse を契約し、スマホに Muse アプリを入れます。
+2. https://gadgets.muse.ai/settings/sdk-tokens（Account → SDK tokens）で、自分の SDK トークンを作ります。`mgst_` で始まる文字列です。
+3. トークンは個人用です。公開せず、イメージやリリースに入れず、他の家庭と共有しません。1 つのトークンで最大 50 台まで使えます。
+
+### 2. 端末の設定画面で入力する
+
+1. 端末の設定画面から「セットアップページ」（設定 → プライバシー → セットアップページ）を開き、「Sound & Voice」へ進みます。
+2. 「Voice assistant」の「Answered by」を「Muse, paired with the Muse app」にします。
+3. 「Muse SDK token」にトークンを貼り付けます。
+4. 「Speaking voice」を選びます。キー不要の内蔵音声は米国英語のみです。日本語の答えを聞くには、クラウド音声（「Speech key」が必要）を選びます。音声の認識は第 3 部の母艦を使います。
+5. 「Save」を押します。トークンが空だと保存を断られます。
+
+### 3. Muse アプリからペアリングする
+
+1. セットアップページの「Muse pairing」で「Pair with the Muse app」を押します。端末が 10 分間 Bluetooth に現れ、`MuseGadgetA1B2C3` のような名前が表示されます。
+2. スマホの Muse アプリで「Settings → Devices」を開き、「Developer mode」を入れます。
+3. 右上の「+」（Add Device）を押し、手順 1 で表示された `MuseGadget` の名前を選びます。
+4. 「コミュニティ製デバイス」という警告が出ます。自分の端末なら続けます。
+5. Wi-Fi を聞かれたら、表示される 1 つのネットワークを選びます。端末はすでにつながっているので、パスワードは聞かれません。
+
+パネルが「Paired as」とあなたの Muse ユーザー名、そして「connected to Muse」と表示すれば完了です。ペアリングは再起動後も保たれます。10 分以内に終わらなければ、パネルの「Stop pairing」で止めて、やり直します。信頼できるネットワークの上で行ってください。
+
+### 4. 声の扱いを家族に伝える
+
+ウェイクワードのあと、話した内容は音声ノートとしてあなたの Muse アカウントに保存・文字起こしされます。来客の声も同じです。ウェイクワードの検出は端末内で行われ、検出前の音は外へ出ません。
+
+### 5. 推奨する Muse への指示文
+
+声で聞くので、長い答えは向きません。Muse アプリの設定（Muse への指示、カスタム指示など）に、次のような文を入れておくと、短く日本語で返ります。
+
+```
+結論を先に、2〜3 文で、日本語で答えてください。箇条書きや記号は使わず、読み上げて自然な文にしてください。
+```
+
+画面操作や電源・音量・アラームなど、端末でできることは Muse が自分で呼び出します。家電の操作は、Nature Remo の定型句（「リビングの電気を消して」など）が先に処理します。

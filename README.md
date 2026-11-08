@@ -1,3 +1,25 @@
+# Hey Muse（日本語）
+
+Amazon Echo Show 5 を、Meta の AI エージェント [Muse](https://gadgets.muse.ai) の声の窓口にする個人用プロジェクトです。この派生は、日本の家庭向けに次を加えています。
+
+- **日本語の音声認識**: 母艦（WSL の Whisper）または端末内の認識で聞き取り、母艦が止まっていれば Muse の音声ノートに切り替えます。
+- **待機画面**: Google カレンダーの予定、Nature Remo の温度・湿度と家電操作（SwitchBot も従来どおり使えます）。
+- **地震情報の割り込み表示**: P2P 地震情報を端末が直接受信し、全画面で表示します。
+- **在室検知と「手で覆って停止」**: 無人で消灯し、手をかざしてアラームを止めます。
+
+> Meta や Amazon の製品ではなく、どちらも関与していません。Muse の利用は Meta の [Gadget SDK Terms](https://gadgets.muse.ai/sdk-terms) に従います。ベースは HuskerMinion の [TECHO5](https://github.com/HuskerMinion/techo5)（MIT）で、元の README は [README.upstream.md](README.upstream.md) にあります。
+
+## 日本語の手順書
+
+- [セットアップ](docs/ja/setup.md): 母艦の常駐（第 3 部）、Google カレンダー（第 4 部）、在室検知（第 5 部）、地震情報（第 6 部）、端末設定の配置（第 7 部）、Muse の契約とペアリング（第 8 部）。
+- [リリース手順](docs/ja/release.md)
+- [受け入れ記録](docs/ja/acceptance.md): 実施した確認と、実機待ちの確認。
+- 本体連携の詳細: [tools/standalone-home/README.md](tools/standalone-home/README.md)
+
+現在のリリースは `v1.6.30-ja.2` です。以下は上流の流れを引き継いだ英語の説明です。
+
+---
+
 # Hey Muse
 
 An Amazon Echo Show 5 that answers as [Muse](https://gadgets.muse.ai), Meta's AI agent. Say "Hey
