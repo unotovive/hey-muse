@@ -9,7 +9,7 @@ Wants=network-online.target
 Type=simple
 User=@USER@
 EnvironmentFile=@HOME@/.config/hey-muse/bridge.env
-ExecStart=@HOME@/.venvs/muse-bridge/bin/python -I @HOME@/projects/musekusa/hey-muse/tools/mothership/speech_bridge.py --bind 0.0.0.0 $BRIDGE_ARGS
+ExecStart=@HOME@/.venvs/muse-bridge/bin/python -I @REPO@/tools/mothership/speech_bridge.py --bind 0.0.0.0 $BRIDGE_ARGS
 Restart=on-failure
 RestartSec=5
 

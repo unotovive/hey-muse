@@ -13,6 +13,7 @@ for arg in "$@"; do
 done
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo="$(cd "$here/../.." && pwd)"
 run_user="${SUDO_USER:-$(id -un)}"
 run_home="$(getent passwd "$run_user" | cut -d: -f6)"
 if [ "$run_user" = root ] || [ -z "$run_home" ]; then
@@ -22,6 +23,11 @@ fi
 
 sudo_cmd=""
 [ "$(id -u)" -eq 0 ] || sudo_cmd="sudo"
+
+if ! grep -qs '^systemd *= *true' /etc/wsl.conf; then
+  echo "/etc/wsl.conf の [boot] に systemd=true がありません。追記して wsl --shutdown 後に再実行してください。" >&2
+  exit 1
+fi
 
 venv_py="$run_home/.venvs/muse-asr/bin/python"
 if [ ! -x "$venv_py" ]; then
@@ -47,7 +53,7 @@ fi
 if [ "$run_user" != "$(id -un)" ]; then chown "$run_user" "$conf_dir" "$asr_env" 2>/dev/null || true; fi
 
 render() { # $1=元ユニット $2=出力先
-  sed -e "s|@USER@|$run_user|g" -e "s|@HOME@|$run_home|g" "$1" | $sudo_cmd tee "$2" >/dev/null
+  sed -e "s|@USER@|$run_user|g" -e "s|@HOME@|$run_home|g" -e "s|@REPO@|$repo|g" "$1" | $sudo_cmd tee "$2" >/dev/null
 }
 units=(muse-asr)
 [ "$with_bridge" -eq 1 ] && units+=(muse-bridge)

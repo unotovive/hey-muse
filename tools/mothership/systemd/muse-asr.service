@@ -1,4 +1,4 @@
-# 母艦の Whisper 音声認識。install.sh が @USER@ と @HOME@ を実ユーザーの値に置き換えて /etc/systemd/system/ へ入れる。
+# 母艦の Whisper 音声認識。install.sh が @USER@・@HOME@・@REPO@（リポジトリの場所） を実ユーザーの値に置き換えて /etc/systemd/system/ へ入れる。
 # システムユニットでは %h が root のホームになるため、@HOME@ を使う。
 [Unit]
 Description=hey-muse Whisper recognizer (muse-asr)
@@ -9,7 +9,7 @@ Wants=network-online.target
 Type=simple
 User=@USER@
 EnvironmentFile=@HOME@/.config/hey-muse/asr.env
-ExecStart=@HOME@/.venvs/muse-asr/bin/python @HOME@/projects/musekusa/hey-muse/tools/echo-asr/pc/recognizer.py --bind 0.0.0.0 --device auto $ASR_ARGS
+ExecStart=@HOME@/.venvs/muse-asr/bin/python @REPO@/tools/echo-asr/pc/recognizer.py --bind 0.0.0.0 --device auto $ASR_ARGS
 Restart=on-failure
 RestartSec=5
 

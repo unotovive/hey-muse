@@ -2,7 +2,7 @@
 #   powershell.exe -ExecutionPolicy Bypass -File tools\mothership\windows\setup-mothership.ps1
 # 1) .wslconfig の [wsl2] 節に networkingMode=mirrored を入れる（節は二重にしない）
 # 2) 受信ファイアウォール（TCP 50024）を開け、AC 電源時のスタンバイを無効にする
-# 3) ログオン時に WSL を起こして起こしたままにするタスクを登録する
+# 3) ログオン時に WSL を起こして起こしたままにするタスクを登録する（実行時間無制限、バッテリーでも止めない）
 # 実行後に WSL の再起動（wsl --shutdown）が必要。このスクリプトは再起動しない。
 param(
     [string]$Distro = 'Ubuntu',
@@ -60,9 +60,12 @@ if (-not (Get-NetFirewallHyperVRule -Name 'muse-asr' -ErrorAction SilentlyContin
 powercfg /change standby-timeout-ac 0
 
 # --- 3) ログオン時に WSL を起こしたままにする ---
-$tr = "wsl.exe -d $Distro --exec /bin/sh -c 'sleep infinity'"
-schtasks /Create /F /TN 'hey-muse WSL' /SC ONLOGON /RL HIGHEST /TR $tr
-if ($LASTEXITCODE -ne 0) { throw 'schtasks の登録に失敗しました。' }
+# schtasks /Create は実行時間 72 時間の制限とバッテリー時の停止が既定で入るため、Register-ScheduledTask で制限を外す。
+$action = New-ScheduledTaskAction -Execute 'wsl.exe' -Argument "-d $Distro --exec /bin/sh -c 'sleep infinity'"
+$trigger = New-ScheduledTaskTrigger -AtLogOn
+$taskPrincipal = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Highest
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+Register-ScheduledTask -TaskName 'hey-muse WSL' -Action $action -Trigger $trigger -Principal $taskPrincipal -Settings $settings -Force | Out-Null
 
 Write-Host ''
 Write-Host '完了。次に PowerShell で wsl --shutdown を実行し、WSL を開き直してください。'
