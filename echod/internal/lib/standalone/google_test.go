@@ -47,8 +47,8 @@ func googleAgendaHome(t *testing.T) (*Home, *int) {
 	next := time.Now().AddDate(0, 0, 3).Format("2006-01-02")
 	soon := time.Now().Add(3 * time.Hour).UTC().Format(time.RFC3339)
 	soonEnd := time.Now().Add(4 * time.Hour).UTC().Format(time.RFC3339)
-	later := time.Now().Add(26 * time.Hour).UTC().Format(time.RFC3339)
-	laterEnd := time.Now().Add(27 * time.Hour).UTC().Format(time.RFC3339)
+	later := time.Now().Add(50 * time.Hour).UTC().Format(time.RFC3339)
+	laterEnd := time.Now().Add(51 * time.Hour).UTC().Format(time.RFC3339)
 	return googleHome(t, 200, goodToken, map[string]string{
 		"/calendar/v3/calendars/a@group.calendar.google.com/events?pageToken=": `{"nextPageToken":"p2","items":[
 			{"status":"confirmed","summary":"遅い","start":{"dateTime":"` + later + `"},"end":{"dateTime":"` + laterEnd + `"}},
@@ -76,10 +76,11 @@ func TestGoogleAgendaMapsTimedAllDayAndPages(t *testing.T) {
 	if res.Events[0].Title != "早い" || res.Events[0].Calendar != "自分" || res.Events[0].Day {
 		t.Fatalf("first: %+v", res.Events[0])
 	}
-	if res.Events[1].Title != "遅い" || res.Events[1].Calendar != "家族" {
-		t.Fatalf("second: %+v", res.Events[1])
+	// 終日は今日+2 日の 0 時で、現在から 24〜48 時間後に収まる。「遅い」は +50 時間なので常にその後ろ。
+	if res.Events[2].Title != "遅い" || res.Events[2].Calendar != "家族" {
+		t.Fatalf("third: %+v", res.Events[2])
 	}
-	d := res.Events[2]
+	d := res.Events[1]
 	want := time.Now().AddDate(0, 0, 2)
 	wantStart := time.Date(want.Year(), want.Month(), want.Day(), 0, 0, 0, 0, time.Local)
 	if d.Title != "予定" || !d.Day || !d.Start.Equal(wantStart) || !d.End.Equal(wantStart.AddDate(0, 0, 1)) {
