@@ -14,6 +14,32 @@ python -I tools/mothership/speech_bridge.py --bind PC_LAN_IP --allowed-network E
 
 プレースホルダーは自分のアドレスに置き換えます。省略時はループバックのみです。既定ポートは50022、音声APIは `/v1/audio/speech`、稼働確認は `/health` です。Windowsで必要な場合は `--keep-awake` を指定できます。通常のテストでは自動起動登録や電源設定の変更はしません。
 
+## WSL・systemd・自動起動
+
+母艦が WSL2（`Ubuntu`）の Windows PC のとき、Whisper 認識器 `muse-asr` を systemd で常駐させ、Windows 再起動後も戻します。詳しい手順と確認の期待値は [docs/ja/setup.md](../../docs/ja/setup.md) の第 3 部にあります。ここでは要点だけ書きます。
+
+| ファイル | 役割 |
+| --- | --- |
+| `windows/setup-mothership.ps1` | 管理者の PowerShell で実行する。`.wslconfig` の `[wsl2]` 節へ `networkingMode=mirrored` を入れ（節は二重にしない）、TCP 50024 の受信許可と AC スタンバイ無効化、ログオン時に WSL を起こすタスク `hey-muse WSL` を登録する。何度実行しても安全 |
+| `install.sh` | `systemd/*.service` の `@USER@`・`@HOME@` を実ユーザーに置き換えて `/etc/systemd/system/` へ入れ、`muse-asr` を有効化する。`~/.config/hey-muse/asr.env` が無ければ雛形を作る。何度実行しても安全。`--with-bridge` で `muse-bridge` も入れる |
+| `systemd/muse-asr.service` | `recognizer.py --bind 0.0.0.0 --device auto $ASR_ARGS`。`asr.env` の `ASR_ARGS="--allow 端末のIP"` と `LD_LIBRARY_PATH` を読む |
+| `systemd/muse-bridge.service` | 任意。`speech_bridge.py --bind 0.0.0.0 $BRIDGE_ARGS`。`bridge.env` の `SPEECH_BRIDGE_TOKEN` と `BRIDGE_ARGS="--allowed-network LAN/24"` を読む |
+
+実行の順序（IP やトークンは例のダミー値に置き換える）:
+
+```text
+# Windows、管理者の PowerShell
+powershell.exe -ExecutionPolicy Bypass -File tools\mothership\windows\setup-mothership.ps1
+wsl --shutdown
+# WSL
+bash tools/mothership/install.sh
+# ~/.config/hey-muse/asr.env の ASR_ARGS="--allow 192.0.2.10" を端末の IP に直す
+sudo systemctl restart muse-asr
+systemctl is-active muse-asr
+```
+
+システムユニットでは `%h` が root のホームになるため、ユニットには `%h` ではなく置換用の `@HOME@` を使っています。
+
 ## ローカル設定
 
 `home-local.example.json` を同じディレクトリの `home-local.json` にコピーします。このファイルと実行時のSQLiteはGitの対象外です。

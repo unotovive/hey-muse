@@ -2,6 +2,100 @@
 
 この文書の他の部は、別のタスクで追加されます。ここには第 4 部「Google カレンダー」を置きます。
 
+## 第 3 部 母艦（WSL の音声認識を常駐させる）
+
+母艦は、WSL2（ディストリビューション名 `Ubuntu`）を動かす Windows の PC です。端末（Echo Show 5）の音声を Whisper で文字にする `tools/echo-asr/pc/recognizer.py` を、systemd のサービス `muse-asr` として常駐させます。Windows を再起動しても、ログオンすれば自動で戻ります。仮想環境 `~/.venvs/muse-asr` は先に作ってあることが前提です（[tools/echo-asr/README.md](../../tools/echo-asr/README.md) の「Run Whisper on a PC」）。
+
+次の作業のうち、手順 1・3・4 は Windows 側の管理者権限や WSL の再起動を伴います。作業中の WSL が止まるので、他の作業を保存してから行ってください。
+
+### 1. WSL を mirrored にし、ファイアウォールを開ける
+
+mirrored にすると、WSL が Windows と同じ LAN の IP アドレスを持ち、端末から直接届きます。既存の `.wslconfig` には `[wsl2]` 節があることが多く、節を二重にすると壊れます。次のスクリプトは、既存の節に `networkingMode=mirrored` を入れ、元のファイルを `.wslconfig.bak` に残します。ファイアウォールの受信許可（TCP 50024）と、AC 電源時にスタンバイしない設定も同じ実行で入ります。手順 3 のタスク登録も含みます。
+
+管理者として開いた PowerShell で、リポジトリの場所へ移動して実行します（`\\wsl$\Ubuntu\home\ユーザー名\projects\musekusa\hey-muse` など）。
+
+```powershell
+cd \\wsl$\Ubuntu\home\ユーザー名\projects\musekusa\hey-muse
+powershell.exe -ExecutionPolicy Bypass -File tools\mothership\windows\setup-mothership.ps1
+```
+
+期待する結果: 画面に `.wslconfig` の中身が出て、`[wsl2]` が 1 つだけで `networkingMode=mirrored` を含みます。最後に「完了」と出ます。
+
+その後、PowerShell で WSL を止め、開き直します。
+
+```powershell
+wsl --shutdown
+wsl -d Ubuntu
+```
+
+WSL の中で確認します。
+
+```bash
+ip -4 addr show | grep -v 127.0.0.1 | grep inet
+```
+
+期待する結果: Windows と同じ LAN のアドレス（例 `192.168.x.x`）が出ます。NAT のときの `172.17.x.x` ではありません。
+
+### 2. systemd ユニットを入れる
+
+WSL の中で `install.sh` を実行します。`sudo` のパスワードを 1 回聞かれます。何度実行しても安全です。ユニットの `User=` は、実行したユーザーに自動で置き換わります。
+
+```bash
+cd ~/projects/musekusa/hey-muse
+bash tools/mothership/install.sh
+```
+
+初回は `~/.config/hey-muse/asr.env` の雛形ができます。`ASR_ARGS` の `--allow` を、端末の IP アドレスに直してから再起動します（下は例のダミー値です）。
+
+```bash
+# ~/.config/hey-muse/asr.env
+ASR_ARGS="--allow 192.0.2.10"
+LD_LIBRARY_PATH=/home/ユーザー名/.venvs/muse-asr/lib/python3.12/site-packages/nvidia/cublas/lib:/home/ユーザー名/.venvs/muse-asr/lib/python3.12/site-packages/nvidia/cudnn/lib
+```
+
+```bash
+sudo systemctl restart muse-asr
+systemctl is-active muse-asr && journalctl -u muse-asr -n 5 --no-pager
+```
+
+期待する結果: `active` と出て、ログに待ち受け開始とモデル読み込みの表示があります。初回はモデルのダウンロード（約 1.6 GB）に時間がかかります。
+
+ブリッジ（`speech_bridge.py`）も常駐させる場合は、`bash tools/mothership/install.sh --with-bridge` を使います。事前に `~/.venvs/muse-bridge` を作り、`~/.config/hey-muse/bridge.env` に `SPEECH_BRIDGE_TOKEN=ランダムなトークン` と `BRIDGE_ARGS="--allowed-network 192.168.1.0/24"` を書きます（値は自分の LAN に合わせます）。`bridge.env` がなければ起動しません。
+
+### 3. Windows ログオン時に WSL を起こしたままにする
+
+手順 1 のスクリプトが、タスク `hey-muse WSL` を登録しています。ログオン時に `wsl.exe -d Ubuntu --exec /bin/sh -c 'sleep infinity'` を 1 本起動し、WSL が idle で終了するのを防ぎます。ディストリビューション名は `wsl -l -q` で確認し、`Ubuntu` がなければ止まります（`docker-desktop` は使いません）。別の名前なら `-Distro 名前` を付けて実行します。
+
+```powershell
+schtasks /Query /TN "hey-muse WSL" /V /FO LIST | Select-String "Task To Run"
+```
+
+期待する結果: `Task To Run:` の行に `wsl.exe -d Ubuntu --exec /bin/sh -c 'sleep infinity'` が出ます。
+
+### 4. 再起動して確認する
+
+Windows を再起動し、ログオンして 2 分待ちます。WSL の中で次を実行します。
+
+```bash
+systemctl is-active muse-asr
+```
+
+期待する結果: `active`。
+
+別の LAN 機器から届くかも確認します。端末が使えなければ、別の Windows PC の PowerShell か、スマホの TCP テストアプリを使います。
+
+```powershell
+Test-NetConnection 母艦のLAN_IP -Port 50024
+```
+
+期待する結果: `TcpTestSucceeded : True`。
+
+うまくいかないとき:
+
+- `TcpTestSucceeded : False` のとき: ファイアウォールの規則 `muse-asr` が 2 種類（`Get-NetFirewallRule -Name muse-asr` と `Get-NetFirewallHyperVRule -Name muse-asr`）あるか確認します。
+- `ip addr` に 172.17.x が出るとき: `.wslconfig` の `networkingMode=mirrored` が `[wsl2]` の下にあるか、`wsl --shutdown` を実行したかを確認します。
+- `active` にならないとき: `journalctl -u muse-asr -n 30 --no-pager` を見ます。`--allow` の書き方と `LD_LIBRARY_PATH` が主な原因です。
+
 ## 第 4 部 Google カレンダー
 
 待機画面の予定を Google Calendar API（読み取り専用）から取得します。iCal 購読より反映が早く、更新に失敗したときは前回の予定を「更新待ち」として表示します。Google Cloud の設定とブラウザでの同意は、カレンダーの持ち主が自分で行います。

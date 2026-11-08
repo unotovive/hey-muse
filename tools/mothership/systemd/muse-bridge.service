@@ -1,0 +1,17 @@
+# 母艦ブリッジ（任意）。install.sh --with-bridge で有効化する。
+# bridge.env に SPEECH_BRIDGE_TOKEN と BRIDGE_ARGS（例: --allowed-network 192.168.1.0/24）を置く。
+[Unit]
+Description=hey-muse mothership speech bridge (muse-bridge)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+EnvironmentFile=@HOME@/.config/hey-muse/bridge.env
+ExecStart=@HOME@/.venvs/muse-bridge/bin/python -I @HOME@/projects/musekusa/hey-muse/tools/mothership/speech_bridge.py --bind 0.0.0.0 $BRIDGE_ARGS
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
