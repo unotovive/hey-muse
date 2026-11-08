@@ -2,10 +2,10 @@
 
 Amazon Echo Show 5 を、Meta の AI エージェント [Muse](https://gadgets.muse.ai) の声の窓口にする個人用プロジェクトです。この派生は、日本の家庭向けに次を加えています。
 
-- **日本語の音声認識**: 母艦（WSL の Whisper）または端末内の認識で聞き取り、母艦が止まっていれば Muse の音声ノートに切り替えます。
+- **日本語の音声認識**: 母艦（WSL の Whisper）で聞き取り、母艦が止まっていれば録音を Muse に送って Muse に認識させます。
 - **待機画面**: Google カレンダーの予定、Nature Remo の温度・湿度と家電操作（SwitchBot も従来どおり使えます）。
 - **地震情報の割り込み表示**: P2P 地震情報を端末が直接受信し、全画面で表示します。
-- **在室検知と「手で覆って停止」**: 無人で消灯し、手をかざしてアラームを止めます。
+- **在室検知と「手で覆って停止」**: 無人で消灯し、手をかざしてアラームや Muse の読み上げを止めます。
 
 > Meta や Amazon の製品ではなく、どちらも関与していません。Muse の利用は Meta の [Gadget SDK Terms](https://gadgets.muse.ai/sdk-terms) に従います。ベースは HuskerMinion の [TECHO5](https://github.com/HuskerMinion/techo5)（MIT）で、元の README は [README.upstream.md](README.upstream.md) にあります。
 

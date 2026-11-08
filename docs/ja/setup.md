@@ -134,7 +134,9 @@ python3 -m venv ~/.venvs/muse-tools
 ~/.venvs/muse-tools/bin/python tools/standalone-home/google_auth.py --client ~/.config/hey-muse/google-client.json
 ```
 
-ブラウザが開くので、手順 2 で登録したアカウントで同意します。成功すると `~/.config/hey-muse/google-token.json` ができ、使えるカレンダーの `id` と名前が一覧で表示されます。
+ブラウザが開くので、手順 2 で登録したアカウントで同意します。成功すると WSL の `~/.config/hey-muse/google-token.json` ができ、使えるカレンダーの `id` と名前が一覧で表示されます。
+
+このトークンは WSL 側にできるだけで、端末にはまだ届きません。`deploy_usb.py` は Windows の Python で動き、Windows 側のホームフォルダーしか見ないため、第 7 部の手順 1 で Windows 側へコピーしてから送ります。
 
 ### 5. 使うカレンダーを設定する
 
@@ -149,11 +151,9 @@ python3 -m venv ~/.venvs/muse-tools
 
 ### 6. トークンを端末へ送る
 
-```
-python3 tools/standalone-home/deploy_usb.py config --serial SERIAL
-```
+端末へ送る作業は第 7 部で行います。第 7 部の手順 1 で、手順 4 のトークンを WSL から Windows 側へコピーし、手順 2 で `deploy_usb.py config` を実行します。ここでは `deploy_usb.py` を実行しません（WSL の中では動かず、動いたとしても WSL 側のトークンは送られません）。
 
-`~/.config/hey-muse/google-token.json` が `google-token.json` として端末へ送られます。端末にこのファイルがあるあいだは API を使い、削除すると従来の `calendar-feeds.txt`（iCal）に戻ります。`google-token.json` と `google-client.json` は秘密情報なので、リポジトリにコミットしないでください。
+端末にトークンがあるあいだは Google Calendar API を使い、削除すると従来の `calendar-feeds.txt`（iCal）に戻ります。`google-token.json` と `google-client.json` は秘密情報なので、リポジトリにコミットしないでください。
 
 ## 第 5 部 在室検知・ジェスチャー・減光の設定
 
@@ -210,7 +210,7 @@ Echo Show では、P2P 地震情報（https://www.p2pquake.net/）の WebSocket 
 更新後に確認します。
 
 ```bash
-ssh root@<端末IP> 'techo5 --version; slotctl status'
+ssh root@<端末IP> 'PATH=/usr/local/sbin:$PATH techo5 --version; slotctl status'
 ```
 
 期待する結果: `v1.6.30-ja.2` と出て、再起動から 5 分後に `slotctl status` が `good` になります。
@@ -224,8 +224,27 @@ ssh root@<端末IP> 'techo5 --version; slotctl status'
 | `BASE/speech-bridge/home-local.json` | `home-local.json` | 必須 | `backend`、`calendars`、`voice_devices` |
 | `BASE/speech-bridge/home-requests.sqlite` | `initial-power.json`（中身を取り出して送る） | 必須 | 電源の最後の向きの表 `power_last` |
 | `~/natureremo.env`（`--remo-env ファイル` で変更可） | `natureremo.env` | あるときだけ | `NATURE_REMO_TOKEN=…` |
-| `~/.config/hey-muse/google-token.json` | `google-token.json` | あるときだけ | 第 4 部で作ったトークン |
+| `~/.config/hey-muse/google-token.json`（Windows 側） | `google-token.json` | あるときだけ | 第 4 部で作ったトークン。WSL から Windows 側へコピーが必要（下記） |
 | `~/switchbot_token.env`、`BASE/calendar-feeds.txt` | `switchbot.env`、`calendar-feeds.txt` | あるときだけ | SwitchBot の資格情報、iCal の購読 URL |
+
+**第 4 部のトークンを Windows 側へコピーします。** 第 4 部は WSL で行うため、`google-token.json` は WSL のホームにできています。`deploy_usb.py` は Windows のホームだけを見るので、Windows の PowerShell で次のようにコピーします（`<ユーザー>` は WSL のユーザー名、ディストリビューション名が `Ubuntu` でなければ置き換えます）。
+
+```powershell
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.config\hey-muse" | Out-Null
+Copy-Item "\\wsl$\Ubuntu\home\<ユーザー>\.config\hey-muse\google-token.json" "$env:USERPROFILE\.config\hey-muse\google-token.json"
+```
+
+コピーしないと、`deploy_usb.py` は黙ってトークンを送らず、予定は iCal（`calendar-feeds.txt`）に戻ります。第 4 部以外で WSL に作ったファイルも、この表の Windows 側の場所に無ければ送られません。送る前に、`deploy_usb.py` が拾うファイルを Windows の PowerShell で確認します。`True` になったものだけが送られ、必須の 2 つが `False` なら止まります。
+
+```powershell
+$base = "$env:USERPROFILE\Documents\muse_on_echo"
+"$base\speech-bridge\home-local.json",
+"$base\speech-bridge\home-requests.sqlite",
+"$env:USERPROFILE\natureremo.env",
+"$env:USERPROFILE\switchbot_token.env",
+"$base\calendar-feeds.txt",
+"$env:USERPROFILE\.config\hey-muse\google-token.json" | ForEach-Object { "{0}  {1}" -f (Test-Path $_), $_ }
+```
 
 さらに、`deploy_usb.py` は `BASE/speech-bridge/` にある `echo_home.py` と `hall_light.py`、`BASE/assets/hey-muse/tools/` にある `techo5lib` を読み込みます。`BASE` の下にこの構成がなければ、`ModuleNotFoundError` で止まります。`tools/mothership/` の `echo_home.py` と `hall_light.py` を `BASE/speech-bridge/` に置いてください。
 
@@ -278,6 +297,14 @@ ls -l /data/misc/techo5/standalone-home/
 - 一覧に `enabled`、`home-local.json`、`natureremo.env`、`google-token.json` が見えます。
 
 `natureremo.env`、`google-token.json`、`home-local.json` の `key` は秘密情報です。リポジトリにコミットしないでください。
+
+音声で操作できる家電の言い方は次のとおりです（端末内で解釈し、母艦へ送ります）。
+
+- 照明: 「廊下の電気をつけて」「廊下の電気を消して」
+- エアコンの運転: 「冷房にして」「暖房にして」「エアコンの冷房をつけて」「冷房を消して」「暖房を止めて」
+- エアコンの温度: 「エアコンを26度にして」（16〜30 度の 2 桁だけ。「26度にして」だけでは設定されません）
+
+冷房・暖房・温度の指定は端末の経路だけで使えます。母艦の経路（`hall_light.py`）は照明のオン・オフだけを受け付け、冷房・暖房・温度は受け付けません。
 
 ### 4. 在室検知・地震情報・手で覆う停止
 

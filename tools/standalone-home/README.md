@@ -45,7 +45,8 @@ python3 -m venv ~/.venvs/muse-tools && ~/.venvs/muse-tools/bin/pip install -r re
 ```
 
 3. 表示されたカレンダーの `id` と名前を、`home-local.json` の `calendars` に `{"id": "...", "name": "..."}` で書きます。API 経路では `id` が必須です。
-4. `deploy_usb.py config --serial SERIAL` を実行すると、`~/.config/hey-muse/google-token.json` が `google-token.json` として端末へ送られます。
+4. WSL で作ったトークンは、Windows 側の `%USERPROFILE%\.config\hey-muse\google-token.json` へコピーします（`docs/ja/setup.md` 第 7 部の手順 1）。`deploy_usb.py` は Windows のホームだけを見ます。
+5. Windows の Python で `deploy_usb.py config --serial SERIAL` を実行すると、Windows 側の `~/.config/hey-muse/google-token.json` が `google-token.json` として端末へ送られます。
 
 `google-token.json` にはリフレッシュトークンが入るため、権限 0600 で扱い、コミットしないでください。
 

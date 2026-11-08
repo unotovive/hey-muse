@@ -56,12 +56,22 @@
 grep 'muse turn answered' /data/techo5-linux/techo5.log | tail -10
 ```
 
-比較用の値は、ストリーミングを使わない `v1.6.30-ja.1` のものを使ってかまいません。`thinkingAfter` など他の設定は変えません。
+比較用の値は、文単位の先読み読み上げ（コミット bfe463ca）より前の版で測ります。タグ `v1.6.30-ja.1` はすでに先読みを含み、アセットも公開していないため、比較相手にはなりません。また先読みを切る実行時の設定はありません。そのため仕様 7.4 の「有効・無効の比較」とは異なり、版どうしの比較にします。
+
+bfe463ca の 1 つ前（a9e80bbb）を一時的な worktree に取り出し、そこから端末へ入れます。版名は任意の文字列でよく（`deploy-rootfs.sh` は `--version` の値を検査しません）、ここでは `0.0.0-nostream.1` とします。`0.0.0-` で始めると、どの正式版より古い版として扱われます。
+
+```bash
+git worktree add ../hey-muse-nostream a9e80bbb
+cd ../hey-muse-nostream
+HOST=<端末IP> tools/linux/deploy-rootfs.sh --version 0.0.0-nostream.1 --install --reboot
+```
+
+測り終えたら `v1.6.30-ja.2` を入れ直し（第 7 部の手順 0）、`git worktree remove ../hey-muse-nostream` で片付けます。`thinkingAfter` など他の設定は変えません。
 
 | 版 | 10 回の `first_audio_ms` | 中央値 |
 |---|---|---|
 | `v1.6.30-ja.2` | （未計測） | （未計測） |
-| `v1.6.30-ja.1`（比較） | （未計測） | （未計測） |
+| `0.0.0-nostream.1`（a9e80bbb、比較） | （未計測） | （未計測） |
 
 ## 項目 5 Nature Remo と家電コマンドのテスト（実施済み・合格）
 
