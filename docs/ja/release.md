@@ -2,11 +2,13 @@
 
 このフォーク `unotovive/hey-muse` のリリースを、WSL（Ubuntu）で作る手順です。英語の `docs/releasing-the-fork.md` は Mac 前提で、鍵の場所・リモート名・版名の付け方が古くなっています。この文書が現行の手順です。
 
-初回リリースは `v1.6.30-ja.1` です。上流 TECHO5 v1.6.30 に、このフォークの日本語化と Muse 対応を載せています。
+初回リリースは `v1.6.30-ja.2` です。上流 TECHO5 v1.6.30 に、このフォークの日本語化と Muse 対応を載せています。
+
+注記: `v1.6.30-ja.1` は、最初のタグの CI が失敗したため成果物を公開していません。そのため初回は `v1.6.30-ja.2` です。タグを打ち直せないときは版名を 1 つ繰り上げるので、版名は飛ぶことがあります。
 
 ## 版名
 
-`vX.Y.Z-ja.N` と付けます。`vX.Y.Z` は土台にした上流のリリース、`N` はこのフォークのリリースごとに 1 つずつ上げます。端末は `v1.6.30-ja.2` を `v1.6.30-ja.1` より新しいと判断し、`v1.6.31-ja.1` はどちらよりも新しいと判断します（`echod/internal/update/version.go`）。
+`vX.Y.Z-ja.N` と付けます。`vX.Y.Z` は土台にした上流のリリース、`N` はこのフォークのリリースごとに 1 つずつ上げます。端末は `v1.6.30-ja.2` を `v1.6.30-ja.2` より新しいと判断し、`v1.6.31-ja.1` はどちらよりも新しいと判断します（`echod/internal/update/version.go`）。
 
 ## 署名鍵の保管
 
@@ -49,7 +51,7 @@ export PATH=$HOME/sdk/go/bin:$HOME/go/bin:$PATH
 
 ## 手順
 
-以降 `V` は版名です（例: `V=v1.6.30-ja.1`）。
+以降 `V` は版名です（例: `V=v1.6.30-ja.2`）。
 
 ### 1. 上流の資産を取り、ヘルパーとブートイメージを取り出す
 
@@ -73,7 +75,7 @@ cp ~/downloads-untrusted/techo5-v1.6.30/techo5-boot-checkers-v1.6.30.img bin/tec
 
 - 第 1 世代（checkers）向けの上流 rootfs の資産名は `rootfs-v1.6.30.tar.gz` です（`techo5-rootfs-v1.6.30.tar.gz` ではありません）。athena 用と skylight 用は別名で別物です。
 - 上流 v1.6.30 の rootfs には `techo5-pico` が入っていません。内蔵の音声ヘルパー（pico）は入らないまま作ります。必要になったら `tools/linux/build-pico.sh`（zig が要ります）で作り、`bin/techo5-pico-arm` に置きます。
-- 上流の `techo5-shairport-sync`、`techo5-nqptp`、`tailscaled` も、同じ要領で `bin/` に置けば rootfs に入ります（`deploy-rootfs.sh` が拾います）。初回リリースでは入れていません。
+- `deploy-rootfs.sh` は、`techo5-shairport-sync`、`techo5-nqptp`、`tailscaled` も必須とし、無いと止まります。同じ要領で上流の rootfs から `bin/techo5-shairport-sync-arm`、`bin/techo5-nqptp-arm`、`bin/tailscaled-arm64` に取り出します。`tailscaled` のライセンス（上流 rootfs の `usr/share/licenses/tailscale/LICENSE`）は `bin/tailscaled-arm64.LICENSE` に置きます。
 
 ### 2. タグを打ち、CI でテストと ARMv7 ビルドを通す
 
@@ -104,8 +106,11 @@ go test ./... && go test -tags dot ./... && go test -tags dot,donut ./... \
 
 ### 3. rootfs を作る
 
+`PREBUILT_DAEMON` に `bin/echod-arm` そのものを指定すると、スクリプトが同じファイルを `cp` して止まります。CI の成果物を別の場所（例: `bin/ci/`）にコピーして指定します。実行権限がないので `bash` 経由で起動します。
+
 ```bash
-PREBUILT_DAEMON=bin/echod-arm tools/linux/deploy-rootfs.sh --out bin/techo5-rootfs-$V.tar.gz --version $V
+mkdir -p bin/ci && cp bin/echod-arm bin/ci/echod-arm
+PREBUILT_DAEMON=bin/ci/echod-arm bash tools/linux/deploy-rootfs.sh --out bin/techo5-rootfs-$V.tar.gz --version $V
 tar -tzf bin/techo5-rootfs-$V.tar.gz | grep -E '^(\./)?vendor/.' && echo "STOP: vendor tree inside" || echo "vendor なし"
 ```
 
