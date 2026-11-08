@@ -19,7 +19,7 @@ import (
 
 // avatarDir is where an installed set lives: with the device's own state, which an update leaves
 // alone.
-const avatarDir = layout.StateDir + "/muse-avatar"
+var avatarDir = layout.StateDir + "/muse-avatar"
 
 // avatarEdgeBase is the least room left above and below the character, in the Show 5's pixels.
 const avatarEdgeBase = 20

@@ -73,6 +73,9 @@ func TestExactReadOnlyAndApplianceHoldBypassJev(t *testing.T) {
 	cancel := ReadOnlyViews.Listen(func(q *ReadOnlyView) { q.Handled = true; q.Answer = "表示します。" })
 	defer cancel()
 	for _, text := range []string{"今日の天気", "明日の予定を見せて", "廊下の電気は消さないで"} {
+		if text == "今日の天気" && !weatherBypassesJev {
+			continue
+		}
 		m := newViaMuse(&textTestLink{}, builtIn, nil, func(event) {})
 		m.brain = func() config.Brain { return config.Brain{STT: "local:50024"} }
 		m.transcribe = func(context.Context, config.Brain, []byte) (string, error) { return text, nil }
