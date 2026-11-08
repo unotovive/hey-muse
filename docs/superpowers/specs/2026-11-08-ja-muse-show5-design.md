@@ -1,7 +1,7 @@
 # 日本語 Muse 端末としての Echo Show 5（第 1 世代）設計書
 
 作成日: 2026-11-08
-対象ブランチ: `feature/ja-muse-show5`（2357gi/hey-muse の `a4cfe87` を起点）
+対象ブランチ: `feature/ja-muse-show5`（2357gi/hey-muse の `506b173d`「本体連携」を起点。2026-11-09 改訂）
 
 ## 1. 目的と背景
 
@@ -9,7 +9,9 @@ Amazon 純正のまま手元にある Echo Show 5 第 1 世代（モデル H23K3
 Meta の AI エージェント Muse に日本語で話しかけられるリビング常設端末にする。
 
 土台は友人（2357gi）のフォークで、すでに日本語表示・日本語音声認識・サイドチャット会話・
-待機画面ダッシュボード・母艦 PC 経由の家電操作が入っている。本設計はそれを施主の環境
+待機画面ダッシュボード・家電操作が入っている。2026-11-09 の友人の更新（本体連携、`lib/standalone`）で
+予定取得と SwitchBot 操作は母艦を介さず端末内の Go で動くようになった。本設計はその方向に沿い、
+母艦の役割を音声認識だけに絞る。本設計はそれを施主の環境
 （Nature Remo、Google カレンダー、GPU 付き常時稼働 PC）に合わせて差し替え、体感速度と
 常設運用の品質を上げるものである。
 
@@ -73,23 +75,22 @@ Muse 本体は Meta のクラウドで動き、端末は Muse Gadget SDK のク�
 [Echo Show 5 / echod (Go, ARMv7)]
   ├─ ウェイクワード・録音・AEC（TECHO5 既存）
   ├─ 音声認識: 母艦の Wyoming サーバーへ → 失敗時 Muse 音声ノートへフォールバック（既存）
-  ├─ 定型句判定 → 母艦 /echo-hall/v1 へ家電命令（既存の経路、バックエンドを Remo に）
+  ├─ 定型句判定 → 端末内の家電バックエンドへ（既存 lib/standalone、Nature Remo を追加）
   ├─ Muse クライアント（/chat/subscribe、既存）→ 文単位ストリーミング読み上げ（新規）
   ├─ 読み上げ: OpenAI /v1/audio/speech を端末から直接（既存の speech.Client を使う）
-  ├─ 待機画面: 母艦 /echo-home/v1 から予定・環境を取得（既存）
+  ├─ 待機画面: 端末内で予定・環境を取得（既存 lib/standalone。予定の取得元に Google Calendar API を追加）
   ├─ 地震: P2P 地震情報 WebSocket に端末から直接接続（新規）
   └─ 人感・手のひら: 既存の presence を有効化、手のひらで読み上げ停止（拡張）
 
 [母艦 / WSL2 (Python 3.12 + systemd)]
-  ├─ speech_bridge.py（既存）: 認証・ルーティング・/echo-home・/echo-hall・/echo-intent
-  │    └─ 家電バックエンド: SwitchBot（既存） | Nature Remo（新規、設定で選択）
-  │    └─ カレンダー: Google Calendar API（OAuth）で予定を読む（新規、Codex 経路を置換）
   ├─ recognizer.py（既存を GPU 対応に）: faster-whisper large-v3-turbo、CUDA、Wyoming 50024
+  ├─ speech_bridge.py（既存、任意）: VOICEVOX を使う場合だけ。既定では起動しない
   └─ 起動: systemd ユニット + Windows タスクスケジューラで WSL を起動時に立ち上げる（新規）
 ```
 
-母艦↔端末の認証・暗号化（AES-256-GCM + HMAC-SHA256、`lib/mothership/home.go` と
-`echo_home.py` の `pack/unpack`）は友人版のまま使う。
+友人版の母艦経由ダッシュボード（`speech_bridge.py` の `/echo-home` 等、`lib/mothership`）は
+壊さずに残すが、本設計では使わない。端末は `/data/misc/techo5/standalone-home/enabled` がある
+本体連携モードで動く。
 
 ## 5. 決定事項（施主の判断）
 
@@ -97,8 +98,8 @@ Muse 本体は Meta のクラウドで動き、端末は Muse Gadget SDK のク�
 | --- | --- |
 | 音声認識 | 母艦の Whisper を GPU で動かす |
 | 読み上げ | OpenAI の音声から始める。ElevenLabs は将来候補 |
-| 家電 | Nature Remo。対象は照明とエアコン。機種不明のため枠だけ作り、実機接続は後回し |
-| カレンダー | Google Calendar API（OAuth）で直接読む（Codex 経由をやめる）。家族から共有されたカレンダーも対象 |
+| 家電 | Nature Remo。対象は照明とエアコン。機種不明のため枠だけ作り、実機接続は後回し。実装は端末内 Go（友人の本体連携に合わせる。2026-11-09 の設計者判断） |
+| カレンダー | Google Calendar API（OAuth）で直接読む。家族から共有されたカレンダーも対象。実行場所は端末内 Go（2026-11-09、友人の iCal 方式との比較で施主が選択） |
 | 音声の送信 | 母艦不在で音声認識できないときは、録音を Muse に送って認識させてよい |
 | 追加機能 | ストリーミング読み上げ、地震速報の割り込み、人感で画面 ON/OFF と手のひら停止 |
 | 見送り | 情報表示系、電車遅延、朝ブリーフィング、カメラ質問 |
@@ -114,8 +115,9 @@ Muse 本体は Meta のクラウドで動き、端末は Muse Gadget SDK のク�
   書き換え、友人の履歴との照合を難しくするので採らない。
 - 対象は上流 `v1.6.30` のタグ。日々動いている `main` ではなくタグに合わせ、以後の追従も
   タグ単位で行う（上流はほぼ毎日リリースしているため、節目ごとにまとめて取り込む）。
-- 試験マージ（2026-11-09）では衝突 33 ファイル。内訳は `feature/display` 13、`tools/linux` 3、
-  `feature/voice` 3、`lib/bluez` 2、`feature/setup` 2、`config` 2、文書 4、その他 4。
+- 試験マージ（2026-11-09、友人の本体連携を取り込んだ後）では衝突 36 ファイル。内訳は `feature/display` 13、
+  `tools/linux` 3、`feature/voice` 3、`lib/bluez` 2、`feature/setup` 2、`config` 2、`go.mod`/`go.sum` 2、
+  文書 4、その他 5。
   衝突しない箇所でも上流の API 変更が Muse 周りのコードに及ぶため、マージ後にビルドと
   Go 全テストを通すまでを一つの作業単位とする。
 - 上流 v1.6.x で入ったものは移植せずそのまま使う（一定時間後の減光、次の予定の時計表示、
@@ -139,38 +141,51 @@ Muse 本体は Meta のクラウドで動き、端末は Muse Gadget SDK のク�
 - 「考え中」の扱い: 録音終了から最初の音声が出るまで 5 秒を超えたら短い相槌音（既存の
   音クリップ機構 `docs/voice-clips.md` を使う）を 1 回だけ鳴らす。画面は既存の thinking 表示を使う。
 - 読み上げは端末から OpenAI へ直接行く。母艦の VOICEVOX 経路は残すが既定にしない。
+  友人の本体連携にある「定型句の返答は事前生成音声を再生」（`speakHomeReply`）は、音声ファイルが
+  置かれていなければ素通りするので、そのまま残す。
 - Muse への指示（長文を避け結論を先に）は Muse 側の設定であり、コードでは扱わない。
   セットアップ手順書に推奨文として書く。
 
-### 6.2 Nature Remo バックエンド
+### 6.2 Nature Remo バックエンド（端末内 Go）
 
-- `tools/mothership/hall_light.py` に直書きされている SwitchBot 呼び出しを、
-  `appliance_backend` 抽象（`resolve`、`execute`、`environment`、`power_state`）に切り出し、
-  `home-local.json` の `backend: "switchbot" | "nature_remo"` で選ぶ。SwitchBot 実装は
-  現状の振る舞いを保ち、友人版の既存テストを通す。
+- 友人の `lib/standalone` は SwitchBot 直叩き（`switchbot.go`）で、`Home.Appliance(ctx, key, action)`、
+  `Dashboard(ctx, "environment", "")`、`CheckTargets` が入口。ここに家電バックエンドの抽象
+  （`Appliance`、`Environment`、`Check`）を切り出し、`home-local.json` の
+  `backend: "switchbot" | "nature_remo"`（省略時 `switchbot`）で選ぶ。SwitchBot 実装は現状の
+  振る舞いを保ち、友人のテスト `home_test.go` を通す。
 - Nature Remo 実装は Cloud API（`GET /1/appliances`、`POST /1/appliances/{id}/light`、
   `POST /1/appliances/{id}/aircon_settings`、`GET /1/devices` の `newest_events`）を使う。
-  トークンは `NATURE_REMO_TOKEN` 環境変数またはファイルから読む。レート制限（30 回/5 分）を
-  守るため、家電一覧と環境値は 60 秒キャッシュする。
+  トークンは端末の `/data/misc/techo5/standalone-home/natureremo.env`（`NATURE_REMO_TOKEN=...`）から読む。
+  レート制限（30 回/5 分）を守るため、家電一覧と環境値は 60 秒キャッシュする。
 - ローカル API（`POST /messages`、ヘッダー `X-Requested-With` 必須、mDNS `_remo._tcp`）は
   照明・エアコンの定型操作で学習済み信号が取れる場合にだけ使い、2 秒で失敗したら Cloud に
-  フォールバックする。nano と Lapis はローカル API 非対応なので設定で無効化できる。
-- 論理 ID は `living`（照明）と `ac`（エアコン）。エアコンは「つけて／消して」「冷房／暖房」
-  「○度にして」の最小セットとし、友人版の定型句判定（`voice/appliances.go`）を日本語表現で拡張する。
-- 実機接続は後回し。Swagger 定義に基づくモック API でユニットテストを書き、実機では
-  `--dry-run` で送信内容を表示する手順を README に書く。
+  フォールバックする。nano と Lapis はローカル API 非対応なので設定で無効化できる。v1 では枠（設定項目と
+  フォールバック順）だけ作り、実装は Cloud のみでよい。
+- 論理 ID は `living`（照明）と `ac`（エアコン）。`home-local.json` の `voice_devices` に
+  Remo 側の家電名（`nickname`）を書く。エアコンは「つけて／消して」「冷房／暖房」「○度にして」の
+  最小セットとし、友人版の定型句判定（`voice/appliances.go`）を日本語表現で拡張する。
+  `applianceCommand` に数値（温度）を運ぶ場を足す。
+- 実機接続は後回し。Swagger 定義に基づく `httptest` のモックでユニットテストを書き、
+  `techo5 tools home-check` が Remo でも疎通確認できるようにする。
 
-### 6.3 Google カレンダー
+### 6.3 Google カレンダー（端末内 Go）
 
-- Google Calendar API を `google-api-python-client` で呼ぶ。認証は「デスクトップアプリ」種別の
-  OAuth クライアントで、スコープは `calendar.readonly` のみ。初回だけ施主がブラウザで同意し、
-  リフレッシュトークンを `~/.config/hey-muse/google-token.json` に保存する。
+- 友人の `lib/standalone/calendar.go` は非公開 iCal URL を 5 分ごとに読み、`agenda-cache.json` に
+  キャッシュし、失敗時は前回結果と「更新待ち」表示を返す。この器（`refresh` → `agenda`、
+  `Result{Stale, Fetched}`）は残し、取得元に Google Calendar API を足す。
+  端末ディレクトリに `google-token.json` があれば API、無ければ従来の `calendar-feeds.txt`（iCal）を使う。
+- 認証は「デスクトップアプリ」種別の OAuth クライアント、スコープは `calendar.readonly` のみ。
+  初回だけ施主が PC のブラウザで同意し、`tools/standalone-home/google_auth.py` が
+  `google-token.json`（`client_id`、`client_secret`、`refresh_token`）を書く。これを友人の
+  `deploy_usb.py config` と同じ経路で端末へ置く。端末は `https://oauth2.googleapis.com/token` で
+  アクセストークンを更新し、メモリに持つ（ディスクには書かない）。
 - Google Cloud プロジェクトと OAuth クライアントの作成手順は `docs/ja/setup.md` に書く。
   テストユーザー登録が要る（公開審査は受けない）。
-- 置き換え対象は `tools/mothership/echo_home.py` の `agenda()`（現在は Codex MCP 経由）。
-  `home-local.json` の `calendars` 配列（`id`、`name`）はそのまま使い、共有カレンダーも ID で指定する。
-- 取得は 5 分ごと、`singleEvents=true` で繰り返し予定を展開し、終日・複数日・複数カレンダーは
-  友人版の表示仕様を踏襲する。認証失敗時は前回の結果と「取得失敗」の表示を使う。
+- API は `GET /calendar/v3/calendars/{calendarId}/events` に `singleEvents=true`、`orderBy=startTime`、
+  `timeMin`/`timeMax`（今から 8 日後まで）、`maxResults=100`、`pageToken` で繰り返し予定を展開済みで取る。
+  `home-local.json` の `calendars` 配列（`id`、`name`）を使い、共有カレンダーも ID で指定する。
+  終日・複数日・複数カレンダーの表示は友人版の仕様（`Event{Day}`、24 件上限）を踏襲する。
+- 母艦の `echo_home.py`（Codex MCP 経由）は触らない。本体連携モードでは使われない。
 
 ### 6.4 地震情報の割り込み
 
@@ -196,19 +211,20 @@ Muse 本体は Meta のクラウドで動き、端末は Muse Gadget SDK のク�
 
 ### 6.6 母艦の運用
 
+- 母艦の役割は音声認識（Wyoming、50024）だけ。読み上げは端末から OpenAI へ、予定と家電は端末内で
+  完結するので、母艦が落ちても会話・待機画面・家電操作は動く（音声認識だけ Muse 側へフォールバック）。
 - WSL2 のネットワークを `networkingMode=mirrored` に切り替え、Windows ファイアウォールに
-  50022（ブリッジ）と 50024（音声認識）の受信許可を追加する。これで Echo から PC の LAN アドレス
-  で届く。切り替えには WSL の再起動が要る。
-- サービスは systemd ユニット 2 つ（`muse-bridge.service`、`muse-asr.service`）。
-  Windows のタスクスケジューラに「ログオン時に `wsl.exe -d <distro> --exec /bin/true`」を登録して
-  WSL を起こす。Windows のスリープは「なし」に設定する。
+  50024（音声認識）の受信許可を追加する。これで Echo から PC の LAN アドレスで届く。
+  切り替えには WSL の再起動が要る。
+- サービスは systemd ユニット `muse-asr.service`。VOICEVOX を使う場合だけ `muse-bridge.service`
+  （`speech_bridge.py`、50022）を追加で有効にする。Windows のタスクスケジューラに
+  「ログオン時に `wsl.exe -d <distro> --exec /bin/true`」を登録して WSL を起こす。
+  Windows のスリープは「なし」に設定する。
 - 音声認識サーバーは `recognizer.py`（現在は `cpu`/`int8` 固定、`--model-dir` 必須）に
   `--device`、`--compute-type`、`--model` を追加し、`cuda`/`float16`/`large-v3-turbo` を既定にする。
   CPU フォールバックは残す。
 - 端末側の音声認識待ちは現在最大 12 秒。母艦不在時に毎ターン待たされないよう、接続タイムアウトを
   短くし、連続失敗時は一定時間 Muse 音声認識へ直行する。
-- `speech_bridge.py` の `/health` は VOICEVOX 応答を条件にしている。VOICEVOX を置かない構成では
-  ブリッジ自身の稼働を返すよう変える。
 - 秘密情報は `~/.config/hey-muse/` 配下のファイルに置き、systemd の `EnvironmentFile` で渡す。
 
 ### 6.7 リリースと更新
@@ -244,12 +260,13 @@ Muse 本体は Meta のクラウドで動き、端末は Muse Gadget SDK のク�
 3. 母艦不在でも「Hey Muse」→ 質問 → 回答読み上げが成立する（音声認識は Muse 側にフォールバック）。
 4. 母艦ありで、録音終了から最初の音声が出るまでの時間を 10 回計測し、中央値を記録する。
    文単位ストリーミングの有効・無効で比較する。
-5. 「電気消して」で母艦が Nature Remo のモック API に正しい要求を送ることをテストで確認する。
+5. 「電気消して」で端末が Nature Remo のモック API に正しい要求を送ることを Go のテストで確認する。
    「電気消してって言われた」「電気消さないで」では送らない。
-6. Google カレンダーの予定が待機画面に出て、繰り返し予定と終日予定が正しい。
+6. Google Calendar API 経由の予定が待機画面に出て、繰り返し予定と終日予定が正しい。
+   `techo5 tools home-check` が件数と取得時刻を返す。
 7. P2P 地震情報のテスト配信（公式のサンプルまたは録画した JSON）で割り込み表示と自動復帰を確認する。
 8. 無人で設定時間後に画面が消え、近づくと点く。読み上げ中に手のひらをかざすと止まる。
-9. Windows を再起動すると、母艦の 2 サービスが自動で上がり `/health` が応答する。
+9. Windows を再起動すると、母艦の音声認識サービスが自動で上がり、端末からの認識が通る。
 10. Go 全パッケージのテスト、Python のテスト、ARMv7 ビルドがローカルと GitHub Actions で通る。
 
 ## 8. 作業の進め方
@@ -259,9 +276,10 @@ Muse 本体は Meta のクラウドで動き、端末は Muse Gadget SDK のク�
    `v1.6.30-ja.1` を作る（rootfs ビルド + 上流 v1.6.30 の checkers ブートイメージ）。
 3. 端末の解除（amonet、LineageOS v0.7）。1・2 と並行できる。
 4. 端末へ初回インストール。受け入れ 1・2 を確認。
-5. 母艦の基盤（ネットワーク、systemd、GPU 認識）、Whisper GPU、Google カレンダー、Nature Remo 枠。
-6. ストリーミング読み上げ、音声フォールバックの分岐変更、手のひら停止、地震割り込み。
-7. リリース `v1.6.30-ja.2` と端末更新、Muse 契約後のペアリングと受け入れ 3〜10。
+5. 母艦の基盤（ネットワーク、systemd、GPU 認識）、Whisper GPU。
+6. 端末内の Google Calendar API と Nature Remo 枠（友人の `lib/standalone` の拡張）。
+7. ストリーミング読み上げ、音声フォールバックの分岐変更、手のひら停止、地震割り込み。
+8. リリース `v1.6.30-ja.2` と端末更新、Muse 契約後のペアリングと受け入れ 3〜10。
 
 ## 9. 作り手に委ねる事項
 
