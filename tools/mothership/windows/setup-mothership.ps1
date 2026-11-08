@@ -61,7 +61,8 @@ powercfg /change standby-timeout-ac 0
 
 # --- 3) ログオン時に WSL を起こしたままにする ---
 # schtasks /Create は実行時間 72 時間の制限とバッテリー時の停止が既定で入るため、Register-ScheduledTask で制限を外す。
-$action = New-ScheduledTaskAction -Execute 'wsl.exe' -Argument "-d $Distro --exec /bin/sh -c 'sleep infinity'"
+# wsl.exe --exec は単一引用符を解釈しないため、sh -c を使わず /bin/sleep を直接呼ぶ。
+$action = New-ScheduledTaskAction -Execute 'wsl.exe' -Argument "-d $Distro --exec /bin/sleep infinity"
 $trigger = New-ScheduledTaskTrigger -AtLogOn
 $taskPrincipal = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Highest
 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
