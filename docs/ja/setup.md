@@ -205,6 +205,8 @@ Echo Show では、P2P 地震情報（https://www.p2pquake.net/）の WebSocket 
   HOST=<端末IP> tools/linux/deploy-rootfs.sh --version v1.6.30-ja.2 --install --reboot
   ```
 
+  `deploy-rootfs.sh` は `bin/` のヘルパー類（`docs/ja/release.md` 手順 1 で揃えるもの）が前提です。
+
   `--version` は端末に記録する版名、`--install` は使っていない側のスロットへ入れること、`--reboot` は入れたあとに再起動して新しい側で起動することです。
 
 更新後に確認します。
@@ -292,7 +294,7 @@ ls -l /data/misc/techo5/standalone-home/
 期待する結果は次のとおりです。
 
 - `Backend: nature_remo` と出ます。
-- `Calendar refreshed: N events` と出ます（N は今後 7 日間の予定の数）。
+- `Calendar refreshed: N events` と出ます（N は今から 8 日後までの予定の数で、上限は 24 件）。
 - Remo のトークンが空なら、家電の検査はエラーで止まります。これは想定どおりで、その行までが出れば足ります。
 - 一覧に `enabled`、`home-local.json`、`natureremo.env`、`google-token.json` が見えます。
 

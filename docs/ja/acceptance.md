@@ -36,7 +36,7 @@
    grep 'local recognition unavailable' /data/techo5-linux/techo5.log | tail -3
    ```
 
-4. 母艦で認識を戻し、もう一度話しかけます。
+4. 母艦で認識を戻し、もう一度話しかけます。失敗が 2 回続くと 60 秒は母艦を使わず、その間は Muse へ直行します。戻ったことを確かめるときは、60 秒待ってから話しかけます。
 
    ```bash
    sudo systemctl start muse-asr
