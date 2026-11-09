@@ -14,6 +14,7 @@
 | 8 | 在室検知と手で覆って停止 | 未実施（実機待ち） |
 | 9 | 母艦の再起動後の認識 | 未実施（実機待ち） |
 | 10 | ローカルのテスト・ビルド・CI | 実施済み・合格 |
+| 11 | 母艦の省メモリ（待機中は GPU を使わない） | 未実施（実機待ち） |
 
 ## 項目 1 ブートローダー解除と起動の確認（実施済み・合格）
 
@@ -100,6 +101,15 @@ HOST=<端末IP> tools/linux/deploy-rootfs.sh --version 0.0.0-nostream.1 --instal
 | `v1.6.30-ja.2` | （未計測） | （未計測） |
 | `0.0.0-nostream.1`（a9e80bbb、比較） | （未計測） | （未計測） |
 
+母艦は認識プロセスを 30 分使われないと下ろすため、次の 2 通りも測ります（`v1.6.30-ja.2` で各 10 回）。
+
+| 場面 | 10 回の `first_audio_ms` | 中央値 |
+|---|---|---|
+| 久しぶりの一言（認識プロセスが居ない状態。30 分以上あけて話しかける） | （未計測） | （未計測） |
+| 連続の一言（認識プロセスが居る状態。続けて話しかける） | （未計測） | （未計測） |
+
+合否基準: 久しぶりの一言は、10 回とも 12 秒以内に母艦で認識されること（ログに `muse: using local speech recognition`）。
+
 ## 項目 5 Nature Remo と家電コマンドのテスト（実施済み・合格）
 
 Nature Remo の Cloud API 呼び出し（照明・エアコン、トークン欠落、429 の送信停止、環境値）と家電コマンドの解釈のテストです。
@@ -156,19 +166,30 @@ techo5 tools quake-test --code 556
 
 ## 項目 9 母艦の再起動後の認識（未実施・実機待ち）
 
-母艦の systemd と Windows 自動起動は `docs/ja/setup.md` 第 3 部のとおりです。Windows を再起動し、ログオンして 2 分待ってから確認します。
-
-```bash
-systemctl is-active muse-asr
-```
+母艦は Windows ネイティブ（タスク `hey-muse ASR`）です。手順は `docs/ja/setup.md` 第 3 部のとおりです。Windows を再起動し、ログオンして 2 分待ってから確認します。
 
 ```powershell
+Get-ScheduledTask -TaskName 'hey-muse ASR' | Select-Object State
 Test-NetConnection 母艦のLAN_IP -Port 50024
 ```
 
-期待する結果は `active` と `TcpTestSucceeded : True` です。続けて、項目 3 の手順 2 に準じて話しかけ、ログに `muse: using local speech recognition` が出ることを確認します。
+端末の SSH または USB コンソールから、母艦に届くことも確認します。
 
-2026-11-09 に第 3 部の手順 1（`setup-mothership.ps1`）を実施し、`.wslconfig` の `networkingMode=mirrored`、タスク `hey-muse WSL`（「タスクを停止するまでの時間」= 無効、「電源管理」= 空欄）、ファイアウォール規則（通常・Hyper-V とも TCP 50024）、AC 電源のスタンバイ無効を確認しました。再起動後の確認は未実施です。
+```sh
+nc -zv 母艦のLAN_IP 50024
+```
+
+次に `wsl --shutdown` を実行し、同じ確認をもう一度行います。
+
+期待する結果:
+
+- `State` が `Running`、`TcpTestSucceeded : True`、端末からの `nc` が成功します。
+- `wsl --shutdown` のあとも、同じ結果になります。
+- 続けて、項目 3 の手順 2 に準じて話しかけ、ログに `muse: using local speech recognition` が出ます。
+
+### 旧構成での記録
+
+2026-11-09 に WSL の母艦の手順 1（`setup-mothership.ps1`）を実施し、`.wslconfig` の `networkingMode=mirrored`、タスク `hey-muse WSL`（「タスクを停止するまでの時間」= 無効、「電源管理」= 空欄）、ファイアウォール規則（通常・Hyper-V とも TCP 50024）、AC 電源のスタンバイ無効を確認しました。再起動後の確認は未実施でした。この構成は、Windows ネイティブの母艦に置き換えました（手順は `docs/ja/setup.md` 付録 A・B）。
 
 ## 項目 10 ローカルのテスト・ビルド・CI（実施済み・合格）
 
@@ -183,3 +204,26 @@ Test-NetConnection 母艦のLAN_IP -Port 50024
 | CI | GitHub Actions の `v1.6.30-ja.2` の run（42517139377） | `uboot` と `build` が成功、`panel` は実行されず |
 
 CI の run は https://github.com/unotovive/hey-muse/actions/runs/42517139377 です。`gh run view` で確認しました。リリースは、`gh release view v1.6.30-ja.2 --repo unotovive/hey-muse --json isDraft,assets` で、`isDraft` が `true`（ドラフト）、添付は `echod-arm`、`manifest.json`、`manifest.json.sig`、`SHA256SUMS`、`techo5-boot-checkers-v1.6.30-ja.2.img`、`techo5-rootfs-v1.6.30-ja.2.tar.gz` の 6 つでした。施主の公開操作を待っています。
+
+## 項目 11 母艦の省メモリ（未実施・実機待ち）
+
+母艦が待機中に GPU を使わず、話しかけたときだけモデルを読み込むことを確認します。
+
+1. 母艦の PowerShell で、話しかける前の GPU メモリを記録します。
+
+   ```powershell
+   nvidia-smi --query-gpu=memory.used --format=csv
+   ```
+
+2. 端末に話しかけ、直後にもう一度同じコマンドを実行します。
+3. 30 分以上、話しかけずに置き、同じコマンドを実行します。あわせて、残っているプロセスを確認します。
+
+   ```powershell
+   Get-Process python,pythonw | Select-Object Name,WS
+   ```
+
+期待する結果:
+
+- 手順 2 の直後は、手順 1 より約 2 GB 増えます。
+- 30 分後は、手順 1 の値に戻ります。
+- 30 分後の `Get-Process` には、受付の `pythonw` だけが残り、認識のプロセス（`python`）はありません。

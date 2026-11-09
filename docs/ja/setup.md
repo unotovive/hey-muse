@@ -95,105 +95,75 @@ ssh root@<端末IP> 'cat /etc/techo5-release; PATH=/usr/local/sbin:$PATH slotctl
 
 期待する結果: `v1.6.30-ja.2`、`active: a`、slot a が `trial` → 起動から約 5〜8 分で `good`。非対話の SSH では `slotctl` が PATH に無いので、上のように PATH を足します。
 
-## 第 3 部 母艦（WSL の音声認識を常駐させる）
+## 第 3 部 母艦（Windows で音声認識を常駐させる）
 
-母艦は、WSL2（ディストリビューション名 `Ubuntu`）を動かす Windows の PC です。端末（Echo Show 5）の音声を Whisper で文字にする `tools/echo-asr/pc/recognizer.py` を、systemd のサービス `muse-asr` として常駐させます。Windows を再起動しても、ログオンすれば自動で戻ります。仮想環境 `~/.venvs/muse-asr` は先に作ってあることが前提です（[tools/echo-asr/README.md](../../tools/echo-asr/README.md) の「Run Whisper on a PC」）。
+母艦は、Windows 11 の PC です。端末（Echo Show 5）の音声を Whisper で文字にする `tools/echo-asr/pc/recognizer.py` を、Windows のタスクスケジューラのタスク `hey-muse ASR` として常駐させます。WSL は使いません。ログオンすれば自動で起動し、`wsl --shutdown` しても止まりません。Linux や WSL を母艦にする場合は、付録 A を見てください。
 
-次の作業のうち、手順 1・3・4 は Windows 側の管理者権限や WSL の再起動を伴います。作業中の WSL が止まるので、他の作業を保存してから行ってください。
+### 0. 前提
 
-### 1. WSL を mirrored にし、ファイアウォールを開ける
+- Windows 11、Python 3.13（`py -3 --version` で確認）、NVIDIA ドライバー（`nvidia-smi` が動くこと）。
+- PC は常時起動にします。タスクは Windows にログオンしたときに起動するので、ログオンした状態にしておきます。
+- リポジトリは WSL にあります。スクリプトは Windows から `\\wsl.localhost\<ディストリビューション名>\home\<ユーザー名>\...` のパスで実行します。インストーラが Python ファイル 2 つ（`recognizer.py`、`worker.py`）を Windows 側へコピーするので、導入後は WSL を止めてかまいません。
 
-mirrored にすると、WSL が Windows と同じ LAN の IP アドレスを持ち、端末から直接届きます。既存の `.wslconfig` には `[wsl2]` 節があることが多く、節を二重にすると壊れます。次のスクリプトは、既存の節に `networkingMode=mirrored` を入れ、元のファイルを `.wslconfig.bak` に残します。ファイアウォールの受信許可（TCP 50024）と、AC 電源時にスタンバイしない設定も同じ実行で入ります。手順 3 のタスク登録も含みます。
+### 1. 管理者の前処理（ファイアウォールと電源）
 
-管理者として開いた PowerShell で、リポジトリの場所へ移動して実行します（`\\wsl$\Ubuntu\home\ユーザー名\projects\musekusa\hey-muse` など）。
-
-```powershell
-cd \\wsl$\Ubuntu\home\ユーザー名\projects\musekusa\hey-muse
-powershell.exe -ExecutionPolicy Bypass -File tools\mothership\windows\setup-mothership.ps1
-```
-
-期待する結果: 画面に `.wslconfig` の中身が出て、`[wsl2]` が 1 つだけで `networkingMode=mirrored` を含みます。最後に「完了」と出ます。
-
-その後、PowerShell で WSL を止め、開き直します。
+管理者として開いた PowerShell で、リポジトリの場所へ移動して実行します。ファイアウォールの受信許可（規則 `muse-asr`、TCP 50024）と、AC 電源時にスタンバイしない設定だけを行います。
 
 ```powershell
-wsl --shutdown
-wsl -d Ubuntu
+cd \\wsl.localhost\Ubuntu\home\<ユーザー名>\projects\musekusa\hey-muse
+powershell.exe -ExecutionPolicy Bypass -File tools\mothership\windows\setup-mothership.ps1 -WindowsNative
 ```
 
-WSL の中で確認します。
+期待する結果: 最後に「完了（Windows ネイティブ母艦）」と出ます。
 
-```bash
-ip -4 addr show | grep -v 127.0.0.1 | grep inet
-```
+### 2. インストール（通常権限）
 
-期待する結果: Windows と同じ LAN のアドレス（例 `192.168.x.x`）が出ます。NAT のときの `172.17.x.x` ではありません。
-
-### 2. systemd ユニットを入れる
-
-`/etc/wsl.conf` の `[boot]` に `systemd=true` が必要です（`install.sh` が確認し、なければ止まります）。WSL の中で `install.sh` を実行します。`sudo` のパスワードを 1 回聞かれます。何度実行しても安全です。ユニットの `User=` とリポジトリの場所は、実行したユーザーと `install.sh` 自身の場所に自動で置き換わります。clone 先は下の例と違っていてもかまいません。
-
-```bash
-cd ~/projects/musekusa/hey-muse
-bash tools/mothership/install.sh
-```
-
-初回は `~/.config/hey-muse/asr.env` の雛形ができます。`ASR_ARGS` の `--allow` を、端末の IP アドレスに直してから再起動します（下は例のダミー値です）。
-
-```bash
-# ~/.config/hey-muse/asr.env
-ASR_ARGS="--allow 192.0.2.10"
-LD_LIBRARY_PATH=/home/ユーザー名/.venvs/muse-asr/lib/python3.12/site-packages/nvidia/cublas/lib:/home/ユーザー名/.venvs/muse-asr/lib/python3.12/site-packages/nvidia/cudnn/lib
-```
-
-```bash
-sudo systemctl restart muse-asr
-systemctl is-active muse-asr && journalctl -u muse-asr -n 5 --no-pager
-```
-
-期待する結果: `active` と出て、ログに待ち受け開始とモデル読み込みの表示があります。初回はモデルのダウンロード（約 1.6 GB）に時間がかかります。
-
-ブリッジ（`speech_bridge.py`）も常駐させる場合は、`bash tools/mothership/install.sh --with-bridge` を使います。事前に `~/.venvs/muse-bridge` を作り、`~/.config/hey-muse/bridge.env` に `SPEECH_BRIDGE_TOKEN=ランダムなトークン` と `BRIDGE_ARGS="--allowed-network 192.168.1.0/24"` を書きます（値は自分の LAN に合わせます）。`bridge.env` がなければ起動しません。
-
-### 3. Windows ログオン時に WSL を起こしたままにする
-
-手順 1 のスクリプトが、タスク `hey-muse WSL` を登録しています。ログオン時に `wsl.exe -d Ubuntu --exec /bin/sleep infinity` を 1 本起動し、WSL が idle で終了するのを防ぎます。タスクは実行時間の制限なし、バッテリー駆動でも開始・継続する設定です。ディストリビューション名は `wsl -l -q` で確認し、`Ubuntu` がなければ止まります（`docker-desktop` は使いません）。別の名前なら `-Distro 名前` を付けて実行します。
+管理者でない PowerShell で実行します。`-Allow` には、端末の IP アドレスを指定します（複数ならコンマ区切り、または `-Allow` を繰り返します）。
 
 ```powershell
-schtasks /Query /TN "hey-muse WSL" /V /FO LIST | Select-String "実行するタスク","タスクを停止するまでの時間","電源管理"
+cd \\wsl.localhost\Ubuntu\home\<ユーザー名>\projects\musekusa\hey-muse
+powershell.exe -ExecutionPolicy Bypass -File tools\mothership\windows\install-asr.ps1 -Allow 端末のIP
 ```
 
-日本語の Windows では項目名が日本語で出ます（英語の Windows では `Task To Run`、`Stop the task if it runs longer than`、`Power Management`）。絞り込みの語は、お使いの Windows の表記に合わせてください。
+他の引数は `-Port`（既定 50024）、`-IdleMinutes`（既定 30）、`-Model`（既定 `large-v3-turbo`）です。
 
-期待する結果は次のとおりです。
+インストーラは、`%LOCALAPPDATA%\hey-muse` に `venv`・`app`・`logs` を作り、faster-whisper と CUDA の DLL を入れ、`recognizer.py` と `worker.py` を `app` にコピーします。続けて `worker.py --check` でモデルを読み込みます（初回はモデルの取得、約 1.6 GB に時間がかかります）。そのあと、タスク `hey-muse ASR`（ログオン時に非表示で起動、実行時間の制限なし、失敗したら再起動）を登録して開始し、`127.0.0.1:50024` が応答するまで確認します。旧構成のタスク `hey-muse WSL` があれば、消せるときは消します。
 
-- 「実行するタスク」の行に `wsl.exe -d Ubuntu --exec /bin/sleep infinity` が出ます。
-- 「タスクを停止するまでの時間」が、時間の値（`72:00:00` など）でなく「無効」（`Disabled`）です。
-- 「電源管理」に「バッテリ モードで停止」と「バッテリで開始しない」が含まれません（英語表記では `Stop On Battery Mode` と `No Start On Batteries`）。
+期待する結果: 最後に、タスク名、ログの場所、`--allow`、アイドル解放の分数が出ます。「管理者 PowerShell で実行してください」の案内が出たときは、表示されたコマンドを管理者の PowerShell で実行します。
+
+### 3. 確認
+
+```powershell
+Get-ScheduledTask -TaskName 'hey-muse ASR' | Select-Object State
+Test-NetConnection 母艦のLAN_IP -Port 50024
+Get-Content $env:LOCALAPPDATA\hey-muse\logs\asr.log -Tail 5
+```
+
+期待する結果: `State` が `Running`、`TcpTestSucceeded : True`、ログに `ready`（待ち受け開始）と `worker:` の行が出ます。
 
 ### 4. 再起動して確認する
 
-Windows を再起動し、ログオンして 2 分待ちます。WSL の中で次を実行します。
+Windows を再起動し、ログオンして 2 分待ってから、手順 3 を繰り返します。さらに、`wsl --shutdown` を実行したあとも同じ結果になることを確認します。
 
-```bash
-systemctl is-active muse-asr
-```
+### 5. メモリの振る舞い
 
-期待する結果: `active`。
+- 待機中は、受付のプロセス（`pythonw`）だけが動き、GPU のメモリ（VRAM）は使いません。
+- 端末が話しかけられると、認識プロセスがモデルを読み込みます（VRAM 約 2 GB、約 3 秒）。最後の使用から 30 分たつと、認識プロセスは終了し、VRAM は元に戻ります。
+- 30 分以上あけたあとの最初の一言は、3〜6 秒遅くなります。まれに、その 1 回だけ Muse 側の認識に切り替わることがあります。
+- 時間を変えるときは、`install-asr.ps1 -Allow 端末のIP -IdleMinutes N` を再実行します。
 
-別の LAN 機器から届くかも確認します。端末が使えなければ、別の Windows PC の PowerShell か、スマホの TCP テストアプリを使います。
+端末側の設定は変わりません。端末が使う認識の宛先は、母艦の LAN アドレス（Windows の IP）の 50024 番です（第 7 部）。
 
-```powershell
-Test-NetConnection 母艦のLAN_IP -Port 50024
-```
+### 6. 設定を変える・更新する
 
-期待する結果: `TcpTestSucceeded : True`。
+`install-asr.ps1` を、引数を変えて再実行します（何度実行しても安全です）。`recognizer.py` や `worker.py` を更新したときも、同じく再実行して `app` へコピーし直します。
 
-うまくいかないとき:
+### 7. うまくいかないとき
 
-- `TcpTestSucceeded : False` のとき: ファイアウォールの規則 `muse-asr` が 2 種類（`Get-NetFirewallRule -Name muse-asr` と `Get-NetFirewallHyperVRule -Name muse-asr`）あるか確認します。
-- `ip addr` に 172.17.x が出るとき: `.wslconfig` の `networkingMode=mirrored` が `[wsl2]` の下にあるか、`wsl --shutdown` を実行したかを確認します。
-- `active` にならないとき: `journalctl -u muse-asr -n 30 --no-pager` を見ます。`--allow` の書き方と `LD_LIBRARY_PATH` が主な原因です。
+- ログ `%LOCALAPPDATA%\hey-muse\logs\asr.log`（5 MB × 3 世代でローテーション）で、`ready` と `worker:` の行を探します。`fatal` の行があれば、CUDA か DLL の問題です。
+- モデルの読み込みを手で試すには、`%LOCALAPPDATA%\hey-muse\venv\Scripts\python.exe %LOCALAPPDATA%\hey-muse\app\worker.py --check --idle-seconds 0` を実行します。
+- `TcpTestSucceeded : False` のとき: ファイアウォールの規則 `muse-asr`（`Get-NetFirewallRule -Name muse-asr`）と、`-Allow` に端末の IP を指定したかを確認します。
+- 旧構成のタスク `hey-muse WSL` が残っていないか確認します（付録 B）。
 
 ## 第 4 部 Google カレンダー
 
@@ -452,3 +422,29 @@ ls -l /data/misc/techo5/standalone-home/
 ```
 
 画面操作や電源・音量・アラームなど、端末でできることは Muse が自分で呼び出します。家電の操作は、Nature Remo の定型句（「リビングの電気を消して」など）が先に処理します。
+
+## 付録 A Linux / WSL を母艦にする場合
+
+Linux や WSL2 を母艦にするときの手順です。詳しくは [tools/mothership/README.md](../../tools/mothership/README.md) を見てください。
+
+1. Windows の WSL を使うときは、管理者 PowerShell で `setup-mothership.ps1`（`-WindowsNative` なし）を実行します。`.wslconfig` に `networkingMode=mirrored`（WSL が Windows と同じ LAN の IP を持つ設定）を入れ（元のファイルは `.wslconfig.bak`）、ファイアウォール、AC 電源のスタンバイ無効、タスク `hey-muse WSL`（ログオン時に WSL を起こしたままにする）を設定します。そのあと `wsl --shutdown` で WSL を開き直し、`ip -4 addr show` で Windows と同じ LAN のアドレスが出ることを確認します。
+2. 仮想環境 `~/.venvs/muse-asr` を先に作ります（[tools/echo-asr/README.md](../../tools/echo-asr/README.md) の「Run Whisper on a PC」）。WSL の中で `bash tools/mothership/install.sh` を実行すると、systemd のサービス `muse-asr` が入ります（`/etc/wsl.conf` に `systemd=true` が必要）。
+3. 初回にできる `~/.config/hey-muse/asr.env` の `ASR_ARGS` で、`--allow` を端末の IP に直し、`sudo systemctl restart muse-asr` を実行します。
+4. 確認は `systemctl is-active muse-asr`（`active`）と、別の機器からの `Test-NetConnection 母艦のLAN_IP -Port 50024` です。
+
+## 付録 B WSL の母艦からの移行
+
+WSL の母艦（`muse-asr` と `hey-muse WSL`）から、第 3 部の Windows ネイティブ版へ移すときの手順です。先に第 3 部を済ませ、動くことを確認してから行います。
+
+1. WSL の中で、旧サービスを止めます。
+
+   ```bash
+   sudo systemctl disable --now muse-asr
+   ```
+
+2. 任意です。`%USERPROFILE%\.wslconfig` の `networkingMode=mirrored` を消し、PowerShell で `wsl --shutdown` を実行します。
+3. タスク `hey-muse WSL` が残っていれば消します（インストーラが消せなかったときだけ必要です）。管理者の PowerShell で実行します。
+
+   ```powershell
+   Unregister-ScheduledTask -TaskName 'hey-muse WSL' -Confirm:$false
+   ```
