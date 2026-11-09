@@ -193,8 +193,31 @@ class DoorTests(unittest.TestCase):
         s.close()
         return port
 
+    def test_openai_style_speech_returns_24k_pcm(self):
+        conn = self.http()
+        conn.request('POST', '/v1/audio/speech', body=json.dumps({'model': 'x', 'voice': 'alloy', 'input': 'こんにちは',
+                     'response_format': 'pcm'}), headers={'Content-Type': 'application/json', 'Authorization': 'Bearer local'})
+        resp = conn.getresponse()
+        data = resp.read()
+        self.assertEqual((resp.status, resp.getheader('Content-Type')), (200, 'audio/pcm'))
+        self.assertEqual(len(data), 80000)
+        self.assertEqual(self.speaker.asked, [('こんにちは', None)])
+
+    def test_speech_in_other_formats_is_refused(self):
+        conn = self.http()
+        conn.request('POST', '/v1/audio/speech', body=json.dumps({'input': 'はい', 'response_format': 'mp3'}))
+        resp = conn.getresponse()
+        resp.read()
+        self.assertEqual(resp.status, 400)
+
+    def test_resample_to_24k(self):
+        pcm = llm_door.to_rate(b'\x00\x10' * 22050, 22050)
+        self.assertEqual(len(pcm), 2 * 24000)
+        self.assertEqual(llm_door.to_rate(b'\x01\x00' * 10, 24000), b'\x01\x00' * 10)
+
     def test_http_is_refused_without_upstream(self):
         self.server.upstream = None
+        self.server.speaker = None
         conn = self.http()
         conn.request('GET', '/v1/models')
         with self.assertRaises((http.client.RemoteDisconnected, ConnectionError)):

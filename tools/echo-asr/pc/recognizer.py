@@ -268,11 +268,11 @@ class Handler(socketserver.StreamRequestHandler):
             return
         if first != b'{':
             # Wyoming のイベントは JSON の 1 行で始まる。それ以外は答え手（LLM）への HTTP 要求として扱う
-            upstream = getattr(self.server, 'upstream', None)
-            if upstream is None:
+            upstream, speaker = getattr(self.server, 'upstream', None), getattr(self.server, 'speaker', None)
+            if upstream is None and speaker is None:
                 return
             from llm_door import ChatDoor
-            ChatDoor.serve(self.rfile, self.wfile, self.connection, self.client_address, upstream)
+            ChatDoor.serve(self.rfile, self.wfile, self.connection, self.client_address, upstream, speaker)
             return
         self.handle_wyoming()
 

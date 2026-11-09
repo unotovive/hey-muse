@@ -3,6 +3,9 @@
 母艦の受付ポート（Wyoming の 50024）に HTTP で来た要求だけをここで扱う。Windows の受信規則を
 増やさずに済み、Ollama 自身は 127.0.0.1 だけで待ち受けたままにできる。中継するのは会話と
 モデル一覧の 2 つだけで、それ以外の Ollama の API（モデルの削除や取得など）は通さない。
+
+OpenAI 互換の読み上げ（/v1/audio/speech、24 kHz の PCM）もここで受け、speaker.py で読む。
+Muse で答えるときの「Speech endpoint」に母艦を指定すれば、OpenAI の鍵なしで日本語を読める。
 """
 import http.client
 import http.server
@@ -14,6 +17,26 @@ import time
 LOG = logging.getLogger('muse-llm')
 MAX_BODY = 4 * 1024 * 1024
 ROUTES = {('POST', '/v1/chat/completions'), ('GET', '/v1/models')}
+SPEECH = ('POST', '/v1/audio/speech')
+SPEECH_RATE = 24000  # OpenAI の pcm 形式（16 bit リトルエンディアン、モノラル）
+
+
+def to_rate(pcm, rate, target=SPEECH_RATE):
+    """16 bit モノラル PCM を線形補間で target Hz にする（SAPI の 22050 Hz を 24 kHz にするため）。"""
+    if rate == target or not pcm:
+        return pcm
+    from array import array
+    src = array('h')
+    src.frombytes(pcm[:len(pcm) // 2 * 2])
+    n = len(src) * target // rate
+    out = array('h', bytes(2 * n))
+    last = len(src) - 1
+    for i in range(n):
+        pos = i * rate / target
+        j = int(pos)
+        k = min(j + 1, last)
+        out[i] = int(src[j] + (src[k] - src[j]) * (pos - j))
+    return out.tobytes()
 
 
 class Upstream:
@@ -69,10 +92,10 @@ class ChatDoor(http.server.BaseHTTPRequestHandler):
     sys_version = ''
 
     @classmethod
-    def serve(cls, rfile, wfile, connection, client_address, upstream):
+    def serve(cls, rfile, wfile, connection, client_address, upstream, speaker=None):
         door = cls.__new__(cls)
         door.rfile, door.wfile, door.connection, door.request = rfile, wfile, connection, connection
-        door.client_address, door.server, door.upstream = client_address, None, upstream
+        door.client_address, door.server, door.upstream, door.speaker = client_address, None, upstream, speaker
         door.close_connection = True
         door.handle()
 
@@ -86,7 +109,8 @@ class ChatDoor(http.server.BaseHTTPRequestHandler):
 
     def _route(self, method):
         path = self.path.split('?', 1)[0]
-        if (method, path) not in ROUTES:
+        speech = (method, path) == SPEECH and self.speaker is not None
+        if not speech and ((method, path) not in ROUTES or self.upstream is None):
             self._reply(404, 'application/json', b'{"error":"not found"}')
             return
         length = int(self.headers.get('Content-Length') or 0)
@@ -95,6 +119,9 @@ class ChatDoor(http.server.BaseHTTPRequestHandler):
             self._reply(413, 'application/json', b'{"error":"too large"}')
             return
         body = self.rfile.read(length) if length else b''
+        if speech:
+            self._speak(body)
+            return
         started = time.monotonic()
         try:
             status, ctype, data = self.upstream.forward(method, path, body)
@@ -104,6 +131,30 @@ class ChatDoor(http.server.BaseHTTPRequestHandler):
             return
         LOG.info('llm %s %s -> %s in %.1fs', method, path, status, time.monotonic() - started)
         self._reply(status, ctype, data)
+
+    def _speak(self, body):
+        try:
+            req = json.loads(body)
+            text = str(req.get('input') or '')
+            fmt = req.get('response_format') or 'pcm'
+        except (ValueError, AttributeError):
+            self._reply(400, 'application/json', b'{"error":"invalid json"}')
+            return
+        if fmt != 'pcm':
+            self._reply(400, 'application/json', b'{"error":"only response_format pcm is served"}')
+            return
+        voice = req.get('voice')
+        started = time.monotonic()
+        try:
+            pcm, rate = self.speaker.synthesize(text, voice if str(voice or '').isdigit() else None)
+        except Exception as exc:
+            LOG.warning('speech failed: %s', exc)
+            self._reply(502, 'application/json', b'{"error":"speech failed"}')
+            return
+        pcm = to_rate(pcm, rate)
+        LOG.info('speech chars=%d audio_seconds=%.1f in %.2fs', len(text), len(pcm) / 2 / SPEECH_RATE,
+                 time.monotonic() - started)
+        self._reply(200, 'audio/pcm', pcm)
 
     def do_POST(self):
         self._route('POST')
