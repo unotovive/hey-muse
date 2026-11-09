@@ -4,15 +4,31 @@
 # 2) 受信ファイアウォール（TCP 50024）を開け、AC 電源時のスタンバイを無効にする
 # 3) ログオン時に WSL を起こして起こしたままにするタスクを登録する（実行時間無制限、バッテリーでも止めない）
 # 実行後に WSL の再起動（wsl --shutdown）が必要。このスクリプトは再起動しない。
+# -WindowsNative を付けると Windows ネイティブ母艦用になり、WSL 関連（ディストリビューション確認、
+# .wslconfig、Hyper-V 規則、タスク hey-muse WSL）を行わず、受信規則 muse-asr と AC スタンバイ無効化だけを行う。
+#   powershell.exe -ExecutionPolicy Bypass -File tools\mothership\windows\setup-mothership.ps1 -WindowsNative
 param(
     [string]$Distro = 'Ubuntu',
-    [int]$Port = 50024
+    [int]$Port = 50024,
+    [switch]$WindowsNative
 )
 $ErrorActionPreference = 'Stop'
 
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw '管理者として実行してください（スタートメニューで PowerShell を右クリック、管理者として実行）。'
+}
+
+# --- Windows ネイティブ母艦: 受信規則と電源だけ ---
+if ($WindowsNative) {
+    if (-not (Get-NetFirewallRule -Name 'muse-asr' -ErrorAction SilentlyContinue)) {
+        New-NetFirewallRule -Name 'muse-asr' -DisplayName 'muse-asr' -Direction Inbound -Protocol TCP -LocalPort $Port -Action Allow | Out-Null
+    }
+    powercfg /change standby-timeout-ac 0
+    if ($LASTEXITCODE -ne 0) { throw 'powercfg に失敗しました。' }
+    Write-Host ''
+    Write-Host '完了（Windows ネイティブ母艦）。'
+    return
 }
 
 # --- ディストリビューション名の確認 ---
