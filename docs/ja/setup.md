@@ -129,7 +129,7 @@ powershell.exe -ExecutionPolicy Bypass -File tools\mothership\windows\install-as
 
 他の引数は `-Port`（既定 50024）、`-IdleMinutes`（既定 30）、`-Model`（既定 `large-v3-turbo`）です。
 
-インストーラは、`%LOCALAPPDATA%\hey-muse` に `venv`・`app`・`logs` を作り、faster-whisper と CUDA の DLL を入れ、`recognizer.py` と `worker.py` を `app` にコピーします。続けて `worker.py --check` でモデルを読み込みます（初回はモデルの取得、約 1.6 GB に時間がかかります）。そのあと、タスク `hey-muse ASR`（ログオン時に非表示で起動、実行時間の制限なし、失敗したら再起動）を登録して開始し、`127.0.0.1:50024` が応答するまで確認します。旧構成のタスク `hey-muse WSL` があれば、消せるときは消します。
+インストーラは、`%LOCALAPPDATA%\hey-muse` に `venv`・`app`・`logs` を作り、faster-whisper と CUDA の DLL を入れ、`recognizer.py` と `worker.py` を `app` にコピーします。続けて `worker.py --check` でモデルを読み込みます（初回はモデルの取得、約 1.6 GB に時間がかかります）。そのあと、タスク `hey-muse ASR`（ログオン時に非表示で起動、実行時間の制限なし、落ちても最長 5 分で起動し直す）を登録して開始し、`127.0.0.1:50024` が応答するまで確認します。旧構成のタスク `hey-muse WSL` があれば、消せるときは消します。
 
 期待する結果: 最後に、タスク名、ログの場所、`--allow`、アイドル解放の分数が出ます。「管理者 PowerShell で実行してください」の案内が出たときは、表示されたコマンドを管理者の PowerShell で実行します。
 

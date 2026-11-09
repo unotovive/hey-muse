@@ -71,6 +71,9 @@ $argList = @(
 foreach ($ip in $allowList) { $argList += @('--allow', $ip) }
 $action = New-ScheduledTaskAction -Execute $venvPythonw -Argument ($argList -join ' ') -WorkingDirectory $appDir
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
+# RestartCount はプロセスの異常終了では働かないので、ログオン後 5 分ごとに無期限で繰り返す。
+# 動作中は MultipleInstances IgnoreNew で何もせず、落ちていたときだけ最長 5 分で起動し直す。
+$trigger.Repetition = (New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5)).Repetition
 $taskPrincipal = New-ScheduledTaskPrincipal -UserId $currentUser -LogonType Interactive -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
     -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew
