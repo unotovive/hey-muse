@@ -141,6 +141,17 @@ class ProxyTests(unittest.TestCase):
         self.assertEqual(self.proxy.transcribe(LOUD, 'ja'), 'ja:3200')
         self.assertEqual(self.proxy.pid, pid)
 
+    def test_cold_timeout_keeps_worker_that_became_ready_meanwhile(self):
+        # 要求を出した時点で読み込み中なら、待つ間に ready が来て応答だけが遅れても止めない（仕様 4.2）
+        self.proxy = app.WorkerProxy(FAKE + ['--delay-ready', '0.7', '--slow', '0.6', '--idle-seconds', '0'], response_timeout=1.0)
+        with self.assertRaises(app.WorkerTimeout):
+            self.proxy.transcribe(LOUD, 'ja')
+        pid = self.proxy.pid
+        self.assertIsNotNone(pid)
+        self.proxy.response_timeout = 10
+        self.assertEqual(self.proxy.transcribe(LOUD2, 'ja'), 'ja:6400')
+        self.assertEqual(self.proxy.pid, pid)
+
     def test_hung_worker_after_ready_is_replaced(self):
         self.proxy = app.WorkerProxy(FAKE + ['--hang-on', '2', '--idle-seconds', '0'], response_timeout=1.0)
         self.assertEqual(self.proxy.transcribe(LOUD, 'ja'), 'ja:3200'); pid = self.proxy.pid

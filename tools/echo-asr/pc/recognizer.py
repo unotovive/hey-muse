@@ -178,10 +178,10 @@ class WorkerProxy:
             proc.kill()
         self._release()
 
-    def _discard_if_hung(self, spawn):
-        """ready 済みで応答が来ない＝固まったとみなし、止めて捨てる（次の要求で起動し直す）。
-        読み込み中（ready 前）のタイムアウトでは生かしておく（仕様 4.2）。"""
-        if not spawn.ready.is_set():
+    def _discard_if_hung(self, spawn, was_ready):
+        """要求を出した時点で ready 済みだったのに応答が来ない＝固まったとみなし、止めて捨てる（次の要求で起動し直す）。
+        要求を出した時点で読み込み中なら、待つ間に ready が来ていても生かしておく（読み込みは打ち切らない。仕様 4.2）。"""
+        if not was_ready:
             return
         with self._spawn_lock:
             if self.spawn is spawn:
@@ -197,6 +197,7 @@ class WorkerProxy:
             # 起動を含め、ここからの待ちをすべて response_timeout に収める
             deadline = time.monotonic() + self.response_timeout
             spawn = self._ensure()  # 以後は手元の参照だけを使う（他スレッドの prepare で差し替わっても安全）
+            was_ready = spawn.ready.is_set()  # タイムアウト時ではなく、要求を出す時点の状態で判定する
             self.next_id += 1
             rid = self.next_id
             header = json.dumps({'id': rid, 'language': language, 'pcm_length': len(pcm)}).encode() + b'\n'
@@ -209,13 +210,13 @@ class WorkerProxy:
             if failed.is_set():
                 raise WorkerExited('worker exited')
             if writer.is_alive():
-                self._discard_if_hung(spawn)
+                self._discard_if_hung(spawn, was_ready)
                 raise WorkerTimeout('no response within %s seconds' % self.response_timeout)
             while True:
                 try:
                     message = spawn.responses.get(timeout=max(0, deadline - time.monotonic()))
                 except queue.Empty:
-                    self._discard_if_hung(spawn)
+                    self._discard_if_hung(spawn, was_ready)
                     raise WorkerTimeout('no response within %s seconds' % self.response_timeout) from None
                 if message is None:
                     raise WorkerExited('worker exited')
