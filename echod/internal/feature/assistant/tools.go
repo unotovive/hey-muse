@@ -18,7 +18,48 @@ import (
 	"github.com/HuskerMinion/techo5/echod/internal/feature/timer"
 	"github.com/HuskerMinion/techo5/echod/internal/lib/llm"
 	"github.com/HuskerMinion/techo5/echod/internal/lib/openmeteo"
+	"github.com/HuskerMinion/techo5/echod/internal/lib/standalone"
 )
+
+// standaloneDays says the device's own calendar events (lib/standalone) for n days from first, the way
+// the calendar tool says the others: a day past what was read (until) is said to be unknown rather than
+// free.
+func standaloneDays(evs []standalone.Event, first time.Time, n int, until time.Time) string {
+	var s []string
+	for i := range n {
+		day := first.AddDate(0, 0, i)
+		next := day.AddDate(0, 0, 1)
+		name := day.Format("Monday January 2")
+		if !day.Before(until) {
+			s = append(s, name+": not known (only the coming week is read)")
+			continue
+		}
+		var items []string
+		for _, e := range evs {
+			end := e.End
+			if !end.After(e.Start) {
+				end = e.Start.Add(time.Nanosecond)
+			}
+			if !e.Start.Before(next) || !end.After(day) {
+				continue
+			}
+			when := "all day"
+			if !e.Day {
+				when = e.Start.In(time.Local).Format("3:04 PM")
+			}
+			item := when + " " + e.Title
+			if e.Calendar != "" {
+				item += " (" + e.Calendar + ")"
+			}
+			items = append(items, item)
+		}
+		if len(items) == 0 {
+			items = []string{"nothing"}
+		}
+		s = append(s, name+": "+strings.Join(items, ", "))
+	}
+	return strings.Join(s, "; ")
+}
 
 // tool is one thing the model may do on the device. Run gets the model's arguments and returns what
 // happened, for the model to put into words.
@@ -109,7 +150,7 @@ func deviceTools() []tool {
 				return strings.Join(s, "; "), nil
 			}},
 
-		{llm.Tool{Name: "cancel_timers", Description: "Cancel timers: the one with this label, or all of them.",
+		{llm.Tool{Name: "cancel_timers", Description: "Cancel timers that are still counting down, which is what stopping a timer before it rings means: the one with this label, or all of them.",
 			Parameters: object(map[string]any{"label": str("The timer's label; empty cancels all.")})},
 			func(a map[string]any) (string, error) {
 				label := strings.ToLower(argString(a, "label"))
@@ -231,13 +272,27 @@ func deviceTools() []tool {
 				return fmt.Sprintf("%d alarms matched; ask which one, nothing was deleted", len(found)), nil
 			}},
 
-		{llm.Tool{Name: "stop", Description: "Stop whatever is ringing or playing on this device right now: a ringing alarm or timer, the radio or music. It does not delete alarms or cancel timers.",
+		{llm.Tool{Name: "stop", Description: "Stop whatever is ringing or playing on this device right now: a ringing alarm or timer, the radio or music. It does not delete alarms or cancel timers: a timer still counting down is cancelled with cancel_timers, even when asked to stop it.",
 			Parameters: object(map[string]any{})},
 			func(map[string]any) (string, error) {
 				rang := ring.End()
+				playing, _ := media.Get().Playing()
 				media.Get().Stop()
 				if rang {
 					return "stopped the ringing and anything playing", nil
+				}
+				// Asked to stop with nothing ringing or playing, a timer still counting down is what was
+				// meant: "stop the timer" came here, and was reported done while the timer ran on.
+				if !playing {
+					n := 0
+					for _, t := range timer.Get().List(time.Now()) {
+						if timer.Get().Cancel(t.ID) {
+							n++
+						}
+					}
+					if n > 0 {
+						return fmt.Sprintf("canceled %d timer(s) that were counting down (nothing was ringing or playing)", n), nil
+					}
 				}
 				return "stopped anything playing", nil
 			}},
@@ -291,9 +346,6 @@ func deviceTools() []tool {
 				"days": num("How many days, 1 to 14. Default 1."),
 			})},
 			func(a map[string]any) (string, error) {
-				if len(home.Get().CalendarSources()) == 0 {
-					return "", errors.New("this device shows no calendars")
-				}
 				now := time.Now()
 				first := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local)
 				if d := argString(a, "date"); d != "" {
@@ -306,6 +358,17 @@ func deviceTools() []tool {
 				n := 1
 				if v, ok := argNumber(a, "days"); ok {
 					n = int(max(1, min(14, math.Round(v))))
+				}
+				if len(home.Get().CalendarSources()) == 0 {
+					// The device's own calendars (Google Calendar or iCal, read for the waiting screen).
+					if standalone.Device.Enabled() {
+						evs, until, err := standalone.Device.CachedEvents()
+						if err != nil {
+							return "", errors.New("the calendars have not been read yet")
+						}
+						return standaloneDays(evs, first, n, until), nil
+					}
+					return "", errors.New("this device shows no calendars")
 				}
 				var s []string
 				read := true

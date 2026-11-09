@@ -152,8 +152,8 @@ func (d *direct) answer(ctx context.Context, pcm []byte) {
 	d.post(event{kind: evReplyText, text: reply})
 	// An answer that asks something wants one, and gets it without the wake word again: what Home
 	// Assistant's pipeline reports as continue_conversation for a chat model's reply that ends in a
-	// question.
-	if strings.HasSuffix(reply, "?") {
+	// question. A Japanese answer asks with a full-width mark, as Muse's do (muse.go).
+	if strings.HasSuffix(reply, "?") || strings.HasSuffix(reply, "？") {
 		d.post(event{kind: evContinue})
 	}
 

@@ -117,6 +117,9 @@ func (a *Assistant) Think(ctx context.Context, heard string) (string, error) {
 		return speech.Spoken(m.Content), nil
 	}
 	a.remember(added, g.Read())
+	if config.Get().Screen.Language == "ja" {
+		return "すみません、うまく答えられませんでした。", nil
+	}
 	return "Sorry, I got stuck on that one.", nil
 }
 

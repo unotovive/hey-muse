@@ -117,3 +117,18 @@ func TestCalendarAtomicRefreshAndRecurrence(t *testing.T) {
 		t.Fatalf("lost previous snapshot: %+v %v", cached, err)
 	}
 }
+
+func TestCachedEvents(t *testing.T) {
+	h := Home{dir: t.TempDir()}
+	if _, _, err := h.CachedEvents(); err == nil {
+		t.Fatal("no cache yet should be an error")
+	}
+	until := time.Date(2026, 11, 18, 0, 0, 0, 0, time.UTC)
+	if err := h.save("agenda-cache.json", snapshot{Events: []Event{{Title: "会議"}}, Until: until}); err != nil {
+		t.Fatal(err)
+	}
+	evs, got, err := h.CachedEvents()
+	if err != nil || len(evs) != 1 || evs[0].Title != "会議" || !got.Equal(until) {
+		t.Fatalf("got %v %v %v", evs, got, err)
+	}
+}

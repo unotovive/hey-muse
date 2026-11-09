@@ -1,6 +1,11 @@
 package assistant
 
 import (
+	"github.com/HuskerMinion/techo5/echod/internal/config"
+	"github.com/HuskerMinion/techo5/echod/internal/feature/timer"
+	"github.com/HuskerMinion/techo5/echod/internal/lib/standalone"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -65,5 +70,52 @@ func TestGoingHomeIsHandledHere(t *testing.T) {
 		if handledHere(s) {
 			t.Errorf("%q was kept from the model", s)
 		}
+	}
+}
+
+func TestStandaloneDays(t *testing.T) {
+	at := func(d, hm int) time.Time { return time.Date(2026, 11, d, hm/100, hm%100, 0, 0, time.Local) }
+	evs := []standalone.Event{
+		{Title: "会議", Calendar: "仕事", Start: at(10, 1500), End: at(10, 1600)},
+		{Title: "旅行", Calendar: "家族", Start: at(10, 0), End: at(12, 0), Day: true},
+		{Title: "締め切り", Start: at(11, 900), End: at(11, 900)},
+	}
+	got := standaloneDays(evs, at(10, 0), 3, at(12, 0))
+	want := "Tuesday November 10: 3:00 PM 会議 (仕事), all day 旅行 (家族); " +
+		"Wednesday November 11: all day 旅行 (家族), 9:00 AM 締め切り; " +
+		"Thursday November 12: not known (only the coming week is read)"
+	if got != want {
+		t.Errorf("got  %q\nwant %q", got, want)
+	}
+	if got := standaloneDays(nil, at(10, 0), 1, at(18, 0)); got != "Tuesday November 10: nothing" {
+		t.Errorf("an empty day: %q", got)
+	}
+}
+
+// "Stop the timer" for one still counting down reached the stop tool, which stopped nothing and said
+// it was done: with nothing ringing or playing, stop cancels the timers counting down.
+func TestStopCancelsACountingTimerWhenNothingRings(t *testing.T) {
+	config.Use(filepath.Join(t.TempDir(), "state.json"))
+	timer.Get().Start("パスタ", 10*time.Minute)
+	defer func() {
+		for _, c := range timer.Get().List(time.Now()) {
+			timer.Get().Cancel(c.ID)
+		}
+	}()
+	var stop tool
+	for _, x := range deviceTools() {
+		if x.Name == "stop" {
+			stop = x
+		}
+	}
+	got, err := stop.Run(map[string]any{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(timer.Get().List(time.Now())); n != 0 {
+		t.Errorf("%d timer(s) still counting down after stop: %q", n, got)
+	}
+	if !strings.Contains(got, "canceled 1 timer") {
+		t.Errorf("stop said %q", got)
 	}
 }

@@ -116,6 +116,17 @@ func (h *Home) refreshGoogle(ctx context.Context, cfg settings, tok googleToken,
 	return data, nil
 }
 
+// CachedEvents is what the last calendar refresh read (agenda-cache.json), and until when it covers.
+// The waiting screen refreshes it every few minutes, so a question by voice reads this rather than
+// asking every calendar again.
+func (h *Home) CachedEvents() ([]Event, time.Time, error) {
+	var data snapshot
+	if err := h.read("agenda-cache.json", &data); err != nil {
+		return nil, time.Time{}, err
+	}
+	return data.Events, data.Until, nil
+}
+
 func (h *Home) agenda(ctx context.Context, cfg settings) (Result, error) {
 	now := time.Now()
 	data, err := h.refresh(ctx, cfg, now)
