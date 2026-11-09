@@ -20,6 +20,7 @@ class FakeRecognizer:
 
 FAKE = [sys.executable, str(pathlib.Path(__file__).with_name('fake_worker.py'))]
 LOUD = (b'\x00\x10' * 1600)   # 4096 の振幅 × 1600 サンプル
+LOUD2 = b'\x00\x10' * 3200   # 6400 バイト（古い応答との取り違え検出用）
 SILENT = b'\x01\x00' * 1600   # 振幅 1
 
 class ProtocolTests(unittest.TestCase):
@@ -68,8 +69,11 @@ class ProtocolTests(unittest.TestCase):
         rec.prepare = lambda: setattr(rec, 'prepared', rec.prepared + 1)
         app.send_event(self.file, 'transcribe', {'language': 'ja'})
         app.send_event(self.file, 'audio-start', app.FORMAT)
+        payload = b'\x01\x00'*1600
+        self.file.write(json.dumps({'type':'audio-chunk','data':app.FORMAT,'payload_length':len(payload)}).encode()+b'\n'+payload)
         app.send_event(self.file, 'audio-stop', {})
-        app.read_event(self.file)
+        kind, data, _ = app.read_event(self.file)
+        self.assertEqual((kind, data['text']), ('transcript', '日本語のテスト'))
         self.assertEqual(rec.prepared, 1)
 
     def test_timeout_reaches_client_as_error(self):
@@ -98,6 +102,16 @@ class ProxyTests(unittest.TestCase):
         self.assertEqual(self.proxy.transcribe(LOUD, 'ja'), 'ja:3200')
         self.assertEqual(self.proxy.pid, pid)
 
+    def test_concurrent_prepare_spawns_one_worker(self):
+        self.proxy = app.WorkerProxy(FAKE + ['--idle-seconds', '0'])
+        pids = []
+        def run(): self.proxy.prepare(); pids.append(self.proxy.pid)
+        threads = [threading.Thread(target=run) for _ in range(8)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        self.assertEqual(len(set(pids)), 1)
+        self.assertEqual(self.proxy.transcribe(LOUD, 'ja'), 'ja:3200')
+
     def test_silence_short_circuits_worker(self):
         self.proxy = app.WorkerProxy(['/nonexistent/python'])
         self.assertEqual(self.proxy.transcribe(SILENT, 'ja'), '')
@@ -108,7 +122,8 @@ class ProxyTests(unittest.TestCase):
             self.proxy.transcribe(LOUD, 'ja')
         pid = self.proxy.pid
         self.proxy.response_timeout = 10
-        self.assertEqual(self.proxy.transcribe(LOUD, 'ja'), 'ja:3200')
+        # 遅れて届く旧 id の 'ja:3200' を捨て、2 回目の 'ja:6400' を返す
+        self.assertEqual(self.proxy.transcribe(LOUD2, 'ja'), 'ja:6400')
         self.assertEqual(self.proxy.pid, pid)
 
     def test_worker_death_then_respawn(self):

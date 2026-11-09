@@ -64,6 +64,7 @@ class WorkerProxy:
     def __init__(self, command, response_timeout=10.0):
         self.command, self.response_timeout = command, response_timeout
         self.lock = threading.Lock()
+        self._spawn_lock = threading.Lock()
         self.proc, self.responses, self.next_id = None, None, 0
 
     @property
@@ -72,14 +73,20 @@ class WorkerProxy:
 
     def prepare(self):
         """生きたワーカーが無ければ起動して戻る（ready は待たない）。"""
-        if self.proc is not None and self.proc.poll() is None:
-            return
-        self._release()
-        self.proc = subprocess.Popen(self.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        # 起動ごとに専用のキューを持ち、死んだワーカーの古い行を新しいワーカーのものと取り違えない
-        self.responses = queue.Queue()
-        threading.Thread(target=self._read_stdout, args=(self.proc.stdout, self.responses), daemon=True).start()
-        threading.Thread(target=self._relay_stderr, args=(self.proc.stderr,), daemon=True).start()
+        self._ensure()
+
+    def _ensure(self):
+        """(proc, responses) を返す。差し替えは _spawn_lock で守る（self.lock は長く持たれるので流用しない）。"""
+        with self._spawn_lock:
+            if self.proc is None or self.proc.poll() is not None:
+                self._release()
+                proc = subprocess.Popen(self.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                # 起動ごとに専用のキューを持ち、死んだワーカーの古い行を新しいワーカーのものと取り違えない
+                responses = queue.Queue()
+                threading.Thread(target=self._read_stdout, args=(proc.stdout, responses), daemon=True).start()
+                threading.Thread(target=self._relay_stderr, args=(proc.stderr,), daemon=True).start()
+                self.proc, self.responses = proc, responses
+            return self.proc, self.responses
 
     @staticmethod
     def _read_stdout(stream, responses):
@@ -121,19 +128,19 @@ class WorkerProxy:
         if not self.lock.acquire(timeout=3):
             raise ValueError('recognizer busy')
         try:
-            self.prepare()
+            proc, responses = self._ensure()  # 以後は手元の参照だけを使う（他スレッドの prepare で差し替わっても安全）
             self.next_id += 1
             rid = self.next_id
             header = json.dumps({'id': rid, 'language': language, 'pcm_length': len(pcm)}).encode() + b'\n'
             try:
-                self.proc.stdin.write(header + pcm)
-                self.proc.stdin.flush()
+                proc.stdin.write(header + pcm)
+                proc.stdin.flush()
             except OSError:
                 raise WorkerExited('worker exited') from None
             deadline = time.monotonic() + self.response_timeout
             while True:
                 try:
-                    message = self.responses.get(timeout=max(0, deadline - time.monotonic()))
+                    message = responses.get(timeout=max(0, deadline - time.monotonic()))
                 except queue.Empty:
                     raise WorkerTimeout('no response within %s seconds' % self.response_timeout) from None
                 if message is None:
@@ -149,14 +156,15 @@ class WorkerProxy:
             self.lock.release()
 
     def close(self):
-        if self.proc is None:
-            return
-        self.proc.terminate()
-        try:
-            self.proc.wait(3)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
-        self._release()
+        with self._spawn_lock:
+            if self.proc is None:
+                return
+            self.proc.terminate()
+            try:
+                self.proc.wait(3)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+            self._release()
 
 class Recognizer:
     def __init__(self, model, device, compute_type):
