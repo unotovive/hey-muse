@@ -445,10 +445,11 @@ WSL の母艦（`muse-asr` と `hey-muse WSL`）から、第 3 部の Windows �
    ```
 
 2. 第 3 部の手順 1・2 を行います。
-3. 第 3 部の手順 3・4 で、動作を確認します。
+3. 第 3 部の手順 3 で、動作を確認します。
 4. 任意です。`%USERPROFILE%\.wslconfig` の `networkingMode=mirrored` を消し、PowerShell で `wsl --shutdown` を実行します。
 5. タスク `hey-muse WSL` が残っていれば消します（インストーラが消せなかったときだけ必要です）。管理者の PowerShell で実行します。
 
    ```powershell
    Unregister-ScheduledTask -TaskName 'hey-muse WSL' -Confirm:$false
    ```
+6. 第 3 部の手順 4 で、再起動と `wsl --shutdown` のあとの動作を確認します。

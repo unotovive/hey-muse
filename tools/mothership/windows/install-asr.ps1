@@ -16,6 +16,10 @@ if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))
     throw '管理者権限で実行されています。venv とモデルキャッシュの所有者がずれるため、通常の（非昇格の）PowerShell で実行してください。'
 }
 $currentUser = $identity.Name
+$allowList = @($Allow | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+if ($allowList.Count -eq 0) {
+    throw '-Allow に有効な IP がありません。端末の IP を指定してください（複数ならコンマ区切り）。'
+}
 
 $taskName = 'hey-muse ASR'
 $app = Join-Path $env:LOCALAPPDATA 'hey-muse'
@@ -57,7 +61,6 @@ $argList = @(
     '--idle-unload-minutes', $IdleMinutes,
     '--log-file', "`"$logFile`""
 )
-$allowList = @($Allow | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 foreach ($ip in $allowList) { $argList += @('--allow', $ip) }
 $action = New-ScheduledTaskAction -Execute $venvPythonw -Argument ($argList -join ' ') -WorkingDirectory $appDir
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
