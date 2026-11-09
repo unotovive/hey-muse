@@ -1,4 +1,4 @@
-import io, json, os, sys, threading, time, unittest
+import io, json, os, subprocess, sys, threading, time, unittest
 import worker as w
 
 
@@ -52,6 +52,22 @@ class ProtocolTest(unittest.TestCase):
         start = time.monotonic()
         w.serve(Model(), w.start_reader(SlowEOF()), io.BytesIO(), idle_seconds=1)
         self.assertLess(time.monotonic() - start, 3)
+
+
+class DetachStdinTest(unittest.TestCase):
+    def test_fd0_becomes_null_and_requests_come_from_private_fd(self):
+        # 読み取りスレッドが標準入力のハンドルで待つと、Windows では子プロセスの起動などが止まる。
+        # そのため fd 0 は NUL に差し替え、要求は私用の fd から読む。子プロセスは NUL を継承する。
+        code = (
+            "import os, sys, subprocess, worker\n"
+            "f = worker.detach_stdin()\n"
+            "null0 = os.path.samestat(os.fstat(0), os.stat(os.devnull))\n"
+            "child = subprocess.run([sys.executable, '-c', 'import sys; print(len(sys.stdin.buffer.read()))'],"
+            " capture_output=True, timeout=10).stdout.strip().decode()\n"
+            "print(null0, sys.stdin.read() == '', child, f.readline().decode().strip())\n")
+        proc = subprocess.run([sys.executable, '-c', code], input=b'hello\n', capture_output=True, timeout=20,
+                              cwd=os.path.dirname(os.path.abspath(__file__)))
+        self.assertEqual(proc.stdout.decode().split(), ['True', 'True', '0', 'hello'], proc.stderr.decode())
 
 
 class CliTest(unittest.TestCase):

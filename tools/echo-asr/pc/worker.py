@@ -99,6 +99,21 @@ def read_requests(stdin, requests):
     requests.put(None)
 
 
+def detach_stdin():
+    """標準入力（fd 0）を私用の fd へ移し、fd 0 と sys.stdin は NUL にする。要求を読むファイルを返す。
+
+    Windows では、同期パイプのハンドルで ReadFile 待ちのスレッドがあると、別スレッドの CreateProcess
+    （標準ハンドルの継承）や GetFileType がデータの到着まで止まる。読み込み中の faster_whisper などが
+    子プロセスを起こしたり標準入力を調べたりして止まるので、読み取りスレッドは私用の fd で待たせる。
+    os.dup の fd は継承されず、Windows の os.dup2 は 0〜2 番で SetStdHandle も更新する。Linux でも害は無い。"""
+    fd = os.dup(0)
+    nul = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(nul, 0)
+    os.close(nul)
+    sys.stdin = open(0, 'r', encoding='utf-8', closefd=False)
+    return os.fdopen(fd, 'rb')
+
+
 def start_reader(stdin):
     """要求の読み取りスレッドを始め、キューを返す。モデル読み込みの前に呼び、読み込み中も stdin を吸い出す
     （読まないと受付側の書き込みがパイプで詰まり、打ち切りが効かなくなる）。"""
@@ -143,7 +158,8 @@ def main():
     logging.basicConfig(stream=sys.stderr, level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     add_cuda_dll_dirs()  # --device auto の判定（ctranslate2 の import）と faster_whisper の import より前に必要
     stdout = sys.stdout.buffer
-    requests = None if args.check else start_reader(sys.stdin.buffer)
+    # 重い import より前に標準入力を私用の fd へ移し、読み込み前から要求を受け取る（--check は読まない）
+    requests = None if args.check else start_reader(detach_stdin())
     try:
         model, device, compute_type = recognizer.model_settings(args)
         LOG.info('loading model=%s device=%s compute_type=%s', model, device, compute_type)
