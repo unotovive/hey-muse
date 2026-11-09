@@ -1,6 +1,99 @@
 # セットアップ（日本語）
 
-この文書の他の部は、別のタスクで追加されます。ここには第 4 部「Google カレンダー」を置きます。
+第 1 部・第 2 部で端末に TECHO5（この派生）を入れ、第 3 部以降で母艦と各機能を設定します。
+
+## 第 1 部 端末の解除（ブートローダー）
+
+自分の Echo Show 5 第 1 世代（checkers）のブートローダーを、公開されている [amonet](https://github.com/R0rt1z2/amonet)（ブランチ `mt8163-checkers`）で解除し、TWRP を入れます。ここで行う操作は端末の起動部分を書き換えるため、**途中で USB を抜いたり電源を切ったりすると起動しなくなります**。
+
+### 1. 道具と USB ドライバー（Windows）
+
+この派生では、端末の操作は **Windows ネイティブ** で行います。WSL に USB を渡す usbipd 経由では、端末が通常 → FASTBOOT → TWRP とモードを変えるたびに USB が付け直され、共有が外れて操作が途中で止まりました。
+
+- Python 3（`py -3 --version` で確認）
+- adb / fastboot: `winget install --id Google.PlatformTools -e`
+- fastboot 用ドライバー: amonet で解除した端末の fastboot は `VID_0BB4&PID_0C01` として見え、Windows には合うドライバーがありません。[Google USB Driver](https://dl.google.com/android/repository/usb_driver_r13-windows.zip) を展開し、端末を fastboot にした状態でデバイス マネージャーの「Android」→ ドライバーの更新 → コンピューターを参照 → 一覧から選択 → すべてのデバイス → ディスク使用 → `android_winusb.inf` →「Android Bootloader Interface」を選びます（互換性の警告は「はい」）。
+- TWRP の adb は Windows 標準のドライバーで動くので、追加は要りません。
+
+usbipd-win を以前に使っていたら、**端末の共有を必ず外しておきます**（管理者 PowerShell で `usbipd unbind --all`、`usbipd attach --auto-attach` が動いていれば止める）。残っていると、端末が fastboot に入った瞬間に WSL に取られ、Windows の fastboot から見えなくなります。
+
+### 2. 解除する
+
+amonet の README（checkers の手順）に従って解除します。電源と音量ボタンの長押しで FASTBOOT に入れる方法が使え、分解やはんだ付けは要りません。終わると端末は TWRP で起動します。
+
+### 3. 解除を確認する
+
+TWRP が起動すること自体が解除の証拠です（解除していない端末では TWRP は起動しません）。初回は「Keep System Read Only?」が出るので、**Swipe to Allow Modifications** をスワイプします。
+
+fastboot でも確かめられます（端末が fastboot のとき）。
+
+```powershell
+fastboot getvar product        # product: CHECKERS
+fastboot getvar unlock_status  # unlock_status: true
+fastboot reboot recovery       # TWRP に戻す
+```
+
+### ここで止まったら
+
+- `fastboot devices` が空: 上のドライバーと usbipd の共有を確認します。デバイス マネージャーで端末が「USBIP Shared Device」になっていれば usbipd が掴んでいます。
+- 画面が「HACKED FASTBOOT MODE」で止まる: 端末は fastboot で待っているだけです。`fastboot reboot recovery` で TWRP に、`fastboot continue` で通常起動に進めます。
+
+## 第 2 部 TECHO5 の導入
+
+TWRP にいる端末へ、`tools/install-show.py` で LineageOS（ドライバーのためだけに入れ、起動はしない）と TECHO5 を入れます。インストーラはリリースのマニフェストをプロジェクトの鍵で検証してから書き込みます。
+
+### 1. ファイルを Windows に置く
+
+```bash
+# WSL から（コピー先は例）
+mkdir -p /mnt/c/Users/<ユーザー>/hey-muse/lineage
+cp -r tools /mnt/c/Users/<ユーザー>/hey-muse/
+cp ~/downloads-untrusted/lineage/lineage-18.1-20260904-UNOFFICIAL-checkers.zip /mnt/c/Users/<ユーザー>/hey-muse/lineage/
+cp ~/.ssh/id_rsa.pub /mnt/c/Users/<ユーザー>/hey-muse/
+```
+
+LineageOS は **2026-09-04 版**（`lineage-18.1-checkers-v0.7`）が必要です。TECHO5 のカーネルはこの版のカーネルから作られており、別の版のドライバーは読み込めません。
+
+### 2. TWRP を整える
+
+端末の TWRP で、毎回次の 2 つを行います。
+
+- Mount →「Mount system partition read-only」の**チェックを外す**
+- Mount →「Disable MTP」を押し、ボタンが「Enable MTP」に変わった状態にする
+
+MTP が有効だと、464MB の zip を送っている最中に USB がリセットされ、adb ごと落ちることがあります（落ちたら TWRP の Reboot → Recovery でやり直します）。
+
+### 3. 事前確認（書き込みなし）
+
+```powershell
+$pt = "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\Google.PlatformTools_Microsoft.Winget.Source_8wekyb3d8bbwe\platform-tools"
+cd $HOME\hey-muse
+py -3 tools\install-show.py --adb "$pt\adb.exe" --fastboot "$pt\fastboot.exe" --serial <adb のシリアル> --name <端末名> --lineage-zip "$HOME\hey-muse\lineage\lineage-18.1-20260904-UNOFFICIAL-checkers.zip" --ssh-key "$HOME\hey-muse\id_rsa.pub" --dry-run
+```
+
+`release manifest signed by the project key` と `Dry run: ... nothing written to the unit.` が出れば準備完了です。
+
+### 4. インストール
+
+`--dry-run` を外し、`--wifi <SSID>` を付けて実行します（Wi-Fi のパスワードは対話で入力し、画面にもログにも残りません）。消去の前に 1 回だけ `ERASE` の入力を求められます。2.4GHz の SSID を推奨します。
+
+流れは、パーティションの退避（`backups\<シリアル>\partitions`）→ userdata の初期化 → LineageOS の導入 → rootfs の転送 → fastboot でブートイメージ → USB シリアルで slot store の作成と slot a への展開 → 初回起動の確認、です。最後に `Done. '<端末名>' runs TECHO5 v1.6.30-ja.2 from slot a` と端末の IP が出ます。
+
+途中で止まったときは、**slot store の作成（`== slot store`）より前なら、TWRP に戻して同じコマンドで最初からやり直せます**（退避済みのパーティションは飛ばされ、初期化する領域はもともと消す予定のものです）。
+
+- `waiting for TWRP after formatting userdata` で端末が HACKED FASTBOOT に止まる: 前の fastboot 要求が残っていると 1 回だけ起きます。待ちの間に別の PowerShell で `fastboot reboot recovery` を送れば、そのまま続きます。**`== flash the boot image` の `waiting for fastboot` では送らないでください**（インストーラがわざと fastboot に入れています）。
+- `waiting for fastboot` で 90 秒止まる: 第 1 部のドライバーと usbipd の共有を確認します。
+- `adb does not see ... in TWRP (state '')`: 端末が TWRP にいません。TWRP に戻してから実行します。
+
+### 5. 初期設定と確認
+
+端末に「Hello … Tap anywhere to begin」が出たら、画面の案内で初期設定をします（タイムゾーンは Tokyo）。**Home Assistant を使わないなら、Home Assistant に追加する選択肢は選びません。** 選ぶと 15 分間、端末は暗号鍵を消して登録を待ち、その間は SSH が起動せず、設定画面の SSH も「Starting...」のままオンにできません（15 分たつと新しい鍵で自動的に閉じ、SSH をオンにできるようになります）。
+
+```bash
+ssh root@<端末IP> 'cat /etc/techo5-release; PATH=/usr/local/sbin:$PATH slotctl status'
+```
+
+期待する結果: `v1.6.30-ja.2`、`active: a`、slot a が `trial` → 起動から約 5〜8 分で `good`。非対話の SSH では `slotctl` が PATH に無いので、上のように PATH を足します。
 
 ## 第 3 部 母艦（WSL の音声認識を常駐させる）
 

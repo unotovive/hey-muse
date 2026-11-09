@@ -11,7 +11,7 @@ Amazon Echo Show 5 を、Meta の AI エージェント [Muse](https://gadgets.m
 
 ## 日本語の手順書
 
-- [セットアップ](docs/ja/setup.md): 母艦の常駐（第 3 部）、Google カレンダー（第 4 部）、在室検知（第 5 部）、地震情報（第 6 部）、端末設定の配置（第 7 部）、Muse の契約とペアリング（第 8 部）。
+- [セットアップ](docs/ja/setup.md): 端末の解除（第 1 部）、TECHO5 の導入（第 2 部）、母艦の常駐（第 3 部）、Google カレンダー（第 4 部）、在室検知（第 5 部）、地震情報（第 6 部）、端末設定の配置（第 7 部）、Muse の契約とペアリング（第 8 部）。
 - [リリース手順](docs/ja/release.md)
 - [受け入れ記録](docs/ja/acceptance.md): 実施した確認と、実機待ちの確認。
 - 本体連携の詳細: [tools/standalone-home/README.md](tools/standalone-home/README.md)
