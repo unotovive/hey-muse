@@ -1,7 +1,14 @@
 import io
 import json
+import logging
+import logging.handlers
+import os
+import pathlib
 import socket
+import sys
+import tempfile
 import threading
+import time
 import unittest
 import unittest.mock
 import recognizer as app
@@ -10,6 +17,10 @@ class FakeRecognizer:
     def transcribe(self, pcm, language):
         assert pcm == b'\x01\x00'*1600 and language == 'ja'
         return '日本語のテスト'
+
+FAKE = [sys.executable, str(pathlib.Path(__file__).with_name('fake_worker.py'))]
+LOUD = (b'\x00\x10' * 1600)   # 4096 の振幅 × 1600 サンプル
+SILENT = b'\x01\x00' * 1600   # 振幅 1
 
 class ProtocolTests(unittest.TestCase):
     def setUp(self):
@@ -51,6 +62,82 @@ class ProtocolTests(unittest.TestCase):
 
     def test_peer_allowlist(self):
         self.assertFalse(self.server.verify_request(None, ('192.168.0.99', 10000)))
+
+    def test_transcribe_event_calls_prepare(self):
+        rec = self.server.recognizer; rec.prepared = 0
+        rec.prepare = lambda: setattr(rec, 'prepared', rec.prepared + 1)
+        app.send_event(self.file, 'transcribe', {'language': 'ja'})
+        app.send_event(self.file, 'audio-start', app.FORMAT)
+        app.send_event(self.file, 'audio-stop', {})
+        app.read_event(self.file)
+        self.assertEqual(rec.prepared, 1)
+
+    def test_timeout_reaches_client_as_error(self):
+        class Slow:
+            def transcribe(self, pcm, language): raise app.WorkerTimeout('slow')
+        self.server.recognizer = Slow()
+        app.send_event(self.file, 'transcribe', {'language': 'ja'})
+        app.send_event(self.file, 'audio-start', app.FORMAT)
+        app.send_event(self.file, 'audio-stop', {})
+        kind, data, _ = app.read_event(self.file)
+        self.assertEqual((kind, data['code']), ('error', 'recognition-failed'))
+
+class SilenceTest(unittest.TestCase):
+    def test_is_silent(self):
+        self.assertTrue(app.is_silent(b''))
+        self.assertTrue(app.is_silent(SILENT))
+        self.assertTrue(app.is_silent(b'\x00\x10' * 1599))
+        self.assertFalse(app.is_silent(LOUD))
+
+class ProxyTests(unittest.TestCase):
+    def tearDown(self): self.proxy.close()
+
+    def test_round_trip_and_prepare_reuses_worker(self):
+        self.proxy = app.WorkerProxy(FAKE + ['--idle-seconds', '0'])
+        self.proxy.prepare(); pid = self.proxy.pid
+        self.assertEqual(self.proxy.transcribe(LOUD, 'ja'), 'ja:3200')
+        self.assertEqual(self.proxy.pid, pid)
+
+    def test_silence_short_circuits_worker(self):
+        self.proxy = app.WorkerProxy(['/nonexistent/python'])
+        self.assertEqual(self.proxy.transcribe(SILENT, 'ja'), '')
+
+    def test_timeout_keeps_worker(self):
+        self.proxy = app.WorkerProxy(FAKE + ['--delay-ready', '2', '--idle-seconds', '0'], response_timeout=0.5)
+        with self.assertRaises(app.WorkerTimeout):
+            self.proxy.transcribe(LOUD, 'ja')
+        pid = self.proxy.pid
+        self.proxy.response_timeout = 10
+        self.assertEqual(self.proxy.transcribe(LOUD, 'ja'), 'ja:3200')
+        self.assertEqual(self.proxy.pid, pid)
+
+    def test_worker_death_then_respawn(self):
+        self.proxy = app.WorkerProxy(FAKE + ['--die-on', '2', '--idle-seconds', '0'])
+        self.assertEqual(self.proxy.transcribe(LOUD, 'ja'), 'ja:3200'); pid = self.proxy.pid
+        with self.assertRaises(app.WorkerExited):
+            self.proxy.transcribe(LOUD, 'ja')
+        self.assertEqual(self.proxy.transcribe(LOUD, 'ja'), 'ja:3200')
+        self.assertNotEqual(self.proxy.pid, pid)
+
+    def test_idle_exit_then_respawn(self):
+        self.proxy = app.WorkerProxy(FAKE + ['--idle-seconds', '1'])
+        self.proxy.prepare(); pid = self.proxy.pid
+        time.sleep(2.5)
+        self.assertEqual(self.proxy.transcribe(LOUD, 'ja'), 'ja:3200')
+        self.assertNotEqual(self.proxy.pid, pid)
+
+    def test_busy_while_transcribing(self):
+        self.proxy = app.WorkerProxy(FAKE + ['--slow', '5', '--idle-seconds', '0'], response_timeout=10)
+        t = threading.Thread(target=lambda: self.proxy.transcribe(LOUD, 'ja')); t.start(); time.sleep(0.5)
+        with self.assertRaisesRegex(ValueError, 'busy'):
+            self.proxy.transcribe(LOUD, 'ja')
+        t.join()
+
+    def test_worker_stderr_is_relayed(self):
+        self.proxy = app.WorkerProxy(FAKE + ['--stderr-line', 'こんにちは', '--idle-seconds', '0'])
+        with self.assertLogs(app.LOG, level='INFO') as cm:
+            self.proxy.transcribe(LOUD, 'ja')
+        self.assertTrue(any('worker: こんにちは' in m for m in cm.output))
 
 class ModelSettingsTest(unittest.TestCase):
     def test_defaults_follow_device(self):

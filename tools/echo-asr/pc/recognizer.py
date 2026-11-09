@@ -2,9 +2,12 @@
 import argparse
 import json
 import logging
+import queue
 import socketserver
+import subprocess
 import threading
 import time
+from array import array
 from pathlib import Path
 
 
@@ -39,6 +42,121 @@ def send_event(stream, kind, data):
     header = json.dumps({'type': kind, 'data_length': len(body)}).encode()+b'\n'
     stream.write(header+body)
     stream.flush()
+
+SILENCE_PEAK = 33  # 従来の 0.001 × 32768 の切り上げ
+
+def is_silent(pcm):
+    """無音判定。16 bit リトルエンディアン PCM を numpy なしで読む。サンプル数 1600 未満も無音扱い。"""
+    samples = array('h')
+    samples.frombytes(pcm[:len(pcm) // 2 * 2])
+    if len(samples) < 1600:
+        return True
+    return max(max(samples), -min(samples)) < SILENCE_PEAK
+
+class WorkerTimeout(Exception):
+    """応答が response_timeout 内に来なかった。TimeoutError にしない（Handler に握りつぶされるため）。"""
+
+class WorkerExited(Exception):
+    """認識プロセスの stdout が EOF になった（終了コードは問わない）。"""
+
+class WorkerProxy:
+    """認識プロセス（worker.py）を必要なときだけ起こし、stdin/stdout の JSON 行で文字起こしを頼む。"""
+    def __init__(self, command, response_timeout=10.0):
+        self.command, self.response_timeout = command, response_timeout
+        self.lock = threading.Lock()
+        self.proc, self.responses, self.next_id = None, None, 0
+
+    @property
+    def pid(self):
+        return self.proc.pid if self.proc else None
+
+    def prepare(self):
+        """生きたワーカーが無ければ起動して戻る（ready は待たない）。"""
+        if self.proc is not None and self.proc.poll() is None:
+            return
+        self._release()
+        self.proc = subprocess.Popen(self.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # 起動ごとに専用のキューを持ち、死んだワーカーの古い行を新しいワーカーのものと取り違えない
+        self.responses = queue.Queue()
+        threading.Thread(target=self._read_stdout, args=(self.proc.stdout, self.responses), daemon=True).start()
+        threading.Thread(target=self._relay_stderr, args=(self.proc.stderr,), daemon=True).start()
+
+    @staticmethod
+    def _read_stdout(stream, responses):
+        try:
+            for line in stream:
+                try:
+                    message = json.loads(line)
+                except ValueError:
+                    LOG.warning('worker stdout is not JSON')
+                    continue
+                if isinstance(message, dict):
+                    responses.put(message)
+        finally:
+            stream.close()
+            responses.put(None)  # EOF の目印
+
+    @staticmethod
+    def _relay_stderr(stream):
+        try:
+            for line in stream:
+                LOG.info('worker: %s', line.decode('utf-8', 'replace').rstrip())
+        finally:
+            stream.close()
+
+    def _release(self):
+        """終了済みワーカーの後始末（パイプを閉じて回収する）。"""
+        if self.proc is not None:
+            if self.proc.stdin:
+                try:
+                    self.proc.stdin.close()
+                except OSError:
+                    pass
+            self.proc.wait()
+        self.proc = None
+
+    def transcribe(self, pcm, language):
+        if is_silent(pcm):
+            return ''
+        if not self.lock.acquire(timeout=3):
+            raise ValueError('recognizer busy')
+        try:
+            self.prepare()
+            self.next_id += 1
+            rid = self.next_id
+            header = json.dumps({'id': rid, 'language': language, 'pcm_length': len(pcm)}).encode() + b'\n'
+            try:
+                self.proc.stdin.write(header + pcm)
+                self.proc.stdin.flush()
+            except OSError:
+                raise WorkerExited('worker exited') from None
+            deadline = time.monotonic() + self.response_timeout
+            while True:
+                try:
+                    message = self.responses.get(timeout=max(0, deadline - time.monotonic()))
+                except queue.Empty:
+                    raise WorkerTimeout('no response within %s seconds' % self.response_timeout) from None
+                if message is None:
+                    raise WorkerExited('worker exited')
+                if message.get('event') == 'fatal':
+                    raise RuntimeError(str(message.get('error')))
+                if message.get('id') != rid:
+                    continue  # ready や、タイムアウト後に遅れて届いた古い応答は捨てる
+                if 'error' in message:
+                    raise RuntimeError(message['error'])
+                return message.get('text', '')
+        finally:
+            self.lock.release()
+
+    def close(self):
+        if self.proc is None:
+            return
+        self.proc.terminate()
+        try:
+            self.proc.wait(3)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+        self._release()
 
 class Recognizer:
     def __init__(self, model, device, compute_type):
@@ -86,6 +204,9 @@ class Handler(socketserver.StreamRequestHandler):
                     if language not in ('ja', 'ja-JP'):
                         raise ValueError('this service is configured for Japanese')
                     language, requested = 'ja', True
+                    prepare = getattr(self.server.recognizer, 'prepare', None)
+                    if prepare:
+                        prepare()
                 elif kind == 'audio-start' and requested and not started:
                     if any(data.get(k) != v for k, v in FORMAT.items()):
                         raise ValueError('expected 16 kHz 16-bit mono audio')
