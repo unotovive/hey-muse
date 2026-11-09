@@ -149,6 +149,12 @@ Get-Content $env:LOCALAPPDATA\hey-muse\logs\asr.log -Tail 5
 
 Windows を再起動し、ログオンして 2 分待ってから、手順 3 を繰り返します。さらに、`wsl --shutdown` を実行したあとも同じ結果になることを確認します。
 
+手順 8（母艦で答える）まで入れた場合は、次の確認スクリプトで、タスク・待ち受け・受信規則・Ollama・モデル・VOICEVOX をまとめて確かめられます。何も変更しません。すべての行が `[OK ]` なら準備できています。
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File tools\mothership\windows\check-mothership.ps1
+```
+
 ### 5. メモリの振る舞い
 
 - 待機中は、受付のプロセス（`pythonw`）だけが動き、GPU のメモリ（VRAM）は使いません。
