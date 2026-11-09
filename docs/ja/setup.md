@@ -118,7 +118,9 @@ powershell.exe -ExecutionPolicy Bypass -File tools\mothership\windows\setup-moth
 
 ### 2. インストール（通常権限）
 
-管理者でない PowerShell で実行します。`-Allow` には、端末の IP アドレスを指定します（複数ならコンマ区切り、または `-Allow` を繰り返します）。
+WSL で母艦を動かしていた場合は、先に付録 B の手順 1 を行ってください（同じ 50024 番を使うため）。
+
+管理者でない PowerShell で実行します。`-Allow` には、端末の IP アドレスを指定します（複数台ならコンマ区切りで、例 `-Allow 192.0.2.10,192.0.2.11`）。
 
 ```powershell
 cd \\wsl.localhost\Ubuntu\home\<ユーザー名>\projects\musekusa\hey-muse
@@ -434,7 +436,7 @@ Linux や WSL2 を母艦にするときの手順です。詳しくは [tools/mot
 
 ## 付録 B WSL の母艦からの移行
 
-WSL の母艦（`muse-asr` と `hey-muse WSL`）から、第 3 部の Windows ネイティブ版へ移すときの手順です。先に第 3 部を済ませ、動くことを確認してから行います。
+WSL の母艦（`muse-asr` と `hey-muse WSL`）から、第 3 部の Windows ネイティブ版へ移すときの手順です。mirrored の WSL で `muse-asr` が動いていると、WSL が Windows と同じ 50024 番を使うため、先に WSL 側を止めます。
 
 1. WSL の中で、旧サービスを止めます。
 
@@ -442,8 +444,10 @@ WSL の母艦（`muse-asr` と `hey-muse WSL`）から、第 3 部の Windows �
    sudo systemctl disable --now muse-asr
    ```
 
-2. 任意です。`%USERPROFILE%\.wslconfig` の `networkingMode=mirrored` を消し、PowerShell で `wsl --shutdown` を実行します。
-3. タスク `hey-muse WSL` が残っていれば消します（インストーラが消せなかったときだけ必要です）。管理者の PowerShell で実行します。
+2. 第 3 部の手順 1・2 を行います。
+3. 第 3 部の手順 3・4 で、動作を確認します。
+4. 任意です。`%USERPROFILE%\.wslconfig` の `networkingMode=mirrored` を消し、PowerShell で `wsl --shutdown` を実行します。
+5. タスク `hey-muse WSL` が残っていれば消します（インストーラが消せなかったときだけ必要です）。管理者の PowerShell で実行します。
 
    ```powershell
    Unregister-ScheduledTask -TaskName 'hey-muse WSL' -Confirm:$false

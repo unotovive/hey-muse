@@ -57,7 +57,8 @@ $argList = @(
     '--idle-unload-minutes', $IdleMinutes,
     '--log-file', "`"$logFile`""
 )
-foreach ($ip in $Allow) { $argList += @('--allow', $ip) }
+$allowList = @($Allow | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+foreach ($ip in $allowList) { $argList += @('--allow', $ip) }
 $action = New-ScheduledTaskAction -Execute $venvPythonw -Argument ($argList -join ' ') -WorkingDirectory $appDir
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
 $taskPrincipal = New-ScheduledTaskPrincipal -UserId $currentUser -LogonType Interactive -RunLevel Limited
@@ -100,7 +101,7 @@ if (-not $up) {
 Write-Host ''
 Write-Host "完了。タスク: $taskName"
 Write-Host "ログ: $logFile"
-Write-Host "--allow: $($Allow -join ', ')"
+Write-Host "--allow: $($allowList -join ', ')"
 Write-Host "アイドル解放: $IdleMinutes 分"
 if ($adminTodo.Count -gt 0) {
     Write-Host ''
