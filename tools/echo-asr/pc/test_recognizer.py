@@ -172,5 +172,27 @@ class ModelSettingsTest(unittest.TestCase):
         with unittest.mock.patch.object(app, 'cuda_devices', return_value=0):
             self.assertEqual(app.model_settings(ns)[1:], ('cpu', 'int8'))
 
+class CliTests(unittest.TestCase):
+    def test_new_flags_and_defaults(self):
+        ns = app.parse_args([])
+        self.assertEqual((ns.idle_unload_minutes, ns.log_file), (30, None))
+        ns = app.parse_args(['--idle-unload-minutes', '0', '--log-file', 'x.log'])
+        self.assertEqual((ns.idle_unload_minutes, ns.log_file), (0, 'x.log'))
+
+    def test_worker_command(self):
+        ns = app.parse_args(['--device', 'cuda', '--idle-unload-minutes', '30', '--compute-type', 'float16'])
+        cmd = app.worker_command(ns)
+        self.assertEqual(cmd[0], sys.executable)
+        self.assertTrue(cmd[1].endswith('worker.py'))
+        self.assertEqual(cmd[2:], ['--model', 'large-v3-turbo', '--device', 'cuda', '--idle-seconds', '1800', '--compute-type', 'float16'])
+
+    def test_rotating_log_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, 'asr.log')
+            app.configure_logging(path)
+            h = [h for h in logging.getLogger().handlers if isinstance(h, logging.handlers.RotatingFileHandler)][-1]
+            self.assertEqual((h.baseFilename, h.maxBytes, h.backupCount), (path, 5_000_000, 3))
+            logging.getLogger().removeHandler(h); h.close()
+
 if __name__ == '__main__':
     unittest.main()

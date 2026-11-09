@@ -2,9 +2,12 @@
 import argparse
 import json
 import logging
+import logging.handlers
+import os
 import queue
 import socketserver
 import subprocess
+import sys
 import threading
 import time
 from array import array
@@ -166,34 +169,6 @@ class WorkerProxy:
                 self.proc.kill()
             self._release()
 
-class Recognizer:
-    def __init__(self, model, device, compute_type):
-        from faster_whisper import WhisperModel
-
-        self.lock = threading.Lock()
-        # A local directory is used offline; a model name is fetched from the hub on first use.
-        self.model = WhisperModel(str(model), device=device, compute_type=compute_type,
-                                 cpu_threads=6 if device == 'cpu' else 0,
-                                 local_files_only=Path(str(model)).is_dir())
-
-    def transcribe(self, pcm, language):
-        import numpy as np
-
-        samples = np.frombuffer(pcm, dtype='<i2').astype(np.float32)/32768
-        if len(samples) < 1600 or float(np.max(np.abs(samples))) < .001:
-            return ''
-        if not self.lock.acquire(timeout=3):
-            raise ValueError('recognizer busy')
-        try:
-            start = time.monotonic()
-            segments, _ = self.model.transcribe(samples, language=language, beam_size=5,
-                vad_filter=False, condition_on_previous_text=False, temperature=0)
-            text = ''.join(s.text for s in segments).strip()
-            LOG.info('transcribed audio_seconds=%.2f processing_seconds=%.2f', len(samples)/16000, time.monotonic()-start)
-            return text
-        finally:
-            self.lock.release()
-
 class Handler(socketserver.StreamRequestHandler):
     def handle(self):
         self.connection.settimeout(10)
@@ -262,6 +237,8 @@ def parse_args(argv=None):
     parser.add_argument('--model-dir', type=Path, default=None, help='local model directory (overrides --model)')
     parser.add_argument('--device', choices=('auto', 'cuda', 'cpu'), default='auto')
     parser.add_argument('--compute-type', default=None, help='default: float16 on cuda, int8 on cpu')
+    parser.add_argument('--idle-unload-minutes', type=int, default=30, help='認識プロセスを下ろすまでの無音分数（0 で下ろさない）')
+    parser.add_argument('--log-file', default=None, help='ログファイル（指定時はローテーションして書く）')
     return parser.parse_args(argv)
 
 def cuda_devices():
@@ -279,15 +256,40 @@ def model_settings(ns):
     compute_type = ns.compute_type or ('float16' if device == 'cuda' else 'int8')
     return model, device, compute_type
 
+def worker_command(ns):
+    cmd = [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'worker.py'),
+           '--model', ns.model, '--device', ns.device, '--idle-seconds', str(ns.idle_unload_minutes * 60)]
+    if ns.model_dir:
+        cmd += ['--model-dir', str(ns.model_dir)]
+    if ns.compute_type:
+        cmd += ['--compute-type', ns.compute_type]
+    return cmd
+
+def configure_logging(log_file):
+    fmt = '%(asctime)s %(levelname)s %(message)s'
+    if log_file is None:
+        logging.basicConfig(level=logging.INFO, format=fmt)
+        return
+    # pythonw.exe には stderr が無いので、ファイルだけに出す
+    handler = logging.handlers.RotatingFileHandler(log_file, maxBytes=5_000_000, backupCount=3, encoding='utf-8')
+    handler.setFormatter(logging.Formatter(fmt))
+    root = logging.getLogger()
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+
 def main():
     args = parse_args()
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
-    model, device, compute_type = model_settings(args)
-    LOG.info('loading model=%s device=%s compute_type=%s', model, device, compute_type)
-    recognizer = Recognizer(model, device, compute_type)
-    with Server((args.bind, args.port), recognizer, args.allow) as server:
-        LOG.info('ready bind=%s port=%s model=%s device=%s compute_type=%s', args.bind, args.port, model, device, compute_type)
-        server.serve_forever()
+    configure_logging(args.log_file)
+    proxy = WorkerProxy(worker_command(args), response_timeout=10.0)
+    try:
+        with Server((args.bind, args.port), proxy, args.allow) as server:
+            LOG.info('ready bind=%s port=%s idle_unload_minutes=%s worker=%s',
+                     args.bind, args.port, args.idle_unload_minutes, worker_command(args)[1])
+            server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        proxy.close()
 
 if __name__ == '__main__':
     main()
