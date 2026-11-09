@@ -43,10 +43,9 @@ Copy-Item -Path (Join-Path $src 'recognizer.py') -Destination $appDir -Force
 Copy-Item -Path (Join-Path $src 'worker.py') -Destination $appDir -Force
 
 # --- 3) CUDA とモデルの読み込み確認 ---
-& $venvPython (Join-Path $appDir 'worker.py') --model $Model --device cuda --idle-seconds 0 --check 2>&1 | Tee-Object -Variable checkOut
+& $venvPython (Join-Path $appDir 'worker.py') --model $Model --device cuda --idle-seconds 0 --check
 if ($LASTEXITCODE -ne 0) {
-    $checkOut | ForEach-Object { Write-Host $_ }
-    throw 'CUDA が使えないか DLL が読めません。NVIDIA ドライバと、上の出力のエラーを確認してください。'
+    throw "--check が失敗しました（終了コード $LASTEXITCODE）。上の出力を確認してください。CUDA が使えないか、cublas/cudnn の DLL が読めない可能性があります。"
 }
 
 # --- 4) ログオン時に起動するタスク ---
