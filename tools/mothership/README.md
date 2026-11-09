@@ -21,7 +21,7 @@ python -I tools/mothership/speech_bridge.py --bind PC_LAN_IP --allowed-network E
 | ファイル | 役割 |
 | --- | --- |
 | `windows/setup-mothership.ps1` | 管理者の PowerShell で実行する。`.wslconfig` の `[wsl2]` 節へ `networkingMode=mirrored` を入れ（節は二重にしない）、TCP 50024 の受信許可と AC スタンバイ無効化、ログオン時に WSL を起こすタスク `hey-muse WSL` を登録する（実行時間無制限、バッテリーでも開始・継続。`Register-ScheduledTask` を使う）。何度実行しても安全 |
-| `windows/install-asr.ps1` | Windows ネイティブ母艦用。通常権限（非昇格）で実行し、`-Allow 端末のIP` が必須。`%LOCALAPPDATA%\hey-muse` に venv とアプリを入れ、CUDA とモデルの読み込みを確認し、ログオン時起動のタスク `hey-muse ASR`（落ちても 5 分ごとの繰り返しで最長 5 分以内に起動し直す）を登録して起動する。管理者が要る残り作業（旧 `hey-muse WSL` タスクの削除、受信規則）は実行すべきコマンドとして最後に表示する |
+| `windows/install-asr.ps1` | Windows ネイティブ母艦用。通常権限（非昇格）で実行し、`-Allow 端末のIP` が必須。`%LOCALAPPDATA%\hey-muse` に venv とアプリを入れ、CUDA とモデルの読み込みを確認し、ログオン時起動のタスク `hey-muse ASR`（ログオン時のトリガーに加え、インストール直後から 5 分ごとに見張るトリガーを持ち、落ちても最長 5 分以内に起動し直す）を登録して起動する。管理者が要る残り作業（旧 `hey-muse WSL` タスクの削除、受信規則）は実行すべきコマンドとして最後に表示する |
 | `windows/setup-mothership.ps1 -WindowsNative` | 管理者の PowerShell で実行する。WSL 関連は行わず、TCP 50024 の受信許可と AC スタンバイ無効化だけを行う |
 | `install.sh` | `systemd/*.service` の `@USER@`・`@HOME@`・`@REPO@`（この clone の場所）を実ユーザーに置き換えて `/etc/systemd/system/` へ入れ、`muse-asr` を有効化する。`~/.config/hey-muse/asr.env` が無ければ雛形を作る。何度実行しても安全。`--with-bridge` で `muse-bridge` も入れる |
 | `systemd/muse-asr.service` | `recognizer.py --bind 0.0.0.0 --device auto $ASR_ARGS`。`asr.env` の `ASR_ARGS="--allow 端末のIP"` と `LD_LIBRARY_PATH` を読む |
