@@ -87,8 +87,11 @@ def deploy(args):
             import hall_light as light
             cfg = json.loads((bridge / "home-local.json").read_text(encoding="utf-8-sig"))
             cfg.pop("codex", None)
-            cfg["power_controls"] = {k: dict(label=v[0], icon=v[1], toggle=v[2], on=v[3], off=v[4])
-                                     for k, v in live.POWER_NAMES.items()}
+            # 旧版の echo_home.py は電源ボタンを POWER_NAMES に持つ。現行版は home-local.json の power_controls をそのまま使う。
+            names = getattr(live, "POWER_NAMES", None)
+            if names is not None:
+                cfg["power_controls"] = {k: dict(label=v[0], icon=v[1], toggle=v[2], on=v[3], off=v[4])
+                                         for k, v in names.items()}
             if cfg.get("backend", "switchbot") in ("", "switchbot"):
                 cfg["voice_devices"] = {k: dict(name=v[0], type=v[1]) for k, v in light.VOICE_DEVICES.items()}
                 cfg["voice_scenes"] = {k: {op: name} for (k, op), name in light.VOICE_SCENES.items()}
