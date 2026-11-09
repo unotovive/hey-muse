@@ -14,6 +14,18 @@ python -I tools/mothership/speech_bridge.py --bind PC_LAN_IP --allowed-network E
 
 プレースホルダーは自分のアドレスに置き換えます。省略時はループバックのみです。既定ポートは50022、音声APIは `/v1/audio/speech`、稼働確認は `/health` です。Windowsで必要な場合は `--keep-awake` を指定できます。通常のテストでは自動起動登録や電源設定の変更はしません。
 
+## Windows ネイティブ母艦の受付（50024）
+
+`tools/echo-asr/pc/recognizer.py` は、50024 番の 1 つの口で次の 3 つを受けます（最初の 1 バイトで振り分け）。端末の direct パイプライン（Muse の契約前の暫定）と、Muse の読み上げ先の両方に使えます。手順は [docs/ja/setup.md](../../docs/ja/setup.md) 第 3 部の手順 8 です。
+
+| 要求 | 中身 | 待機中 |
+| --- | --- | --- |
+| Wyoming `transcribe` | `worker.py`（faster-whisper、GPU）で認識 | 30 分で終了 |
+| Wyoming `synthesize`、HTTP `POST /v1/audio/speech`（pcm） | `speaker.py`: VOICEVOX エンジンを必要なときだけ起動。無ければ Windows の SAPI | 30 分で終了。受付と一緒に終わる |
+| HTTP `POST /v1/chat/completions`、`GET /v1/models` | `llm_door.py`: 127.0.0.1:11434 の Ollama へ中継（それ以外の Ollama API は通さない） | モデルは Ollama が 30 分で下ろす |
+
+許可するのは `--allow` に入れた端末の IP と 127.0.0.1 だけです。主な引数: `--tts auto|off|run.exe のパス`、`--tts-speaker`（VOICEVOX の話者 ID、既定 30）、`--llm-upstream`（空で中継しない）、`--llm-model`（要求にモデル名が無いときの既定）。
+
 ## WSL・systemd・自動起動
 
 母艦が WSL2（`Ubuntu`）の Windows PC のとき、Whisper 認識器 `muse-asr` を systemd で常駐させ、Windows 再起動後も戻します。詳しい手順と確認の期待値は [docs/ja/setup.md](../../docs/ja/setup.md) の第 3 部にあります。ここでは要点だけ書きます。

@@ -182,6 +182,52 @@ Windows を再起動し、ログオンして 2 分待ってから、手順 3 を
   出てきた規則は、管理者の PowerShell で、上のコマンドの末尾に `| Remove-NetFirewallRule` を付けて実行して消します。
 - 旧構成のタスク `hey-muse WSL` が残っていないか確認します（付録 B）。
 
+### 8. 母艦で答える（Muse の契約前の暫定、任意）
+
+Muse を契約するまでのあいだも「Hey Muse」に日本語で答えられるよう、母艦の PC で答えを作ります。端末の答え手を「Speech and a chat model, directly」（direct パイプライン）にし、音声認識・読み上げ・答え手（LLM）の 3 つを、すべて母艦の 50024 番で受けます。受信規則は第 3 部の手順 1 の `muse-asr` だけで足ります。
+
+| 役割 | 母艦の中身 | 待機中のメモリ |
+|---|---|---|
+| 音声認識 | これまでどおり `worker.py`（faster-whisper） | 使わない（30 分で終了） |
+| 読み上げ | VOICEVOX エンジン（`speaker.py` が必要なときだけ起動。既定の声は「No.7 アナウンス」） | 使わない（30 分で終了。受付が止まれば一緒に終わる） |
+| 答え手 | Ollama の `qwen3:4b-instruct-2507-q4_K_M`（`llm_door.py` が 127.0.0.1 の Ollama へ中継） | Ollama 本体のみ（モデルは 30 分で GPU から下りる） |
+
+1. 通常の PowerShell で、Ollama と VOICEVOX（CPU 版）を入れ、Ollama の設定を入れます。
+
+   ```powershell
+   [Environment]::SetEnvironmentVariable('OLLAMA_KEEP_ALIVE', '30m', 'User')
+   [Environment]::SetEnvironmentVariable('OLLAMA_CONTEXT_LENGTH', '8192', 'User')
+   winget install --id Ollama.Ollama --scope user --silent --accept-package-agreements --accept-source-agreements
+   winget install --id HiroshibaKazuyuki.VOICEVOX.CPU --scope user --silent --accept-package-agreements --accept-source-agreements
+   ```
+
+   Ollama はログオン時にスタートアップから自動で起動します（`127.0.0.1:11434` だけで待ち受けます）。設定を変えたあとは、タスクトレイの Ollama を終了して起動し直します。
+2. モデルを取得します: `ollama pull qwen3:4b-instruct-2507-q4_K_M`（約 2.5 GB）。
+3. `install-asr.ps1` を再実行し、`speaker.py` と `llm_door.py` も `app` に入れます（手順 6）。ログの `ready` の行に `tts=['Voicevox', 'Sapi'] llm=127.0.0.1:11434 qwen3:4b-instruct-2507-q4_K_M` と出れば準備できています。VOICEVOX が見つからないときは Windows の音声（SAPI）で読みます。
+4. 端末のセットアップページ（Sound & Voice → Voice assistant）を次のようにして「Save」を押します。
+
+   | 項目 | 値 |
+   |---|---|
+   | Answered by | Speech and a chat model, directly |
+   | Speech to text (host:port) | `母艦のLAN_IP:50024` |
+   | Text to speech (host:port) | `母艦のLAN_IP:50024` |
+   | Language | `ja` |
+   | Chat model endpoint | `http://母艦のLAN_IP:50024/v1` |
+   | Model | `qwen3:4b-instruct-2507-q4_K_M` |
+   | Anything the assistant should know | 下の英文 |
+
+   ```
+   Always reply in natural spoken Japanese, briefly. Before answering about the weather, the calendar, timers, alarms or the volume, call the matching tool; never make up weather or events. Answer well-known facts, like the height of Mount Fuji or how something works, from what you know. Never ask whether there is anything else. In Japanese, AM is 午前 and PM is 午後.
+   ```
+
+   この欄は英語で書きます。端末の基本の指示が英語のため、日本語で長く書くと、モデルが道具（タイマーなど）を呼ばずに「セットしました」とだけ答えるようになりました（2026-11-10 の測定で、道具の呼び出しが 30 回中 0 回）。上の英文では 20 回中 20 回呼びました。
+5. 起動語は、上から下へスワイプ → Sound → Wake word で「Hey Muse」を選びます。予備として「Alexa」を 2 つめに残しておくと、Hey Muse が聞き取りにくい人でも使えます。
+6. 天気を出すには、端末の場所が要ります。セットアップページの天気の欄で、町名か郵便番号を入れます（Home Assistant を使わない構成では、端末が Open-Meteo から自分で取ります）。
+
+できること: タイマー、アラーム、音量、天気、予定（第 4 部の Google カレンダー。待機画面が数分ごとに読む内容から答えます）、ラジオ、一般的な知識。冷えた状態（30 分以上使っていない）からの最初の一言は 7〜9 秒、続けて話すと 2〜4 秒で答えます。母艦が止まっていると答えられません（Muse に切り替えれば、母艦なしでも会話できます）。
+
+Muse を契約したら、第 8 部で「Answered by」を Muse に切り替えます。音声認識の宛先はそのまま使えます。
+
 ## 第 4 部 Google カレンダー
 
 待機画面の予定を Google Calendar API（読み取り専用）から取得します。iCal 購読より反映が早く、更新に失敗したときは前回の予定を「更新待ち」として表示します。Google Cloud の設定とブラウザでの同意は、カレンダーの持ち主が自分で行います。
@@ -419,6 +465,7 @@ ls -l /data/misc/techo5/standalone-home/
 2. 「Voice assistant」の「Answered by」を「Muse, paired with the Muse app」にします。
 3. 「Muse SDK token」にトークンを貼り付けます。
 4. 「Speaking voice」を選びます。キー不要の内蔵音声は米国英語のみです。日本語の答えを聞くには、クラウド音声（「Speech key」が必要）を選びます。
+   - OpenAI の鍵が無いとき、または使いたくないときは、母艦の VOICEVOX で読めます（第 3 部の手順 8）。「Speech endpoint (advanced)」に `http://母艦のLAN_IP:50024/v1`、「Speech key」に任意の文字（例: `local`）、「Speaking voice」にクラウド音声のどれか（`alloy` など）を入れます。声の名前は無視され、VOICEVOX の「No.7 アナウンス」で読みます。母艦が止まっているときは内蔵音声（英語）に切り替わり、日本語は正しく読めません。
 5. 「Speech to text (host:port)」に、第 3 部の母艦の宛先 `母艦のLAN_IP:50024` を入れます。空のままだと母艦は使われず、毎回 Muse 側で認識します。
 6. 「Save」を押します。トークンが空だと保存を断られます。
 
