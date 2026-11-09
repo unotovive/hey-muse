@@ -62,9 +62,13 @@ bfe463ca の 1 つ前（a9e80bbb）を一時的な worktree に取り出し、�
 
 ```bash
 git worktree add ../hey-muse-nostream a9e80bbb
+cp -r bin ../hey-muse-nostream/bin        # git 管理外の ARM ヘルパー。無いと deploy-rootfs.sh が止まる
+ln -s "$PWD/inputs" ../hey-muse-nostream/inputs   # 同じく git 管理外（代わりに TECHO5_INPUTS=$PWD/inputs でも可）
 cd ../hey-muse-nostream
 HOST=<端末IP> tools/linux/deploy-rootfs.sh --version 0.0.0-nostream.1 --install --reboot
 ```
+
+`bin/` と `inputs/` は `.gitignore` 対象のため、新しい worktree には含まれません。元の checkout から持ち込んでから実行します。
 
 測り終えたら `v1.6.30-ja.2` を入れ直し（第 7 部の手順 0）、`git worktree remove ../hey-muse-nostream` で片付けます。`thinkingAfter` など他の設定は変えません。
 
