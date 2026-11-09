@@ -20,6 +20,8 @@ from pathlib import Path
 
 LOG = logging.getLogger('muse-speaker')
 MAX_TEXT = 2000  # 一度に読む文字数の上限（端末の答えは短いが、暴走した答えで止まらないように）
+RECENT = 24 * 3600  # この秒数以内に読み上げを頼まれていれば、会話の始まりにエンジンを温める
+FAILED_FOR = 300  # VOICEVOX の起動に失敗したら、この秒数は試さずに次（SAPI）へ回す
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
 
@@ -100,7 +102,7 @@ def default_engine(base=None):
 class Voicevox:
     """VOICEVOX エンジン（HTTP）。すでに誰かが同じポートで動かしていれば、それを使う（止めない）。"""
 
-    def __init__(self, engine, port=50021, speaker=30, speed=1.1, idle_seconds=1800, start_timeout=60.0,
+    def __init__(self, engine, port=50021, speaker=30, speed=1.1, idle_seconds=1800, start_timeout=30.0,
                  urlopen=urllib.request.urlopen, popen=subprocess.Popen, clock=time.monotonic, sleep=time.sleep):
         self.engine, self.port, self.speaker, self.speed = engine, port, speaker, speed
         self.idle_seconds, self.start_timeout = idle_seconds, start_timeout
@@ -108,6 +110,7 @@ class Voicevox:
         self._lock = threading.Lock()
         self._proc = None
         self._last_used = clock()
+        self._failed_until = None
         self._closed = threading.Event()
         if idle_seconds > 0:
             threading.Thread(target=self._reaper, name='voicevox-reaper', daemon=True).start()
@@ -128,7 +131,18 @@ class Voicevox:
         """エンジンが応答する状態にする。呼び出し側がロックを持つ。"""
         self._last_used = self._clock()
         if self._alive():
+            self._failed_until = None
             return
+        if self._failed_until is not None and self._clock() < self._failed_until:
+            raise SpeechFailed('VOICEVOX engine failed recently')
+        try:
+            self._start()
+            self._failed_until = None
+        except SpeechFailed:
+            self._failed_until = self._clock() + FAILED_FOR
+            raise
+
+    def _start(self):
         if self._proc is None or self._proc.poll() is not None:
             if self.engine is None:
                 raise SpeechFailed('VOICEVOX engine not installed')
@@ -252,14 +266,20 @@ class Sapi:
 class Speaker:
     """前から順に試し、最初に読めたものを返す。"""
 
-    def __init__(self, engines):
+    def __init__(self, engines, clock=time.monotonic):
         self.engines = list(engines)
+        self._clock = clock
+        self._asked_at = None
+
+    def recently_used(self):
+        return self._asked_at is not None and self._clock() - self._asked_at < RECENT
 
     def warm(self):
         if self.engines:
             self.engines[0].warm()
 
     def synthesize(self, text, voice=None):
+        self._asked_at = self._clock()
         text = ' '.join(str(text).split())[:MAX_TEXT]
         if not text:
             raise SpeechFailed('nothing to say')

@@ -79,15 +79,19 @@ func TestStandaloneDays(t *testing.T) {
 		{Title: "会議", Calendar: "仕事", Start: at(10, 1500), End: at(10, 1600)},
 		{Title: "旅行", Calendar: "家族", Start: at(10, 0), End: at(12, 0), Day: true},
 		{Title: "締め切り", Start: at(11, 900), End: at(11, 900)},
+		{Title: "夜勤", Start: at(11, 2300), End: at(12, 100)},
 	}
-	got := standaloneDays(evs, at(10, 0), 3, at(12, 0))
-	want := "Tuesday November 10: 3:00 PM 会議 (仕事), all day 旅行 (家族); " +
-		"Wednesday November 11: all day 旅行 (家族), 9:00 AM 締め切り; " +
-		"Thursday November 12: not known (only the coming week is read)"
+	// Read at 8:00 on the 10th, up to 8:00 on the 13th.
+	got := standaloneDays(evs, at(9, 0), 5, at(10, 800), at(13, 800))
+	want := "Monday November 9: not known (only from now to the coming week is read); " +
+		"Tuesday November 10 (from 8:00 AM on; what ended earlier is not known): 3:00 PM 会議 (仕事), all day 旅行 (家族); " +
+		"Wednesday November 11: all day 旅行 (家族), 9:00 AM 締め切り, 11:00 PM 夜勤; " +
+		"Thursday November 12: until 1:00 AM (from the day before) 夜勤; " +
+		"Friday November 13 (until 8:00 AM only): nothing"
 	if got != want {
 		t.Errorf("got  %q\nwant %q", got, want)
 	}
-	if got := standaloneDays(nil, at(10, 0), 1, at(18, 0)); got != "Tuesday November 10: nothing" {
+	if got := standaloneDays(nil, at(14, 0), 1, at(10, 800), at(18, 0)); got != "Saturday November 14: nothing" {
 		t.Errorf("an empty day: %q", got)
 	}
 }
@@ -115,7 +119,14 @@ func TestStopCancelsACountingTimerWhenNothingRings(t *testing.T) {
 	if n := len(timer.Get().List(time.Now())); n != 0 {
 		t.Errorf("%d timer(s) still counting down after stop: %q", n, got)
 	}
-	if !strings.Contains(got, "canceled 1 timer") {
+	if !strings.Contains(got, "canceled the one timer") {
 		t.Errorf("stop said %q", got)
+	}
+
+	// Two counting down: which one was meant is not known, so neither is canceled.
+	timer.Get().Start("卵", 5*time.Minute)
+	timer.Get().Start("パスタ", 40*time.Minute)
+	if got, _ := stop.Run(map[string]any{}); len(timer.Get().List(time.Now())) != 2 {
+		t.Errorf("stop canceled one of two timers: %q", got)
 	}
 }

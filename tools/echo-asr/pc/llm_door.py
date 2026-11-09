@@ -47,9 +47,16 @@ class Upstream:
         self.host, self.port, self.model, self.timeout = host, port, model, timeout
         self._connect, self._clock = connect, clock
         self._warmed_at = None
+        self._chatted_at = None
         self._warm_lock = threading.Lock()
 
+    def recently_used(self):
+        """24 時間以内に会話の中継をしたか（Muse で答えているときは、会話の始まりに LLM を温めない）。"""
+        return self._chatted_at is not None and self._clock() - self._chatted_at < 24 * 3600
+
     def forward(self, method, path, body):
+        if path == '/v1/chat/completions':
+            self._chatted_at = self._clock()
         if method == 'POST' and body:
             try:
                 req = json.loads(body)
@@ -100,20 +107,30 @@ class ChatDoor(http.server.BaseHTTPRequestHandler):
         door.handle()
 
     def _reply(self, status, ctype, body):
+        # 受付は 10 秒で接続を閉じるので、使い回しを許さない（閉じる瞬間に重なった要求は再送されない）
+        self.close_connection = True
         self.send_response(status)
         self.send_header('Content-Type', ctype)
         self.send_header('Content-Length', str(len(body)))
+        self.send_header('Connection', 'close')
         self.end_headers()
         self.wfile.write(body)
         self.wfile.flush()
 
     def _route(self, method):
         path = self.path.split('?', 1)[0]
+        if (method, path) == ('GET', '/health'):
+            # lib/mothership の起動待ち（mothership.json の Address がこの口のとき）
+            self._reply(200, 'application/json', b'{"ok":true}')
+            return
         speech = (method, path) == SPEECH and self.speaker is not None
         if not speech and ((method, path) not in ROUTES or self.upstream is None):
             self._reply(404, 'application/json', b'{"error":"not found"}')
             return
-        length = int(self.headers.get('Content-Length') or 0)
+        try:
+            length = int(self.headers.get('Content-Length') or 0)
+        except ValueError:
+            length = -1
         if length < 0 or length > MAX_BODY:
             self.close_connection = True
             self._reply(413, 'application/json', b'{"error":"too large"}')
@@ -125,7 +142,7 @@ class ChatDoor(http.server.BaseHTTPRequestHandler):
         started = time.monotonic()
         try:
             status, ctype, data = self.upstream.forward(method, path, body)
-        except OSError as exc:
+        except (OSError, http.client.HTTPException) as exc:
             LOG.warning('LLM upstream failed: %s', exc)
             self._reply(502, 'application/json', b'{"error":"assistant model is not running"}')
             return

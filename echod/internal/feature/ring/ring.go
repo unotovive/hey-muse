@@ -47,6 +47,9 @@ var state struct {
 	// Both are the safe direction for what they are.
 	offer time.Time
 
+	// quiet is when the last ring stopped sounding.
+	quiet time.Time
+
 	// silences and snoozes are what can actually end a ring. They live here as functions because
 	// this package must not import the ring engines - alarm and timer both import this one - and
 	// because there are two of them: a caller should not have to know that, which is how Home
@@ -77,10 +80,19 @@ func Sounding() (done func()) {
 				// Nothing is ringing, so a hush or an offer left over from the last one must not
 				// apply to the next.
 				state.until, state.offer = time.Time{}, time.Time{}
+				state.quiet = state.now()
 			}
 			state.mu.Unlock()
 		})
 	}
+}
+
+// RangWithin reports whether a ring is sounding or stopped sounding less than d ago: "stop" said
+// to a ring that the wake word silenced and that then ended by itself is still about that ring.
+func RangWithin(d time.Duration) bool {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return state.sounding > 0 || (!state.quiet.IsZero() && state.now().Sub(state.quiet) < d)
 }
 
 // IsSounding reports whether any ring is sounding.

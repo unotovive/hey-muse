@@ -110,9 +110,11 @@ class WorkerProxy:
         self._ensure()
 
     def wait_ready(self, timeout):
-        """今のワーカーの読み込み完了を最長 timeout 秒待つ。"""
+        """今のワーカーの読み込み完了を最長 timeout 秒待つ。終了したワーカーは準備できていないとみなす。"""
         spawn = self.spawn
-        return spawn is not None and spawn.ready.wait(timeout)
+        if spawn is None or spawn.proc.poll() is not None:
+            return False
+        return spawn.ready.wait(timeout)
 
     def _ensure(self):
         """今の _Spawn を返す。差し替えは _spawn_lock で守る（self.lock は長く持たれるので流用しない）。"""
@@ -305,7 +307,9 @@ class Handler(socketserver.StreamRequestHandler):
         音声認識の読み込みと同時に始めると、GPU とディスクを取り合って認識が 10 秒の上限を超えることが
         あるので、認識の準備ができてから（または待ちきれなくなってから）始める。
         """
-        parts = [p for p in (getattr(self.server, 'speaker', None), getattr(self.server, 'upstream', None)) if p is not None]
+        # 最近使われた部品だけ（Muse で答えて読み上げが OpenAI のときに、VOICEVOX や LLM を起こさない）
+        parts = [p for p in (getattr(self.server, 'speaker', None), getattr(self.server, 'upstream', None))
+                 if p is not None and getattr(p, 'recently_used', lambda: True)()]
         if not parts:
             return
         wait_ready = getattr(self.server.recognizer, 'wait_ready', None)
@@ -338,10 +342,10 @@ class Handler(socketserver.StreamRequestHandler):
                     if language not in ('ja', 'ja-JP'):
                         raise ValueError('this service is configured for Japanese')
                     language, requested = 'ja', True
-                    self.warm()
                     prepare = getattr(self.server.recognizer, 'prepare', None)
                     if prepare:
                         prepare()
+                    self.warm()  # prepare の後: 起こしたばかりの認識プロセスの準備を待てるように
                 elif kind == 'audio-start' and requested and not started:
                     if any(data.get(k) != v for k, v in FORMAT.items()):
                         raise ValueError('expected 16 kHz 16-bit mono audio')

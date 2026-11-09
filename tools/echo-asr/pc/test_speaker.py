@@ -144,7 +144,47 @@ class VoicevoxTests(unittest.TestCase):
         self.assertTrue(procs[0].terminated)
 
 
+class FailureMemoryTests(unittest.TestCase):
+    def test_failed_start_is_not_retried_for_a_while(self):
+        engine = FakeEngine()
+        now = [0.0]
+        procs = []
+
+        def popen(cmd, **_):
+            p = FakeProc(engine)
+            engine.up = False  # 起動したが応答しない
+            procs.append(p)
+            return p
+
+        def sleep(s):
+            now[0] += s
+        v = speaker.Voicevox(pathlib.Path('run.exe'), urlopen=engine.urlopen, popen=popen, sleep=sleep,
+                             clock=lambda: now[0], start_timeout=5, idle_seconds=0)
+        with self.assertRaises(speaker.SpeechFailed):
+            v.synthesize('はい')
+        with self.assertRaises(speaker.SpeechFailed):
+            v.synthesize('もう一度')
+        self.assertEqual(len(procs), 1)  # 失敗を覚えている間は起動し直さない
+        now[0] += speaker.FAILED_FOR
+        with self.assertRaises(speaker.SpeechFailed):
+            v.synthesize('しばらく後')
+        self.assertEqual(len(procs), 2)
+
+
 class SpeakerTests(unittest.TestCase):
+    def test_recently_used(self):
+        now = [0.0]
+
+        class Works:
+            def synthesize(self, text, voice=None):
+                return b'', 24000
+        s = speaker.Speaker([Works()], clock=lambda: now[0])
+        self.assertFalse(s.recently_used())
+        s.synthesize('はい')
+        self.assertTrue(s.recently_used())
+        now[0] += speaker.RECENT
+        self.assertFalse(s.recently_used())
+
     def test_falls_back_in_order(self):
         class Broken:
             def synthesize(self, text, voice=None):

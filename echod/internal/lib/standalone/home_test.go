@@ -120,15 +120,16 @@ func TestCalendarAtomicRefreshAndRecurrence(t *testing.T) {
 
 func TestCachedEvents(t *testing.T) {
 	h := Home{dir: t.TempDir()}
-	if _, _, err := h.CachedEvents(); err == nil {
+	if _, _, _, err := h.CachedEvents(); err == nil {
 		t.Fatal("no cache yet should be an error")
 	}
 	until := time.Date(2026, 11, 18, 0, 0, 0, 0, time.UTC)
-	if err := h.save("agenda-cache.json", snapshot{Events: []Event{{Title: "会議"}}, Until: until}); err != nil {
+	read := until.AddDate(0, 0, -8)
+	if err := h.save("agenda-cache.json", snapshot{Events: []Event{{Title: "会議"}}, Updated: read, Until: until}); err != nil {
 		t.Fatal(err)
 	}
-	evs, got, err := h.CachedEvents()
-	if err != nil || len(evs) != 1 || evs[0].Title != "会議" || !got.Equal(until) {
-		t.Fatalf("got %v %v %v", evs, got, err)
+	evs, gotRead, got, err := h.CachedEvents()
+	if err != nil || len(evs) != 1 || evs[0].Title != "会議" || !got.Equal(until) || !gotRead.Equal(read) {
+		t.Fatalf("got %v %v %v %v", evs, gotRead, got, err)
 	}
 }

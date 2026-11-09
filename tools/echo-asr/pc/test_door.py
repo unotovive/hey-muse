@@ -109,6 +109,7 @@ class DoorTests(unittest.TestCase):
         self.assertEqual(app.read_event(f)[0], 'error')
 
     def test_transcribe_warms_speech_and_model(self):
+        self.upstream._chatted_at = self.upstream._clock()  # 最近、会話の中継に使われた
         f = self.wyoming()
         app.send_event(f, 'transcribe', {'language': 'ja'})
         app.send_event(f, 'audio-start', app.FORMAT)
@@ -128,12 +129,27 @@ class DoorTests(unittest.TestCase):
         self.addCleanup(conn.close)
         return conn
 
-    def test_warm_up_waits_for_recognizer(self):
-        gate = threading.Event()
+    def test_warm_up_skips_parts_not_used_lately(self):
+        self.speaker.recently_used = lambda: False
+        f = self.wyoming()
+        app.send_event(f, 'transcribe', {'language': 'ja'})
+        app.send_event(f, 'audio-start', app.FORMAT)
+        app.send_event(f, 'audio-chunk', app.FORMAT, b'\x00\x10' * 1600)
+        app.send_event(f, 'audio-stop', {})
+        self.assertEqual(app.read_event(f)[0], 'transcript')
+        threading.Event().wait(0.3)
+        self.assertEqual((self.speaker.warmed, FakeOllama.seen), (0, []))  # どちらも最近使っていない
 
+    def test_warm_up_waits_for_recognizer(self):
         class Slow(FakeRecognizer):
+            gate = None
+
+            def prepare(self):
+                # 本物と同じく、prepare で新しい認識プロセスが起きる。warm が prepare より前だと待てない
+                self.gate = threading.Event()
+
             def wait_ready(self, timeout):
-                return gate.wait(timeout)
+                return self.gate is not None and self.gate.wait(timeout)
         self.server.recognizer = Slow()
         f = self.wyoming()
         app.send_event(f, 'transcribe', {'language': 'ja'})
@@ -143,7 +159,7 @@ class DoorTests(unittest.TestCase):
         self.assertEqual(app.read_event(f)[0], 'transcript')
         threading.Event().wait(0.2)
         self.assertEqual(self.speaker.warmed, 0)  # 認識の準備ができるまでは起こさない
-        gate.set()
+        self.server.recognizer.gate.set()
         for _ in range(50):
             if self.speaker.warmed:
                 break
@@ -214,6 +230,19 @@ class DoorTests(unittest.TestCase):
         pcm = llm_door.to_rate(b'\x00\x10' * 22050, 22050)
         self.assertEqual(len(pcm), 2 * 24000)
         self.assertEqual(llm_door.to_rate(b'\x01\x00' * 10, 24000), b'\x01\x00' * 10)
+
+    def test_health_and_no_connection_reuse(self):
+        conn = self.http()
+        conn.request('GET', '/health')
+        resp = conn.getresponse()
+        resp.read()
+        self.assertEqual((resp.status, resp.getheader('Connection')), (200, 'close'))
+
+    def test_bad_content_length_is_refused(self):
+        sock = socket.create_connection(self.server.server_address, timeout=3)
+        self.addCleanup(sock.close)
+        sock.sendall(b'POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\n\r\n')
+        self.assertIn(b' 413 ', sock.recv(200))
 
     def test_http_is_refused_without_upstream(self):
         self.server.upstream = None

@@ -21,18 +21,26 @@ import (
 	"github.com/HuskerMinion/techo5/echod/internal/lib/standalone"
 )
 
+// stopAfterRing is how long after a ring ends "stop" is still taken to be about it.
+const stopAfterRing = 2 * time.Minute
+
 // standaloneDays says the device's own calendar events (lib/standalone) for n days from first, the way
-// the calendar tool says the others: a day past what was read (until) is said to be unknown rather than
-// free.
-func standaloneDays(evs []standalone.Event, first time.Time, n int, until time.Time) string {
+// the calendar tool says the others. What was read runs from read to until: a day outside it is said
+// to be unknown rather than free, and a day it covers only in part says so.
+func standaloneDays(evs []standalone.Event, first time.Time, n int, read, until time.Time) string {
 	var s []string
 	for i := range n {
 		day := first.AddDate(0, 0, i)
 		next := day.AddDate(0, 0, 1)
 		name := day.Format("Monday January 2")
-		if !day.Before(until) {
-			s = append(s, name+": not known (only the coming week is read)")
+		if !day.Before(until) || !next.After(read) {
+			s = append(s, name+": not known (only from now to the coming week is read)")
 			continue
+		}
+		if day.Before(read) {
+			name += " (from " + read.In(time.Local).Format("3:04 PM") + " on; what ended earlier is not known)"
+		} else if next.After(until) {
+			name += " (until " + until.In(time.Local).Format("3:04 PM") + " only)"
 		}
 		var items []string
 		for _, e := range evs {
@@ -46,6 +54,9 @@ func standaloneDays(evs []standalone.Event, first time.Time, n int, until time.T
 			when := "all day"
 			if !e.Day {
 				when = e.Start.In(time.Local).Format("3:04 PM")
+				if e.Start.Before(day) {
+					when = "until " + end.In(time.Local).Format("3:04 PM") + " (from the day before)"
+				}
 			}
 			item := when + " " + e.Title
 			if e.Calendar != "" {
@@ -275,23 +286,20 @@ func deviceTools() []tool {
 		{llm.Tool{Name: "stop", Description: "Stop whatever is ringing or playing on this device right now: a ringing alarm or timer, the radio or music. It does not delete alarms or cancel timers: a timer still counting down is cancelled with cancel_timers, even when asked to stop it.",
 			Parameters: object(map[string]any{})},
 			func(map[string]any) (string, error) {
+				recent := ring.RangWithin(stopAfterRing)
 				rang := ring.End()
-				playing, _ := media.Get().Playing()
+				playing, paused := media.Get().Playing()
 				media.Get().Stop()
 				if rang {
 					return "stopped the ringing and anything playing", nil
 				}
-				// Asked to stop with nothing ringing or playing, a timer still counting down is what was
-				// meant: "stop the timer" came here, and was reported done while the timer ran on.
-				if !playing {
-					n := 0
-					for _, t := range timer.Get().List(time.Now()) {
-						if timer.Get().Cancel(t.ID) {
-							n++
-						}
-					}
-					if n > 0 {
-						return fmt.Sprintf("canceled %d timer(s) that were counting down (nothing was ringing or playing)", n), nil
+				// "Stop the timer" for the one timer counting down came here, and was reported done while
+				// the timer ran on. Only with nothing that "stop" could have meant instead: no ring just
+				// now (the wake word silences one, and it may end by itself before the answer), nothing
+				// playing or paused, and one timer, so a second one is never taken for it.
+				if list := timer.Get().List(time.Now()); !recent && !playing && !paused && len(list) == 1 {
+					if timer.Get().Cancel(list[0].ID) {
+						return "canceled the one timer that was counting down (nothing was ringing or playing)", nil
 					}
 				}
 				return "stopped anything playing", nil
@@ -362,11 +370,11 @@ func deviceTools() []tool {
 				if len(home.Get().CalendarSources()) == 0 {
 					// The device's own calendars (Google Calendar or iCal, read for the waiting screen).
 					if standalone.Device.Enabled() {
-						evs, until, err := standalone.Device.CachedEvents()
+						evs, read, until, err := standalone.Device.CachedEvents()
 						if err != nil {
 							return "", errors.New("the calendars have not been read yet")
 						}
-						return standaloneDays(evs, first, n, until), nil
+						return standaloneDays(evs, first, n, read, until), nil
 					}
 					return "", errors.New("this device shows no calendars")
 				}
