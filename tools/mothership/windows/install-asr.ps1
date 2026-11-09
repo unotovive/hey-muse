@@ -62,10 +62,11 @@ if ($LASTEXITCODE -ne 0) { throw 'pip の更新に失敗しました。' }
 & $venvPython -m pip install faster-whisper==1.2.1 nvidia-cublas-cu12 nvidia-cudnn-cu12
 if ($LASTEXITCODE -ne 0) { throw 'faster-whisper などのインストールに失敗しました。' }
 
-# --- 2) アプリのコピー（recognizer.py は worker.py を隣から読むので両方必要） ---
+# --- 2) アプリのコピー（recognizer.py は worker.py・speaker.py・llm_door.py を隣から読む） ---
 $src = Join-Path $PSScriptRoot '..\..\echo-asr\pc'
-Copy-Item -Path (Join-Path $src 'recognizer.py') -Destination $appDir -Force
-Copy-Item -Path (Join-Path $src 'worker.py') -Destination $appDir -Force
+foreach ($f in 'recognizer.py', 'worker.py', 'speaker.py', 'llm_door.py') {
+    Copy-Item -Path (Join-Path $src $f) -Destination $appDir -Force
+}
 
 # --- 3) CUDA とモデルの読み込み確認 ---
 & $venvPython (Join-Path $appDir 'worker.py') --model $Model --device cuda --idle-seconds 0 --check
