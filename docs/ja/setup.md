@@ -133,6 +133,8 @@ powershell.exe -ExecutionPolicy Bypass -File tools\mothership\windows\install-as
 
 期待する結果: 最後に、タスク名、ログの場所、`--allow`、アイドル解放の分数が出ます。「管理者 PowerShell で実行してください」の案内が出たときは、表示されたコマンドを管理者の PowerShell で実行します。
 
+初回は、タスクが待ち受けを始めたときに Windows Defender ファイアウォールの「アクセスを許可しますか」が出ることがあります。そのときは「許可」を選びます。誤って「キャンセル」を選ぶと、python / pythonw をブロックする規則ができ、規則 `muse-asr` の許可より優先されます。消し方は手順 7 にあります。
+
 ### 3. 確認
 
 ```powershell
@@ -141,7 +143,7 @@ Test-NetConnection 母艦のLAN_IP -Port 50024
 Get-Content $env:LOCALAPPDATA\hey-muse\logs\asr.log -Tail 5
 ```
 
-期待する結果: `State` が `Running`、`TcpTestSucceeded : True`、ログに `ready`（待ち受け開始）と `worker:` の行が出ます。
+期待する結果: `State` が `Running`、`TcpTestSucceeded : True`、ログに `ready`（待ち受け開始）の行が出ます。インストール直後は `ready` の行だけです。`worker:` の行（認識プロセスの出力）は、端末に話しかけたあとに出ます。
 
 ### 4. 再起動して確認する
 
@@ -162,9 +164,20 @@ Windows を再起動し、ログオンして 2 分待ってから、手順 3 を
 
 ### 7. うまくいかないとき
 
-- ログ `%LOCALAPPDATA%\hey-muse\logs\asr.log`（5 MB × 3 世代でローテーション）で、`ready` と `worker:` の行を探します。`fatal` の行があれば、CUDA か DLL の問題です。
-- モデルの読み込みを手で試すには、`%LOCALAPPDATA%\hey-muse\venv\Scripts\python.exe %LOCALAPPDATA%\hey-muse\app\worker.py --check --idle-seconds 0` を実行します。
+- ログ `%LOCALAPPDATA%\hey-muse\logs\asr.log`（5 MB × 3 世代でローテーション）で、`ready` と `worker:` の行を探します。`worker fatal:` の行があれば、その内容を見ます（多くは CUDA か DLL の問題です）。
+- モデルの読み込みを手で試すには、`%LOCALAPPDATA%\hey-muse\venv\Scripts\python.exe %LOCALAPPDATA%\hey-muse\app\worker.py --check --device cuda --idle-seconds 0` を実行します。
+- インストーラ自体が失敗したとき:
+  - 「20 秒待ちましたが … 待ち受けになりません」: 表示されたログの末尾に `startup failed` があれば、その下の例外を見ます（ポートが使用中など）。
+  - 「--check が失敗しました」: 上に出た `worker.py` の出力を見ます（CUDA か DLL、モデルの取得の失敗）。
+  - 「管理者権限で実行されています」: 管理者でない PowerShell で実行し直します。
 - `TcpTestSucceeded : False` のとき: ファイアウォールの規則 `muse-asr`（`Get-NetFirewallRule -Name muse-asr`）と、`-Allow` に端末の IP を指定したかを確認します。
+- 端末からだけつながらないとき: 手順 2 の「アクセスを許可しますか」をキャンセルしてできたブロック規則が残っていないか確認します。ブロック規則は許可の規則より優先されます。
+
+  ```powershell
+  Get-NetFirewallRule | Where-Object DisplayName -like '*python*' | Where-Object Action -eq Block
+  ```
+
+  出てきた規則は、管理者の PowerShell で、上のコマンドの末尾に `| Remove-NetFirewallRule` を付けて実行して消します。
 - 旧構成のタスク `hey-muse WSL` が残っていないか確認します（付録 B）。
 
 ## 第 4 部 Google カレンダー

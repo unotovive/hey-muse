@@ -219,11 +219,13 @@ CI の run は https://github.com/unotovive/hey-muse/actions/runs/42517139377 �
 3. 30 分以上、話しかけずに置き、同じコマンドを実行します。あわせて、残っているプロセスを確認します。
 
    ```powershell
-   Get-Process python,pythonw | Select-Object Name,WS
+   Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" | Select-Object ProcessId,ParentProcessId,CommandLine
    ```
+
+   受付も認識プロセスも `pythonw.exe` です。venv の `pythonw.exe` はランチャーなので、受付だけでも 2 つ見えます。プロセスの数ではなく、コマンドラインに `worker.py` を含むものがあるかで判定します。
 
 期待する結果:
 
-- 手順 2 の直後は、手順 1 より約 2 GB 増えます。
+- 手順 2 の直後は、手順 1 より約 2 GB 増え、コマンドラインに `worker.py` を含むプロセスがあります。
 - 30 分後は、手順 1 の値に戻ります。
-- 30 分後の `Get-Process` には、受付の `pythonw` だけが残り、認識のプロセス（`python`）はありません。
+- 30 分後は、コマンドラインに `worker.py` を含むプロセスがありません（`recognizer.py` を含むものだけが残ります）。

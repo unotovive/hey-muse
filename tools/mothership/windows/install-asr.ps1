@@ -5,7 +5,7 @@
 param(
     [Parameter(Mandatory)][string[]]$Allow,
     [int]$Port = 50024,
-    [int]$IdleMinutes = 30,
+    [ValidateRange(0, 10080)][int]$IdleMinutes = 30,
     [string]$Model = 'large-v3-turbo'
 )
 $ErrorActionPreference = 'Stop'
@@ -29,6 +29,13 @@ $venvPython = Join-Path $app 'venv\Scripts\python.exe'
 $venvPythonw = Join-Path $app 'venv\Scripts\pythonw.exe'
 $logFile = Join-Path $logDir 'asr.log'
 $adminTodo = @()
+
+# --- 0) 稼働中のタスクを止める（venv の DLL を握られたままだと pip が失敗するため。開始は手順 7） ---
+$existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+if ($existing -and $existing.State -eq 'Running') {
+    Stop-ScheduledTask -TaskName $taskName
+    Start-Sleep -Seconds 2
+}
 
 # --- 1) フォルダと venv ---
 New-Item -ItemType Directory -Force -Path $appDir, $logDir | Out-Null
@@ -84,11 +91,6 @@ if (-not (Get-NetFirewallRule -Name 'muse-asr' -ErrorAction SilentlyContinue)) {
 }
 
 # --- 7) 起動と待ち受けの確認 ---
-$existing = Get-ScheduledTask -TaskName $taskName
-if ($existing.State -eq 'Running') {
-    Stop-ScheduledTask -TaskName $taskName
-    Start-Sleep -Seconds 2
-}
 Start-ScheduledTask -TaskName $taskName
 $up = $false
 for ($i = 0; $i -lt 20; $i++) {
