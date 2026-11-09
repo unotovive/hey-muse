@@ -36,6 +36,8 @@ powershell.exe -ExecutionPolicy Bypass -File tools\mothership\windows\setup-moth
 powershell.exe -ExecutionPolicy Bypass -File tools\mothership\windows\install-asr.ps1 -Allow 192.0.2.10
 ```
 
+タスク `hey-muse ASR` を完全に止めるときは `Disable-ScheduledTask -TaskName 'hey-muse ASR'` のあとに `Stop-ScheduledTask`（Stop だけだと最長 5 分で起動し直す）。戻すときは `Enable-ScheduledTask` と `Start-ScheduledTask`。
+
 Linux/WSL 母艦の場合の実行の順序（IP やトークンは例のダミー値に置き換える）:
 
 ```text

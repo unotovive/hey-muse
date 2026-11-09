@@ -162,6 +162,8 @@ Windows を再起動し、ログオンして 2 分待ってから、手順 3 を
 
 `install-asr.ps1` を、引数を変えて再実行します（何度実行しても安全です）。`recognizer.py` や `worker.py` を更新したときも、同じく再実行して `app` へコピーし直します。
 
+完全に止めたいときは、`Disable-ScheduledTask -TaskName 'hey-muse ASR'` のあとに `Stop-ScheduledTask -TaskName 'hey-muse ASR'` を実行します。`Stop-ScheduledTask` だけでは、最長 5 分で起動し直します。戻すときは `Enable-ScheduledTask -TaskName 'hey-muse ASR'` と `Start-ScheduledTask -TaskName 'hey-muse ASR'` を実行します。
+
 ### 7. うまくいかないとき
 
 - ログ `%LOCALAPPDATA%\hey-muse\logs\asr.log`（5 MB × 3 世代でローテーション）で、`ready` と `worker:` の行を探します。`worker fatal:` の行があれば、その内容を見ます（多くは CUDA か DLL の問題です）。

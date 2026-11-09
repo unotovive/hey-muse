@@ -30,11 +30,25 @@ $venvPythonw = Join-Path $app 'venv\Scripts\pythonw.exe'
 $logFile = Join-Path $logDir 'asr.log'
 $adminTodo = @()
 
-# --- 0) 稼働中のタスクを止める（venv の DLL を握られたままだと pip が失敗するため。開始は手順 7） ---
-$existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-if ($existing -and $existing.State -eq 'Running') {
+# --- 0) タスクを無効にして止める（venv の DLL を握られたままだと pip が失敗するため。開始は手順 7） ---
+# 無効にしないと、5 分ごとの繰り返しで pip の最中に起動し直しうる。手順 4 の Register-ScheduledTask -Force で有効に戻る。
+$disabledTask = $false
+if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+    Disable-ScheduledTask -TaskName $taskName | Out-Null
+    $disabledTask = $true
     Stop-ScheduledTask -TaskName $taskName
-    Start-Sleep -Seconds 2
+    # 受付と認識プロセス（app の .py を実行する python/pythonw）が消えるまで最長 10 秒待つ
+    for ($i = 0; $i -lt 10; $i++) {
+        $left = @(Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" |
+            Where-Object { $_.CommandLine -and $_.CommandLine.Contains($appDir) })
+        if ($left.Count -eq 0) { break }
+        Start-Sleep -Seconds 1
+    }
+}
+# 途中で失敗して止まったときは、無効のまま残さず有効に戻す（5 分以内に前の版で起動し直す）
+trap {
+    if ($disabledTask) { Enable-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue | Out-Null }
+    break
 }
 
 # --- 1) フォルダと venv ---
