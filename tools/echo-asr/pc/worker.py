@@ -19,7 +19,9 @@ LANGUAGES = ('ja', 'ja-JP')
 
 
 def add_cuda_dll_dirs():
-    """Windows で pip 版 CUDA ライブラリ（cublas/cudnn）の bin を DLL 検索パスに足す。足したパスを返す。"""
+    """Windows で pip 版 CUDA ライブラリ（cublas/cudnn）の bin を DLL 検索パスに足す。足したパスを返す。
+
+    cuDNN が内部で読み込む DLL は add_dll_directory を見ないことがあるため、PATH の先頭にも足す。"""
     if sys.platform != 'win32':
         return []
     import importlib.util
@@ -34,6 +36,8 @@ def add_cuda_dll_dirs():
             if os.path.isdir(path):
                 os.add_dll_directory(path)
                 added.append(path)
+    if added:
+        os.environ['PATH'] = os.pathsep.join(added + [os.environ.get('PATH', '')])
     return added
 
 
@@ -54,7 +58,6 @@ def parse_request(line):
 
 class Recognizer:
     def __init__(self, model, device, compute_type):
-        add_cuda_dll_dirs()  # faster_whisper の import より前に必要
         from faster_whisper import WhisperModel
 
         # ローカルディレクトリならオフライン、モデル名なら初回にハブから取得する
@@ -96,10 +99,17 @@ def read_requests(stdin, requests):
     requests.put(None)
 
 
-def serve(model, stdin, stdout, idle_seconds):
+def start_reader(stdin):
+    """要求の読み取りスレッドを始め、キューを返す。モデル読み込みの前に呼び、読み込み中も stdin を吸い出す
+    （読まないと受付側の書き込みがパイプで詰まり、打ち切りが効かなくなる）。"""
     requests = queue.Queue()
     # 読み取りスレッドは readline でブロックしたままでも戻れるよう daemon にする
     threading.Thread(target=read_requests, args=(stdin, requests), daemon=True).start()
+    return requests
+
+
+def serve(model, requests, stdout, idle_seconds):
+    """start_reader のキューから要求を取り出して答える。アイドルの計測はここ（読み込み後）から始まる。"""
     write_json(stdout, {'event': 'ready'})
     while True:
         try:
@@ -131,7 +141,9 @@ def parse_args(argv=None):
 def main():
     args = parse_args()
     logging.basicConfig(stream=sys.stderr, level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+    add_cuda_dll_dirs()  # --device auto の判定（ctranslate2 の import）と faster_whisper の import より前に必要
     stdout = sys.stdout.buffer
+    requests = None if args.check else start_reader(sys.stdin.buffer)
     try:
         model, device, compute_type = recognizer.model_settings(args)
         LOG.info('loading model=%s device=%s compute_type=%s', model, device, compute_type)
@@ -143,7 +155,7 @@ def main():
     if args.check:
         write_json(stdout, {'event': 'ready'})
         return
-    serve(loaded, sys.stdin.buffer, stdout, args.idle_seconds)
+    serve(loaded, requests, stdout, args.idle_seconds)
 
 
 if __name__ == '__main__':

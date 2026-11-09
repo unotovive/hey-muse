@@ -22,6 +22,7 @@ FAKE = [sys.executable, str(pathlib.Path(__file__).with_name('fake_worker.py'))]
 LOUD = (b'\x00\x10' * 1600)   # 4096 の振幅 × 1600 サンプル
 LOUD2 = b'\x00\x10' * 3200   # 6400 バイト（古い応答との取り違え検出用）
 SILENT = b'\x01\x00' * 1600   # 振幅 1
+BIG = b'\x00\x10' * 60000   # 120 KB（パイプの容量を超え、読まれない間は書き込みが詰まる）
 
 class ProtocolTests(unittest.TestCase):
     def setUp(self):
@@ -125,6 +126,44 @@ class ProxyTests(unittest.TestCase):
         # 遅れて届く旧 id の 'ja:3200' を捨て、2 回目の 'ja:6400' を返す
         self.assertEqual(self.proxy.transcribe(LOUD2, 'ja'), 'ja:6400')
         self.assertEqual(self.proxy.pid, pid)
+
+    def test_cold_write_respects_timeout(self):
+        # 読み込み中のワーカーは stdin を読まないので、大きな PCM の書き込みが詰まっても response_timeout で返る
+        self.proxy = app.WorkerProxy(FAKE + ['--delay-ready', '3', '--idle-seconds', '0'], response_timeout=1.0)
+        start = time.monotonic()
+        with self.assertRaises(app.WorkerTimeout):
+            self.proxy.transcribe(BIG, 'ja')
+        self.assertLess(time.monotonic() - start, 2)
+        pid = self.proxy.pid
+        self.assertIsNotNone(pid)  # 読み込み中のタイムアウトではワーカーを生かす
+        self.proxy.response_timeout = 10
+        # 書きかけの PCM が先に書き切られ、次の要求と混ざらない（旧 id の 'ja:120000' は捨てる）
+        self.assertEqual(self.proxy.transcribe(LOUD, 'ja'), 'ja:3200')
+        self.assertEqual(self.proxy.pid, pid)
+
+    def test_hung_worker_after_ready_is_replaced(self):
+        self.proxy = app.WorkerProxy(FAKE + ['--hang-on', '2', '--idle-seconds', '0'], response_timeout=1.0)
+        self.assertEqual(self.proxy.transcribe(LOUD, 'ja'), 'ja:3200'); pid = self.proxy.pid
+        with self.assertRaises(app.WorkerTimeout):
+            self.proxy.transcribe(LOUD, 'ja')
+        self.assertEqual(self.proxy.transcribe(LOUD, 'ja'), 'ja:3200')
+        self.assertNotEqual(self.proxy.pid, pid)
+
+    def test_stuck_load_is_restarted_after_load_timeout(self):
+        self.proxy = app.WorkerProxy(FAKE + ['--delay-ready', '30', '--idle-seconds', '0'], load_timeout=0.5)
+        self.proxy.prepare(); pid = self.proxy.pid
+        self.proxy.prepare()
+        self.assertEqual(self.proxy.pid, pid)  # 上限前は読み込みを待つ
+        time.sleep(0.8)
+        self.proxy.prepare()
+        self.assertNotEqual(self.proxy.pid, pid)
+
+    def test_fatal_is_logged(self):
+        self.proxy = app.WorkerProxy([sys.executable, '-c', 'print(\'{"event": "fatal", "error": "RuntimeError: no cuda"}\', flush=True)'])
+        with self.assertLogs(app.LOG, level='ERROR') as cm:
+            with self.assertRaisesRegex(RuntimeError, 'no cuda'):
+                self.proxy.transcribe(LOUD, 'ja')
+        self.assertTrue(any('worker fatal: RuntimeError: no cuda' in m for m in cm.output))
 
     def test_worker_death_then_respawn(self):
         self.proxy = app.WorkerProxy(FAKE + ['--die-on', '2', '--idle-seconds', '0'])

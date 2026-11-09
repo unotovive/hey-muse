@@ -5,6 +5,7 @@ import logging
 import logging.handlers
 import os
 import queue
+import socket
 import socketserver
 import subprocess
 import sys
@@ -62,13 +63,28 @@ class WorkerTimeout(Exception):
 class WorkerExited(Exception):
     """認識プロセスの stdout が EOF になった（終了コードは問わない）。"""
 
+LOAD_TIMEOUT = 60.0  # 起動からこの秒数が過ぎても ready が来なければ、次の要求で起動し直す
+
+class _Spawn:
+    """起動 1 回分の状態。ワーカーを差し替えても古い行や書き込みと取り違えないよう、起動ごとに別物を持つ。"""
+    def __init__(self, proc):
+        self.proc = proc
+        self.responses = queue.Queue()
+        self.ready = threading.Event()
+        self.started = time.monotonic()
+        self.writer = None  # 最後に始めた書き込みスレッド（打ち切られても書き続けている場合がある）
+
 class WorkerProxy:
     """認識プロセス（worker.py）を必要なときだけ起こし、stdin/stdout の JSON 行で文字起こしを頼む。"""
-    def __init__(self, command, response_timeout=10.0):
-        self.command, self.response_timeout = command, response_timeout
+    def __init__(self, command, response_timeout=10.0, load_timeout=LOAD_TIMEOUT):
+        self.command, self.response_timeout, self.load_timeout = command, response_timeout, load_timeout
         self.lock = threading.Lock()
         self._spawn_lock = threading.Lock()
-        self.proc, self.responses, self.next_id = None, None, 0
+        self.spawn, self.next_id = None, 0
+
+    @property
+    def proc(self):
+        return self.spawn.proc if self.spawn else None
 
     @property
     def pid(self):
@@ -79,20 +95,26 @@ class WorkerProxy:
         self._ensure()
 
     def _ensure(self):
-        """(proc, responses) を返す。差し替えは _spawn_lock で守る（self.lock は長く持たれるので流用しない）。"""
+        """今の _Spawn を返す。差し替えは _spawn_lock で守る（self.lock は長く持たれるので流用しない）。"""
         with self._spawn_lock:
-            if self.proc is None or self.proc.poll() is not None:
+            spawn = self.spawn
+            if spawn is not None and spawn.proc.poll() is None and not spawn.ready.is_set() \
+                    and time.monotonic() - spawn.started > self.load_timeout:
+                LOG.warning('worker not ready after %s seconds, restarting', self.load_timeout)
+                self._stop_locked()
+            if self.spawn is None or self.spawn.proc.poll() is not None:
                 self._release()
-                proc = subprocess.Popen(self.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                # 起動ごとに専用のキューを持ち、死んだワーカーの古い行を新しいワーカーのものと取り違えない
-                responses = queue.Queue()
-                threading.Thread(target=self._read_stdout, args=(proc.stdout, responses), daemon=True).start()
+                env = {**os.environ, 'PYTHONUTF8': '1'}  # ワーカーの stderr を UTF-8 に揃える（Windows の文字化け防止）
+                proc = subprocess.Popen(self.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE, env=env)
+                spawn = _Spawn(proc)
+                threading.Thread(target=self._read_stdout, args=(proc.stdout, spawn), daemon=True).start()
                 threading.Thread(target=self._relay_stderr, args=(proc.stderr,), daemon=True).start()
-                self.proc, self.responses = proc, responses
-            return self.proc, self.responses
+                self.spawn = spawn
+            return self.spawn
 
     @staticmethod
-    def _read_stdout(stream, responses):
+    def _read_stdout(stream, spawn):
         try:
             for line in stream:
                 try:
@@ -100,11 +122,16 @@ class WorkerProxy:
                 except ValueError:
                     LOG.warning('worker stdout is not JSON')
                     continue
-                if isinstance(message, dict):
-                    responses.put(message)
+                if not isinstance(message, dict):
+                    continue
+                if message.get('event') == 'ready':
+                    spawn.ready.set()
+                elif message.get('event') == 'fatal':
+                    LOG.error('worker fatal: %s', message.get('error'))
+                spawn.responses.put(message)
         finally:
             stream.close()
-            responses.put(None)  # EOF の目印
+            spawn.responses.put(None)  # EOF の目印
 
     @staticmethod
     def _relay_stderr(stream):
@@ -114,16 +141,52 @@ class WorkerProxy:
         finally:
             stream.close()
 
+    @staticmethod
+    def _write(spawn, data, previous, failed):
+        """stdin に 1 要求を書く。前の要求の書き込みが残っていれば、混ざらないよう書き終わりを待つ。"""
+        if previous is not None:
+            previous.join()
+        try:
+            spawn.proc.stdin.write(data)
+            spawn.proc.stdin.flush()
+        except (OSError, ValueError):  # ValueError: 後始末で閉じられた stdin
+            failed.set()
+
     def _release(self):
         """終了済みワーカーの後始末（パイプを閉じて回収する）。"""
-        if self.proc is not None:
-            if self.proc.stdin:
+        if self.spawn is not None:
+            proc = self.spawn.proc
+            proc.wait()  # 先に終わりを待つ（書き込みスレッドが詰まっていても EPIPE で抜けてから閉じる）
+            if self.spawn.writer is not None:
+                self.spawn.writer.join()
+            if proc.stdin:
                 try:
-                    self.proc.stdin.close()
+                    proc.stdin.close()
                 except OSError:
                     pass
-            self.proc.wait()
-        self.proc = None
+        self.spawn = None
+
+    def _stop_locked(self):
+        """_spawn_lock を持った状態で、今のワーカーを止めて回収する。"""
+        if self.spawn is None:
+            return
+        proc = self.spawn.proc
+        proc.terminate()
+        try:
+            proc.wait(3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        self._release()
+
+    def _discard_if_hung(self, spawn):
+        """ready 済みで応答が来ない＝固まったとみなし、止めて捨てる（次の要求で起動し直す）。
+        読み込み中（ready 前）のタイムアウトでは生かしておく（仕様 4.2）。"""
+        if not spawn.ready.is_set():
+            return
+        with self._spawn_lock:
+            if self.spawn is spawn:
+                LOG.warning('worker did not answer after ready, restarting on next request')
+                self._stop_locked()
 
     def transcribe(self, pcm, language):
         if is_silent(pcm):
@@ -131,20 +194,28 @@ class WorkerProxy:
         if not self.lock.acquire(timeout=3):
             raise ValueError('recognizer busy')
         try:
-            proc, responses = self._ensure()  # 以後は手元の参照だけを使う（他スレッドの prepare で差し替わっても安全）
+            # 起動を含め、ここからの待ちをすべて response_timeout に収める
+            deadline = time.monotonic() + self.response_timeout
+            spawn = self._ensure()  # 以後は手元の参照だけを使う（他スレッドの prepare で差し替わっても安全）
             self.next_id += 1
             rid = self.next_id
             header = json.dumps({'id': rid, 'language': language, 'pcm_length': len(pcm)}).encode() + b'\n'
-            try:
-                proc.stdin.write(header + pcm)
-                proc.stdin.flush()
-            except OSError:
-                raise WorkerExited('worker exited') from None
-            deadline = time.monotonic() + self.response_timeout
+            # 読み込み中のワーカーは stdin を読まないので、大きな PCM の書き込みは詰まりうる。別スレッドで書いて打ち切る
+            failed = threading.Event()
+            writer = threading.Thread(target=self._write, args=(spawn, header + pcm, spawn.writer, failed), daemon=True)
+            spawn.writer = writer
+            writer.start()
+            writer.join(max(0, deadline - time.monotonic()))
+            if failed.is_set():
+                raise WorkerExited('worker exited')
+            if writer.is_alive():
+                self._discard_if_hung(spawn)
+                raise WorkerTimeout('no response within %s seconds' % self.response_timeout)
             while True:
                 try:
-                    message = responses.get(timeout=max(0, deadline - time.monotonic()))
+                    message = spawn.responses.get(timeout=max(0, deadline - time.monotonic()))
                 except queue.Empty:
+                    self._discard_if_hung(spawn)
                     raise WorkerTimeout('no response within %s seconds' % self.response_timeout) from None
                 if message is None:
                     raise WorkerExited('worker exited')
@@ -160,14 +231,7 @@ class WorkerProxy:
 
     def close(self):
         with self._spawn_lock:
-            if self.proc is None:
-                return
-            self.proc.terminate()
-            try:
-                self.proc.wait(3)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-            self._release()
+            self._stop_locked()
 
 class Handler(socketserver.StreamRequestHandler):
     def handle(self):
@@ -217,13 +281,19 @@ class Handler(socketserver.StreamRequestHandler):
                 pass
 
 class Server(socketserver.ThreadingTCPServer):
-    allow_reuse_address = True
+    # Windows の SO_REUSEADDR は「使用中のポートの重ね取り」になるので付けない（代わりに排他で bind する）
+    allow_reuse_address = os.name != 'nt'
     daemon_threads = True
     request_queue_size = 2
 
     def __init__(self, address, recognizer, allowed):
         self.recognizer, self.allowed = recognizer, set(allowed)
         super().__init__(address, Handler)
+
+    def server_bind(self):
+        if os.name == 'nt' and hasattr(socket, 'SO_EXCLUSIVEADDRUSE'):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
 
     def verify_request(self, request, client_address):
         return client_address[0] in self.allowed
@@ -288,6 +358,9 @@ def main():
             server.serve_forever()
     except KeyboardInterrupt:
         pass
+    except Exception:
+        LOG.exception('startup failed')  # pythonw では stderr が無いので、ログファイルに残す
+        raise
     finally:
         proxy.close()
 

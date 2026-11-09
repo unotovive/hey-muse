@@ -35,6 +35,7 @@ def main():
     parser.add_argument('--idle-seconds', type=float, default=0)
     parser.add_argument('--die-on', type=int, default=0)
     parser.add_argument('--slow', type=float, default=0)
+    parser.add_argument('--hang-on', type=int, default=0, help='N 件目の要求で答えずに眠り続ける')
     parser.add_argument('--stderr-line', default=None)
     args = parser.parse_args()
     stdout = sys.stdout.buffer
@@ -56,6 +57,9 @@ def main():
         count += 1
         if args.die_on and count == args.die_on:
             sys.exit(3)
+        if args.hang_on and count == args.hang_on:
+            while True:
+                time.sleep(60)
         time.sleep(args.slow)
         write_json(stdout, {'id': item[0], 'text': 'ja:%d' % item[1]})
 

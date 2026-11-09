@@ -1,4 +1,4 @@
-import io, json, sys, time, unittest
+import io, json, os, sys, threading, time, unittest
 import worker as w
 
 
@@ -29,15 +29,28 @@ class ProtocolTest(unittest.TestCase):
             def transcribe(self, pcm, language): return 'テキスト%d' % len(pcm)
         inp = (b'{"id": 1, "language": "ja", "pcm_length": 2}\n' + b'\x00\x00' +
                b'{"id": 2, "language": "ja", "pcm_length": 0}\n')
-        out = w.serve(Model(), io.BytesIO(inp), io.BytesIO(), idle_seconds=0)
+        out = w.serve(Model(), w.start_reader(io.BytesIO(inp)), io.BytesIO(), idle_seconds=0)
         lines = [json.loads(l) for l in out.getvalue().splitlines()]
         self.assertEqual(lines, [{'event': 'ready'}, {'id': 1, 'text': 'テキスト2'}, {'id': 2, 'text': 'テキスト0'}])
+
+    def test_reader_drains_stdin_before_serve(self):
+        # モデル読み込み中（serve 前）でも stdin を吸い出し、受付の大きな書き込みを詰まらせない
+        r, wfd = os.pipe()
+        with os.fdopen(r, 'rb') as rf, os.fdopen(wfd, 'wb') as wf:
+            requests = w.start_reader(rf)
+            pcm = b'\x00\x10' * 60000
+            t = threading.Thread(target=lambda: (wf.write(b'{"id": 1, "language": "ja", "pcm_length": %d}\n' % len(pcm) + pcm), wf.flush()))
+            t.start(); t.join(2)
+            self.assertFalse(t.is_alive())
+            self.assertEqual(requests.get(timeout=2)[:2], (1, 'ja'))
+            wf.close()
+            self.assertIsNone(requests.get(timeout=2))
 
     def test_serve_exits_after_idle(self):
         class Model:
             def transcribe(self, pcm, language): return ''
         start = time.monotonic()
-        w.serve(Model(), SlowEOF(), io.BytesIO(), idle_seconds=1)
+        w.serve(Model(), w.start_reader(SlowEOF()), io.BytesIO(), idle_seconds=1)
         self.assertLess(time.monotonic() - start, 3)
 
 
