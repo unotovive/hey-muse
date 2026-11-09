@@ -145,6 +145,8 @@ Test-NetConnection 母艦のLAN_IP -Port 50024
 
 期待する結果は `active` と `TcpTestSucceeded : True` です。続けて、項目 3 の手順 2 に準じて話しかけ、ログに `muse: using local speech recognition` が出ることを確認します。
 
+2026-11-09 に第 3 部の手順 1（`setup-mothership.ps1`）を実施し、`.wslconfig` の `networkingMode=mirrored`、タスク `hey-muse WSL`（「タスクを停止するまでの時間」= 無効、「電源管理」= 空欄）、ファイアウォール規則（通常・Hyper-V とも TCP 50024）、AC 電源のスタンバイ無効を確認しました。再起動後の確認は未実施です。
+
 ## 項目 10 ローカルのテスト・ビルド・CI（実施済み・合格）
 
 | 確認 | コマンド | 結果 |
