@@ -367,6 +367,8 @@ python tools/standalone-home/deploy_usb.py config --serial SERIAL
 
 ```sh
 touch /data/misc/techo5/standalone-home/enabled
+umask 077; test -f /data/misc/techo5/idle-home.json || printf '{"Scenes": []}\n' > /data/misc/techo5/idle-home.json
+kill $(pidof techo5)   # 待機画面の予定表示は起動時に idle-home.json を読むため、本体を再起動する（init がすぐ起動し直す）
 techo5 tools home-check
 ls -l /data/misc/techo5/standalone-home/
 ```
@@ -377,6 +379,7 @@ ls -l /data/misc/techo5/standalone-home/
 - `Calendar refreshed: N events` と出ます（N は今から 8 日後までの予定の数で、上限は 24 件）。
 - Remo のトークンが空なら、家電の検査はエラーで止まります。これは想定どおりで、その行までが出れば足ります。
 - 一覧に `enabled`、`home-local.json`、`natureremo.env`、`google-token.json` が見えます。
+- 時計の画面が、上に予定・下にシーンの欄がある待機画面に変わります。`idle-home.json` が無いと時計だけのままで、予定は出ません。
 
 `natureremo.env`、`google-token.json`、`home-local.json` の `key` は秘密情報です。リポジトリにコミットしないでください。
 
