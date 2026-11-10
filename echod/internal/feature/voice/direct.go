@@ -107,21 +107,27 @@ var warmRecognizer = wyoming.Warm
 // two to four seconds of the request itself cover most of that.
 func (d *direct) Start(phrase string) error {
 	err := d.utterance.Start(phrase)
-	b := config.Get().Brain
-	if b.STT != "" {
-		lang := b.Language
-		if lang == "" {
-			lang = "en"
-		}
-		safe.Go("direct warm-up", func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer cancel()
-			if err := warmRecognizer(ctx, b.STT, lang); err != nil {
-				slog.Debug("direct warm-up failed", "err", err)
-			}
-		})
-	}
+	warmSTT(config.Get().Brain)
 	return err
+}
+
+// warmSTT has the recognizer b names get ready, in the background (warmRecognizer). Not the one on
+// this device (127.0.0.1): it is always loaded.
+func warmSTT(b config.Brain) {
+	if b.STT == "" || strings.HasPrefix(b.STT, "127.0.0.1:") {
+		return
+	}
+	lang := b.Language
+	if lang == "" {
+		lang = "en"
+	}
+	safe.Go("recognizer warm-up", func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := warmRecognizer(ctx, b.STT, lang); err != nil {
+			slog.Debug("recognizer warm-up failed", "err", err)
+		}
+	})
 }
 
 // End hands the utterance over to be answered. Not here: this runs on the send queue, and a model

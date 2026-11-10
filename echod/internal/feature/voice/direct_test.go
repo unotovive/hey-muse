@@ -51,3 +51,32 @@ func TestDirectStartWarmsRecognizer(t *testing.T) {
 	}
 	_ = d.Stop()
 }
+
+// Muse で答えるときも、聞き取りが母艦なら会話の始まりに起こす。端末内の認識（127.0.0.1）は起こさない。
+func TestMuseStartWarmsPCRecognizerOnly(t *testing.T) {
+	got := make(chan string, 2)
+	was := warmRecognizer
+	warmRecognizer = func(_ context.Context, addr, _ string) error {
+		got <- addr
+		return nil
+	}
+	t.Cleanup(func() { warmRecognizer = was })
+	for _, tc := range []struct {
+		stt  string
+		want bool
+	}{{"pc:50024", true}, {"127.0.0.1:50024", false}, {"", false}} {
+		m := &viaMuse{brain: func() config.Brain { return config.Brain{Mode: config.BrainMuse, STT: tc.stt, Language: "ja"} }}
+		_ = m.startTurn("Hey Muse", true)
+		select {
+		case addr := <-got:
+			if !tc.want || addr != tc.stt {
+				t.Fatalf("stt %q: warmed %q", tc.stt, addr)
+			}
+		case <-time.After(300 * time.Millisecond):
+			if tc.want {
+				t.Fatalf("stt %q: not warmed", tc.stt)
+			}
+		}
+		_ = m.Stop()
+	}
+}

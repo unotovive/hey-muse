@@ -180,7 +180,12 @@ func (m *viaMuse) startTurn(phrase string, followUp bool) error {
 	}
 	m.early = nil
 	m.nextProbe = 32000
-	return m.utterance.Start(phrase)
+	err := m.utterance.Start(phrase)
+	// A PC recognizer loads on demand: have it ready by the time the request is said (direct.go).
+	if b := m.brain(); b.Mode == config.BrainMuse {
+		warmSTT(b)
+	}
+	return err
 }
 
 func (m *viaMuse) Name() string { return "muse" }
