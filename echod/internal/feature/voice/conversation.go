@@ -923,7 +923,9 @@ func (c *conversation) turnEvent(e event) {
 			// when room noise prevents the energy detector from finding its end.
 			// Finish that audio instead of immediately queuing Stop, which cancels
 			// recognition before it can begin. Follow-ups remain quiet above.
-			if m, ok := c.be.(*viaMuse); ok && m.brain != nil && strings.TrimSpace(m.brain().STT) != "" {
+			// The direct pipeline always has its own recognizer (config.Brain.Direct).
+			_, direct := c.be.(*direct)
+			if m, ok := c.be.(*viaMuse); direct || ok && m.brain != nil && strings.TrimSpace(m.brain().STT) != "" {
 				slog.Info("listening limit reached, transcribing captured audio", "slot", c.slot+1)
 				c.think()
 				return

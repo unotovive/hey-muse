@@ -98,6 +98,32 @@ func (d *direct) Name() string { return "direct" }
 
 func (d *direct) Ready() bool { return config.Get().Brain.Direct() }
 
+// warmRecognizer tells the speech-to-text server a turn has begun (wyoming.Warm); a test replaces it.
+var warmRecognizer = wyoming.Warm
+
+// Start opens the turn, and has the recognizer get ready while the person is still talking: a PC that
+// loads speech recognition, the chat model and its voice on demand (tools/echo-asr/pc) took five
+// seconds after the speaker had finished to answer the first turn after a quiet half hour, and the
+// two to four seconds of the request itself cover most of that.
+func (d *direct) Start(phrase string) error {
+	err := d.utterance.Start(phrase)
+	b := config.Get().Brain
+	if b.STT != "" {
+		lang := b.Language
+		if lang == "" {
+			lang = "en"
+		}
+		safe.Go("direct warm-up", func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			if err := warmRecognizer(ctx, b.STT, lang); err != nil {
+				slog.Debug("direct warm-up failed", "err", err)
+			}
+		})
+	}
+	return err
+}
+
 // End hands the utterance over to be answered. Not here: this runs on the send queue, and a model
 // thinking for two seconds would hold the next turn's start behind it.
 func (d *direct) End() error {

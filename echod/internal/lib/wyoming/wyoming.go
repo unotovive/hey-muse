@@ -158,6 +158,23 @@ func Transcribe(ctx context.Context, addr, language string) (*Transcriber, error
 	return &Transcriber{c: c}, nil
 }
 
+// Warm tells a speech-to-text server that an utterance is on its way, and hangs up: a transcribe with
+// nothing after it. Sent when a turn starts, so a server that loads its model on demand (and its
+// answerer and speech with it, tools/echo-asr/pc) does that while the person is still talking rather
+// than after they have finished.
+func Warm(ctx context.Context, addr, language string) error {
+	c, err := dial(ctx, addr)
+	if err != nil {
+		return err
+	}
+	defer c.close()
+	req := map[string]any{}
+	if language != "" {
+		req["language"] = language
+	}
+	return c.send("transcribe", req, nil)
+}
+
 // Audio sends one chunk of 16-bit little-endian samples.
 func (t *Transcriber) Audio(pcm []byte) error { return t.c.send("audio-chunk", Mic, pcm) }
 

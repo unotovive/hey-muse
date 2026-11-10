@@ -124,6 +124,22 @@ class DoorTests(unittest.TestCase):
         self.assertEqual(FakeOllama.seen[0][0], '/api/generate')
         self.assertEqual(FakeOllama.seen[0][2], {'model': 'test-model'})
 
+    def test_bare_transcribe_warms_up(self):
+        # 端末は起動語を聞いた時点で transcribe だけを送って切る（wyoming.Warm）。話している間に準備させる
+        self.upstream._chatted_at = self.upstream._clock()
+        prepared = []
+        self.server.recognizer.prepare = lambda: prepared.append(1)
+        sock = socket.create_connection(self.server.server_address, timeout=3)
+        f = sock.makefile('rwb')
+        app.send_event(f, 'transcribe', {'language': 'ja'})
+        f.close()
+        sock.close()
+        for _ in range(50):
+            if prepared and self.speaker.warmed and FakeOllama.seen:
+                break
+            threading.Event().wait(0.05)
+        self.assertEqual((len(prepared), self.speaker.warmed, FakeOllama.seen[0][0]), (1, 1, '/api/generate'))
+
     def http(self):
         conn = http.client.HTTPConnection(*self.server.server_address, timeout=3)
         self.addCleanup(conn.close)
